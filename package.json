@@ -1,0 +1,16 @@
+{
+  "name": "signal-bot-router",
+  "version": "1.0.0",
+  "description": "Webhook relay for TradingView → Gainium with sequential action execution",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
