@@ -49,14 +49,30 @@ function extractActions(body) {
   }
 }
 
-// Send a single action to Gainium's webhook endpoint
-async function sendAction(action) {
-  const response = await fetch(GAINIUM_WEBHOOK_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify([action]),
-  });
-  return response.status;
+// Send a single action to Gainium's webhook endpoint (10s timeout, 1 retry)
+async function sendAction(action, attempt = 1) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const response = await fetch(GAINIUM_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([action]),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    return { status: response.status, ok: true };
+  } catch (err) {
+    clearTimeout(timeout);
+    if (attempt < 2) {
+      const actionName = action.action || 'unknown';
+      log(`  ⚠ ${actionName} failed (${err.name === 'AbortError' ? 'timeout' : err.message}), retrying in 3s...`);
+      await new Promise(r => setTimeout(r, 3000));
+      return sendAction(action, attempt + 1);
+    }
+    throw err;
+  }
 }
 
 // Process actions sequentially with delays
@@ -72,10 +88,10 @@ async function processActions(actions, requestId) {
     log(`[${requestId}]   ${i + 1}/${actions.length}: ${actionName} → ${shortUuid}...`);
 
     try {
-      const status = await sendAction(action);
-      log(`[${requestId}]   ✓ ${actionName} returned ${status}`);
+      const result = await sendAction(action);
+      log(`[${requestId}]   ✓ ${actionName} returned ${result.status}`);
     } catch (err) {
-      log(`[${requestId}]   ✗ ${actionName} FAILED: ${err.message}`);
+      log(`[${requestId}]   ✗ ${actionName} FAILED after retry: ${err.name === 'AbortError' ? 'timeout' : err.message}`);
       // Continue with remaining actions — don't let one failure block the rest
     }
 
@@ -96,7 +112,7 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.0.0',
+    version: '1.1.0',
   });
 });
 
@@ -130,7 +146,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.0.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.1.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
