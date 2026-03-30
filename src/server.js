@@ -371,16 +371,41 @@ app.get('/test-verify/:uuid', async (req, res) => {
   const crypto = require('crypto');
   const apiKey = process.env.GAINIUM_API_KEY || '';
   const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  const basePath = `/api/v2/bots/dca`;
-  const query = `?botId=${uuid}&fields=_id,uuid,settings.name,deals`;
-  const url = `https://api.gainium.io${basePath}${query}`;
+  // Test both V1 and V2 endpoints to isolate auth vs endpoint issues
+  const v1Endpoint = `/api/bots/dca`;
+  const v2Endpoint = `/api/v2/bots/dca`;
+  const v2Query = `?botId=${uuid}&fields=_id,uuid,settings.name,deals`;
   const method = 'GET';
   const timestamp = Date.now().toString();
+  const results = {};
 
-  // Try signing with full path including query string
-  const endpointWithQuery = `${basePath}${query}`;
-  const payload = `${method}${endpointWithQuery}${timestamp}`;
-  const signature = crypto.createHmac('sha256', apiSecret).update(payload).digest('base64');
+  for (const [label, endpoint, query] of [
+    ['v1', v1Endpoint, ''],
+    ['v2_no_query_in_sig', v2Endpoint, v2Query],
+    ['v2_with_query_in_sig', v2Endpoint, v2Query],
+  ]) {
+    const url = `https://api.gainium.io${endpoint}${query}`;
+    const ts = Date.now().toString();
+    const signEndpoint = label === 'v2_with_query_in_sig' ? `${endpoint}${query}` : endpoint;
+    const payload = `${method}${signEndpoint}${ts}`;
+    const sig = crypto.createHmac('sha256', apiSecret).update(payload).digest('base64');
+
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 10000);
+      const r = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
+        signal: ctrl.signal,
+      });
+      clearTimeout(to);
+      const ct = r.headers.get('content-type') || '';
+      const body = await r.text();
+      results[label] = { status: r.status, body: body.substring(0, 300) };
+    } catch (e) {
+      results[label] = { error: e.message };
+    }
+  }
 
   log(`[test-diag] Bot: ${bot.name}`);
   log(`[test-diag] URL: ${url}`);
@@ -407,19 +432,15 @@ app.get('/test-verify/:uuid', async (req, res) => {
     const contentType = response.headers.get('content-type') || '';
     const body = await response.text();
 
-    log(`[test-diag] Response: ${response.status} ${response.statusText}`);
-    log(`[test-diag] Content-Type: ${contentType}`);
-    log(`[test-diag] Body: ${body.substring(0, 500)}`);
-
     res.json({
       bot: bot.name,
       uuid,
-      request: { url, endpoint, method, apiKeyLength: apiKey.length, secretLength: apiSecret.length },
-      response: { status: response.status, statusText: response.statusText, contentType, body: body.substring(0, 500) },
+      apiKeyLength: apiKey.length,
+      secretLength: apiSecret.length,
+      results,
     });
   } catch (err) {
-    log(`[test-diag] Error: ${err.message}`);
-    res.status(500).json({ bot: bot.name, uuid, error: err.message });
+    res.status(500).json({ bot: bot.name, uuid, error: err.message, results });
   }
 });
 
