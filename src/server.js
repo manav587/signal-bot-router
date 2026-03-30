@@ -371,9 +371,9 @@ app.post('/test-force-close/:dealId', async (req, res) => {
 
   // Try multiple V1 close endpoints to find the right one
   const attempts = [
-    { label: 'delete_closeDeal_body', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ type: 'closeByMarket' }) },
-    { label: 'delete_closeDeal_query', method: 'DELETE', ep: `/api/closeDeal/${dealId}?type=closeByMarket`, body: '' },
-    { label: 'delete_closeDeal_cancel', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ type: 'cancel' }) },
+    { label: 'with_dealType', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ dealType: 'dca', type: 'closeByMarket' }) },
+    { label: 'with_closeType', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ dealType: 'dca', closeType: 'closeByMarket' }) },
+    { label: 'with_action', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ action: 'close', dealType: 'dca', closeType: 'closeByMarket' }) },
   ];
 
   for (const a of attempts) {
