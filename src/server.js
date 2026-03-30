@@ -371,16 +371,20 @@ app.get('/test-verify/:uuid', async (req, res) => {
   const crypto = require('crypto');
   const apiKey = process.env.GAINIUM_API_KEY || '';
   const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  const endpoint = `/api/v2/bots/dca`;
-  const url = `https://api.gainium.io${endpoint}?botId=${uuid}&fields=_id,uuid,settings.name,deals`;
+  const basePath = `/api/v2/bots/dca`;
+  const query = `?botId=${uuid}&fields=_id,uuid,settings.name,deals`;
+  const url = `https://api.gainium.io${basePath}${query}`;
   const method = 'GET';
   const timestamp = Date.now().toString();
-  const payload = `${method}${endpoint}${timestamp}`;
+
+  // Try signing with full path including query string
+  const endpointWithQuery = `${basePath}${query}`;
+  const payload = `${method}${endpointWithQuery}${timestamp}`;
   const signature = crypto.createHmac('sha256', apiSecret).update(payload).digest('base64');
 
   log(`[test-diag] Bot: ${bot.name}`);
   log(`[test-diag] URL: ${url}`);
-  log(`[test-diag] Endpoint (signed): ${endpoint}`);
+  log(`[test-diag] Endpoint (signed): ${endpointWithQuery}`);
   log(`[test-diag] Payload (signed): ${payload}`);
   log(`[test-diag] API key length: ${apiKey.length}, Secret length: ${apiSecret.length}`);
 
