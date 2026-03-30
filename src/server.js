@@ -250,7 +250,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
     return { verified: false, abortRemaining: false };
   }
 
-  const result = await gainiumApi.verifyAndForceClose(targetBot.mongoId, targetBot.name);
+  const result = await gainiumApi.verifyAndForceClose(targetBot.uuid, targetBot.name);
 
   if (result.flat) {
     if (result.forceClosed > 0) {
@@ -353,7 +353,7 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.3.0',
+    version: '1.3.1',
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -401,7 +401,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.3.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.3.1 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);

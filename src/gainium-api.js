@@ -49,6 +49,7 @@ function authHeaders(method, endpoint, body = '') {
 /**
  * GET a bot's deal count to check if any deals are still active.
  * Returns { active: number, all: number } or null on error.
+ * @param {string} botId — Bot UUID (NOT MongoDB ObjectId — API returns 404 for ObjectIds)
  */
 async function getBotDeals(botId) {
   const endpoint = `/api/v2/bots/dca/${botId}`;
