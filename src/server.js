@@ -45,6 +45,88 @@ async function sendTelegramAlert(message) {
   }
 }
 
+// ── Deferred Flip Queue (v1.3.0) ─────────────────────────────────────────
+// When a flip aborts due to Gainium outage, queue it for retry.
+// Retries every 60s for up to 5 minutes, then gives up with a Telegram alert.
+const DEFERRED_QUEUE = []; // { actions, requestId, targetBot, queuedAt, retryCount }
+const DEFERRED_MAX_RETRIES = 5;      // 5 retries × 60s = 5 minutes
+const DEFERRED_RETRY_INTERVAL = 60000; // 60 seconds
+
+function queueDeferredFlip(actions, requestId, targetBot) {
+  // Don't double-queue the same bot
+  const existing = DEFERRED_QUEUE.find(q => q.targetBot.mongoId === targetBot.mongoId);
+  if (existing) {
+    log(`[${requestId}] Deferred flip already queued for ${targetBot.name} (req ${existing.requestId}) — skipping`);
+    return;
+  }
+
+  DEFERRED_QUEUE.push({
+    actions,
+    requestId,
+    targetBot,
+    queuedAt: Date.now(),
+    retryCount: 0,
+  });
+
+  log(`[${requestId}] 📋 Queued deferred flip for ${targetBot.name} — will retry every 60s for up to 5 min`);
+  sendTelegramAlert(
+    `📋 Flip Queued for Retry\n\n` +
+    `Bot: ${targetBot.name}\n` +
+    `Will retry every 60s for up to 5 min\n` +
+    `Time: ${istTimestamp()}\n` +
+    `Request: ${requestId}`
+  ).catch(() => {});
+}
+
+async function processDeferredQueue() {
+  if (DEFERRED_QUEUE.length === 0) return;
+
+  // Process a copy so we can safely remove entries
+  for (let i = DEFERRED_QUEUE.length - 1; i >= 0; i--) {
+    const item = DEFERRED_QUEUE[i];
+    item.retryCount++;
+
+    log(`[${item.requestId}] 🔄 Deferred retry ${item.retryCount}/${DEFERRED_MAX_RETRIES} for ${item.targetBot.name}...`);
+
+    // Re-attempt the full action sequence
+    try {
+      const result = await processActions(item.actions, item.requestId + `-r${item.retryCount}`, true);
+
+      if (result && result.completed) {
+        log(`[${item.requestId}] ✅ Deferred flip SUCCEEDED for ${item.targetBot.name} on retry ${item.retryCount}`);
+        sendTelegramAlert(
+          `✅ Deferred Flip Succeeded\n\n` +
+          `Bot: ${item.targetBot.name}\n` +
+          `Retry: ${item.retryCount}/${DEFERRED_MAX_RETRIES}\n` +
+          `Time: ${istTimestamp()}\n` +
+          `Request: ${item.requestId}`
+        ).catch(() => {});
+        DEFERRED_QUEUE.splice(i, 1);
+        continue;
+      }
+    } catch (err) {
+      log(`[${item.requestId}] Deferred retry error: ${err.message}`);
+    }
+
+    // Check if we've exhausted retries
+    if (item.retryCount >= DEFERRED_MAX_RETRIES) {
+      log(`[${item.requestId}] ❌ Deferred flip GAVE UP for ${item.targetBot.name} after ${DEFERRED_MAX_RETRIES} retries`);
+      sendTelegramAlert(
+        `❌ Deferred Flip Failed\n\n` +
+        `Bot: ${item.targetBot.name}\n` +
+        `Gave up after ${DEFERRED_MAX_RETRIES} retries (5 min)\n` +
+        `Manual intervention required.\n` +
+        `Time: ${istTimestamp()}\n` +
+        `Request: ${item.requestId}`
+      ).catch(() => {});
+      DEFERRED_QUEUE.splice(i, 1);
+    }
+  }
+}
+
+// Run the deferred queue processor every 60 seconds
+setInterval(processDeferredQueue, DEFERRED_RETRY_INTERVAL);
+
 // Delays between action types (milliseconds)
 const DELAYS = {
   closeAllDeals: 5000,  // 5s — wait for Binance to clear the position
@@ -189,8 +271,8 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 
 // ── Process actions sequentially with delays ─────────────────────────────
 
-async function processActions(actions, requestId) {
-  log(`[${requestId}] Processing ${actions.length} action(s)...`);
+async function processActions(actions, requestId, isRetry = false) {
+  log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
 
   // v1.2.0: Identify if this is a crossover flip (has closeAllDeals)
   const targetBot = findCloseTargetBot(actions);
@@ -240,6 +322,13 @@ async function processActions(actions, requestId) {
 
   if (abortRemaining) {
     log(`[${requestId}] ⛔ Sequence PARTIALLY completed — startBot/startDeal skipped (deals not confirmed closed)`);
+
+    // Queue for deferred retry (only on first attempt, not on retries to avoid infinite loops)
+    if (!isRetry && targetBot) {
+      queueDeferredFlip(actions, requestId, targetBot);
+    }
+
+    return { completed: false };
   } else {
     log(`[${requestId}] ✅ All ${actions.length} action(s) completed`);
     const completedNames = actions.map(a => a.action).join(' → ');
@@ -253,6 +342,8 @@ async function processActions(actions, requestId) {
       `Time: ${istTimestamp()}\n` +
       `Request: ${requestId}`
     ).catch(() => {});
+
+    return { completed: true };
   }
 }
 
@@ -262,7 +353,7 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.2.0',
+    version: '1.3.0',
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -310,7 +401,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.2.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.3.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
