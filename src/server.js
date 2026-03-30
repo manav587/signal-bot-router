@@ -359,89 +359,45 @@ app.get('/', (req, res) => {
   });
 });
 
-// Test endpoint — raw diagnostic: shows exact HTTP response from Gainium REST API
+// Test endpoint — tries V1 and V2 to isolate auth issue
 app.get('/test-verify/:uuid', async (req, res) => {
   const uuid = req.params.uuid;
   const bot = BOT_MAP[uuid];
-  if (!bot) {
-    return res.status(404).json({ error: 'UUID not in BOT_MAP', uuid });
-  }
+  if (!bot) return res.status(404).json({ error: 'UUID not in BOT_MAP', uuid });
 
-  // Make the raw API call ourselves so we can capture everything
   const crypto = require('crypto');
   const apiKey = process.env.GAINIUM_API_KEY || '';
   const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  // Test both V1 and V2 endpoints to isolate auth vs endpoint issues
-  const v1Endpoint = `/api/bots/dca`;
-  const v2Endpoint = `/api/v2/bots/dca`;
-  const v2Query = `?botId=${uuid}&fields=_id,uuid,settings.name,deals`;
   const method = 'GET';
-  const timestamp = Date.now().toString();
   const results = {};
 
-  for (const [label, endpoint, query] of [
-    ['v1', v1Endpoint, ''],
-    ['v2_no_query_in_sig', v2Endpoint, v2Query],
-    ['v2_with_query_in_sig', v2Endpoint, v2Query],
-  ]) {
-    const url = `https://api.gainium.io${endpoint}${query}`;
-    const ts = Date.now().toString();
-    const signEndpoint = label === 'v2_with_query_in_sig' ? `${endpoint}${query}` : endpoint;
-    const payload = `${method}${signEndpoint}${ts}`;
-    const sig = crypto.createHmac('sha256', apiSecret).update(payload).digest('base64');
+  const tests = [
+    { label: 'v1_list', ep: '/api/bots/dca', query: '' },
+    { label: 'v2_bot', ep: '/api/v2/bots/dca', query: `?botId=${uuid}&fields=_id,uuid,settings.name,deals` },
+  ];
 
+  for (const t of tests) {
+    const url = `https://api.gainium.io${t.ep}${t.query}`;
+    const ts = Date.now().toString();
+    const signPayload = `${method}${t.ep}${ts}`;
+    const sig = crypto.createHmac('sha256', apiSecret).update(signPayload).digest('base64');
     try {
       const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 10000);
+      const tm = setTimeout(() => ctrl.abort(), 10000);
       const r = await fetch(url, {
         method,
         headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
         signal: ctrl.signal,
       });
-      clearTimeout(to);
-      const ct = r.headers.get('content-type') || '';
+      clearTimeout(tm);
       const body = await r.text();
-      results[label] = { status: r.status, body: body.substring(0, 300) };
+      results[t.label] = { status: r.status, body: body.substring(0, 300) };
     } catch (e) {
-      results[label] = { error: e.message };
+      results[t.label] = { error: e.message };
     }
   }
 
-  log(`[test-diag] Bot: ${bot.name}`);
-  log(`[test-diag] URL: ${url}`);
-  log(`[test-diag] Endpoint (signed): ${endpointWithQuery}`);
-  log(`[test-diag] Payload (signed): ${payload}`);
-  log(`[test-diag] API key length: ${apiKey.length}, Secret length: ${apiSecret.length}`);
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
-    const response = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        'token': apiKey,
-        'signature': signature,
-        'time': timestamp,
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    const contentType = response.headers.get('content-type') || '';
-    const body = await response.text();
-
-    res.json({
-      bot: bot.name,
-      uuid,
-      apiKeyLength: apiKey.length,
-      secretLength: apiSecret.length,
-      results,
-    });
-  } catch (err) {
-    res.status(500).json({ bot: bot.name, uuid, error: err.message, results });
-  }
+  res.json({ bot: bot.name, uuid, apiKeyLen: apiKey.length, secretLen: apiSecret.length, results });
 });
 
 // Main webhook endpoint — TradingView sends alerts here
