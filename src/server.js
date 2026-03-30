@@ -359,7 +359,32 @@ app.get('/', (req, res) => {
   });
 });
 
-// Test endpoint — tries V1 and V2 to isolate auth issue
+// Debug endpoint — raw API response to diagnose deals structure
+app.get('/debug-deals', async (req, res) => {
+  const crypto = require('crypto');
+  const apiKey = process.env.GAINIUM_API_KEY || '';
+  const apiSecret = process.env.GAINIUM_API_SECRET || '';
+  const endpoint = '/api/deals';
+  const url = `https://api.gainium.io${endpoint}`;
+  const ts = Date.now().toString();
+  const sig = crypto.createHmac('sha256', apiSecret).update(`GET${endpoint}${ts}`).digest('base64');
+  try {
+    const ctrl = new AbortController();
+    const tm = setTimeout(() => ctrl.abort(), 10000);
+    const r = await fetch(url, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
+      signal: ctrl.signal,
+    });
+    clearTimeout(tm);
+    const body = await r.text();
+    res.json({ status: r.status, contentType: r.headers.get('content-type'), bodyLength: body.length, body: body.substring(0, 1000) });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// Test endpoint — end-to-end verification test
 app.get('/test-verify/:uuid', async (req, res) => {
   const uuid = req.params.uuid;
   const bot = BOT_MAP[uuid];
