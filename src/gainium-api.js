@@ -33,6 +33,11 @@ function sign(body, method, endpoint, timestamp) {
   return crypto.createHmac('sha256', API_SECRET).update(payload).digest('base64');
 }
 
+/**
+ * Build HMAC auth headers.
+ * IMPORTANT: endpoint must include query string if present (e.g. '/api/deals?status=open')
+ * because Gainium verifies the signature against the full endpoint path.
+ */
 function authHeaders(method, endpoint, body = '') {
   const timestamp = Date.now().toString();
   const signature = sign(body, method.toUpperCase(), endpoint, timestamp);
@@ -93,13 +98,13 @@ async function getBotDeals(botId) {
 
 /**
  * List open deals for a specific bot.
- * V1 endpoint — fetches all deals, filters by mongoId + status client-side.
+ * V1 endpoint with status=open filter — query params must be included in HMAC signature.
  * NOTE: V1 deals use MongoDB ObjectId in botId field, NOT UUID.
- * Returns array of { _id, status, pair } or empty array on error.
+ * Returns array of { _id, status, pair, botId } or empty array on error.
  */
 async function listOpenDeals(botMongoId) {
-  // V1 endpoint — V2 returns 401 with current API key
-  const endpoint = `/api/deals`;
+  // V1 endpoint with status filter — query params MUST be in the signed endpoint
+  const endpoint = `/api/deals?status=open`;
   const url = `${BASE_URL}${endpoint}`;
   const method = 'GET';
   const headers = authHeaders(method, endpoint);
@@ -119,19 +124,10 @@ async function listOpenDeals(botMongoId) {
     }
 
     const json = await res.json();
-    // V1 deals may return { data: [...] } or { data: { result: [...] } } — handle both
-    let allDeals = null;
-    if (json.status === 'OK' && Array.isArray(json.data)) {
-      allDeals = json.data;
-    } else if (json.status === 'OK' && json.data && Array.isArray(json.data.result)) {
-      allDeals = json.data.result;
-    }
-
-    if (allDeals) {
-      const openDeals = allDeals.filter(d =>
-        d.botId === botMongoId && d.status === 'open'
-      );
-      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botMongoId} (out of ${allDeals.length} total)`);
+    // V1 returns { data: { page, totalPages, totalResults, result: [...] } }
+    if (json.status === 'OK' && json.data && Array.isArray(json.data.result)) {
+      const openDeals = json.data.result.filter(d => d.botId === botMongoId);
+      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botMongoId} (out of ${json.data.result.length} total open)`);
       return openDeals;
     }
     log(`listOpenDeals unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
