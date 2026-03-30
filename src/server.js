@@ -365,7 +365,8 @@ app.get('/debug-deals', async (req, res) => {
   const apiKey = process.env.GAINIUM_API_KEY || '';
   const apiSecret = process.env.GAINIUM_API_SECRET || '';
   const endpoint = '/api/deals';
-  const url = `https://api.gainium.io${endpoint}`;
+  const query = req.query.q || ''; // pass ?q=status%3Dopen%26page%3D8 etc.
+  const url = `https://api.gainium.io${endpoint}${query ? '?' + query : ''}`;
   const ts = Date.now().toString();
   const sig = crypto.createHmac('sha256', apiSecret).update(`GET${endpoint}${ts}`).digest('base64');
   try {
@@ -378,7 +379,7 @@ app.get('/debug-deals', async (req, res) => {
     });
     clearTimeout(tm);
     const body = await r.text();
-    res.json({ status: r.status, contentType: r.headers.get('content-type'), bodyLength: body.length, body: body.substring(0, 1000) });
+    res.json({ url, status: r.status, bodyLength: body.length, body: body.substring(0, 2000) });
   } catch (e) {
     res.json({ error: e.message });
   }
