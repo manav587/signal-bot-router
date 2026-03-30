@@ -371,8 +371,8 @@ app.get('/test-verify/:uuid', async (req, res) => {
   const crypto = require('crypto');
   const apiKey = process.env.GAINIUM_API_KEY || '';
   const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  const endpoint = `/api/v2/bots/dca/${uuid}`;
-  const url = `https://api.gainium.io${endpoint}?fields=_id,uuid,settings.name,deals`;
+  const endpoint = `/api/v2/bots/dca`;
+  const url = `https://api.gainium.io${endpoint}?botId=${uuid}&fields=_id,uuid,settings.name,deals`;
   const method = 'GET';
   const timestamp = Date.now().toString();
   const payload = `${method}${endpoint}${timestamp}`;

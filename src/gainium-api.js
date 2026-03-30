@@ -52,8 +52,8 @@ function authHeaders(method, endpoint, body = '') {
  * @param {string} botId — Bot UUID (NOT MongoDB ObjectId — API returns 404 for ObjectIds)
  */
 async function getBotDeals(botId) {
-  const endpoint = `/api/v2/bots/dca/${botId}`;
-  const url = `${BASE_URL}${endpoint}?fields=_id,uuid,settings.name,deals`;
+  const endpoint = `/api/v2/bots/dca`;
+  const url = `${BASE_URL}${endpoint}?botId=${botId}&fields=_id,uuid,settings.name,deals`;
   const method = 'GET';
   const headers = authHeaders(method, endpoint);
 
@@ -126,25 +126,18 @@ async function listOpenDeals(botId) {
  * Returns true on success, false on failure.
  */
 async function forceCloseDeal(dealId) {
-  const endpoint = `/api/v2/deals/manage`;
-  const method = 'POST';
-  const bodyObj = {
-    action: 'close',
-    dealId,
-    dealType: 'dca',
-    closeType: 'closeByMarket',
-  };
-  const body = JSON.stringify(bodyObj);
-  const headers = authHeaders(method, endpoint, body);
+  const endpoint = `/api/v2/deals/dca/${dealId}`;
+  const method = 'DELETE';
+  const url = `${BASE_URL}${endpoint}?type=closeByMarket`;
+  const headers = authHeaders(method, endpoint);
 
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000); // longer timeout for close
 
-    const res = await fetch(`${BASE_URL}${endpoint}`, {
+    const res = await fetch(url, {
       method,
       headers,
-      body,
       signal: controller.signal,
     });
     clearTimeout(timeout);
