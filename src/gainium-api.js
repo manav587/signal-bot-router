@@ -1,6 +1,6 @@
 /**
- * Gainium REST API v2 Client
- * Used by Signal Bot Router v1.2.0 for deal verification and force-close.
+ * Gainium REST API v1 Client
+ * Used by Signal Bot Router for deal verification and force-close.
  *
  * Auth: HMAC-SHA256 signing per Gainium docs:
  *   signature = HMAC-SHA256(secret, body + method + endpoint + timestamp)
@@ -52,8 +52,9 @@ function authHeaders(method, endpoint, body = '') {
  * @param {string} botId — Bot UUID (NOT MongoDB ObjectId — API returns 404 for ObjectIds)
  */
 async function getBotDeals(botId) {
-  const endpoint = `/api/v2/bots/dca`;
-  const url = `${BASE_URL}${endpoint}?botId=${botId}&fields=_id,uuid,settings.name,deals`;
+  // V1 endpoint — V2 returns 401 with current API key
+  const endpoint = `/api/bots/dca`;
+  const url = `${BASE_URL}${endpoint}`;
   const method = 'GET';
   const headers = authHeaders(method, endpoint);
 
@@ -64,7 +65,7 @@ async function getBotDeals(botId) {
     const res = await fetch(url, { method, headers, signal: controller.signal });
     clearTimeout(timeout);
 
-    // Handle non-JSON responses (e.g. Gainium returning "Not found" as plain text)
+    // Handle non-JSON responses
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       const text = await res.text();
@@ -73,8 +74,14 @@ async function getBotDeals(botId) {
     }
 
     const json = await res.json();
-    if (json.status === 'OK' && json.data) {
-      return json.data.deals; // { active: N, all: N }
+    // V1 returns { data: { result: [...bots...] } }
+    if (json.status === 'OK' && json.data && json.data.result) {
+      const bot = json.data.result.find(b => b.uuid === botId || b._id === botId);
+      if (!bot) {
+        log(`getBotDeals: bot ${botId} not found in ${json.data.result.length} bots`);
+        return null;
+      }
+      return bot.deals; // { active: N, all: N }
     }
     log(`getBotDeals unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
     return null;
@@ -86,12 +93,13 @@ async function getBotDeals(botId) {
 
 /**
  * List open deals for a specific bot.
+ * V1 endpoint — fetches all deals, filters by botId + status client-side.
  * Returns array of { _id, status, pair } or empty array on error.
  */
 async function listOpenDeals(botId) {
-  const endpoint = `/api/v2/deals/dca`;
-  const query = `?botId=${botId}&status=open&fields=_id,status,pair`;
-  const url = `${BASE_URL}${endpoint}${query}`;
+  // V1 endpoint — V2 returns 401 with current API key
+  const endpoint = `/api/deals`;
+  const url = `${BASE_URL}${endpoint}`;
   const method = 'GET';
   const headers = authHeaders(method, endpoint);
 
@@ -110,8 +118,13 @@ async function listOpenDeals(botId) {
     }
 
     const json = await res.json();
-    if (json.status === 'OK' && Array.isArray(json.data)) {
-      return json.data;
+    // V1 returns { data: { result: [...deals...] } }
+    if (json.status === 'OK' && json.data && json.data.result) {
+      const openDeals = json.data.result.filter(d =>
+        (d.botId === botId || d.bot?.uuid === botId) && d.status === 'open'
+      );
+      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botId} (out of ${json.data.result.length} total)`);
+      return openDeals;
     }
     log(`listOpenDeals unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
     return [];
@@ -123,12 +136,14 @@ async function listOpenDeals(botId) {
 
 /**
  * Force-close a single deal by market.
+ * V1 endpoint — DELETE /api/closeDeal/{dealId}
  * Returns true on success, false on failure.
  */
 async function forceCloseDeal(dealId) {
-  const endpoint = `/api/v2/deals/dca/${dealId}`;
+  // V1 endpoint — V2 returns 401 with current API key
+  const endpoint = `/api/closeDeal/${dealId}`;
   const method = 'DELETE';
-  const url = `${BASE_URL}${endpoint}?type=closeByMarket`;
+  const url = `${BASE_URL}${endpoint}`;
   const headers = authHeaders(method, endpoint);
 
   try {
@@ -168,12 +183,12 @@ async function forceCloseDeal(dealId) {
  * Read bot deals with exponential backoff retry.
  * Retries on null (API unreachable) with delays: 3s → 6s → 12s.
  *
- * @param {string} botMongoId — Gainium MongoDB ObjectId
+ * @param {string} botUuid    — Gainium bot UUID
  * @param {string} botName    — Human-readable name (for logging)
  * @param {number} maxAttempts — Number of attempts (default 4)
  * @returns {object|null} — deals object or null if all attempts fail
  */
-async function getBotDealsWithBackoff(botMongoId, botName, maxAttempts = 4) {
+async function getBotDealsWithBackoff(botUuid, botName, maxAttempts = 4) {
   const backoffMs = [0, 3000, 6000, 12000]; // first attempt immediate, then 3s, 6s, 12s
 
   for (let i = 0; i < maxAttempts; i++) {
@@ -183,7 +198,7 @@ async function getBotDealsWithBackoff(botMongoId, botName, maxAttempts = 4) {
       await new Promise(r => setTimeout(r, delay));
     }
 
-    const deals = await getBotDeals(botMongoId);
+    const deals = await getBotDeals(botUuid);
     if (deals) return deals;
   }
 
@@ -194,18 +209,18 @@ async function getBotDealsWithBackoff(botMongoId, botName, maxAttempts = 4) {
 /**
  * Verify that a bot has zero active deals. If deals remain, force-close them.
  *
- * @param {string} botMongoId — Gainium MongoDB ObjectId for the bot
+ * @param {string} botUuid    — Gainium bot UUID
  * @param {string} botName    — Human-readable name (for logging)
  * @param {number} maxRetries — How many verify-then-close cycles (default 2)
  * @returns {{ flat: boolean, forceClosed: number, error: string|null }}
  */
-async function verifyAndForceClose(botMongoId, botName, maxRetries = 2) {
+async function verifyAndForceClose(botUuid, botName, maxRetries = 2) {
   let totalForceClosed = 0;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     log(`[${botName}] Verify attempt ${attempt}/${maxRetries}: checking deals.active...`);
 
-    const deals = await getBotDealsWithBackoff(botMongoId, botName);
+    const deals = await getBotDealsWithBackoff(botUuid, botName);
     if (!deals) {
       return { flat: false, forceClosed: totalForceClosed, error: 'Failed to read bot state from Gainium API (all retries exhausted)' };
     }
@@ -217,7 +232,7 @@ async function verifyAndForceClose(botMongoId, botName, maxRetries = 2) {
 
     log(`[${botName}] ⚠ deals.active = ${deals.active} — fetching open deal IDs...`);
 
-    const openDeals = await listOpenDeals(botMongoId);
+    const openDeals = await listOpenDeals(botUuid);
     if (openDeals.length === 0) {
       // API says active > 0 but no open deals returned — possible lag
       log(`[${botName}] Mismatch: deals.active=${deals.active} but listOpenDeals returned 0. Waiting 3s...`);
@@ -238,7 +253,7 @@ async function verifyAndForceClose(botMongoId, botName, maxRetries = 2) {
   }
 
   // Final check after all retries (also with backoff)
-  const finalDeals = await getBotDealsWithBackoff(botMongoId, botName);
+  const finalDeals = await getBotDealsWithBackoff(botUuid, botName);
   if (finalDeals && finalDeals.active === 0) {
     log(`[${botName}] ✅ Confirmed flat after force-close — deals.active = 0`);
     return { flat: true, forceClosed: totalForceClosed, error: null };

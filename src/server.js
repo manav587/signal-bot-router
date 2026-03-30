@@ -353,7 +353,7 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.3.1',
+    version: '1.3.2',
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -365,39 +365,36 @@ app.get('/test-verify/:uuid', async (req, res) => {
   const bot = BOT_MAP[uuid];
   if (!bot) return res.status(404).json({ error: 'UUID not in BOT_MAP', uuid });
 
-  const crypto = require('crypto');
-  const apiKey = process.env.GAINIUM_API_KEY || '';
-  const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  const method = 'GET';
   const results = {};
 
-  const tests = [
-    { label: 'v1_list', ep: '/api/bots/dca', query: '' },
-    { label: 'v2_bot', ep: '/api/v2/bots/dca', query: `?botId=${uuid}&fields=_id,uuid,settings.name,deals` },
-  ];
-
-  for (const t of tests) {
-    const url = `https://api.gainium.io${t.ep}${t.query}`;
-    const ts = Date.now().toString();
-    const signPayload = `${method}${t.ep}${ts}`;
-    const sig = crypto.createHmac('sha256', apiSecret).update(signPayload).digest('base64');
-    try {
-      const ctrl = new AbortController();
-      const tm = setTimeout(() => ctrl.abort(), 10000);
-      const r = await fetch(url, {
-        method,
-        headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
-        signal: ctrl.signal,
-      });
-      clearTimeout(tm);
-      const body = await r.text();
-      results[t.label] = { status: r.status, body: body.substring(0, 300) };
-    } catch (e) {
-      results[t.label] = { error: e.message };
-    }
+  // Test 1: getBotDeals (V1 — lists all bots, finds ours by UUID)
+  try {
+    const deals = await gainiumApi.getBotDeals(uuid);
+    results.getBotDeals = deals ? { success: true, deals } : { success: false, error: 'returned null' };
+  } catch (e) {
+    results.getBotDeals = { success: false, error: e.message };
   }
 
-  res.json({ bot: bot.name, uuid, apiKeyLen: apiKey.length, secretLen: apiSecret.length, results });
+  // Test 2: listOpenDeals (V1 — lists all deals, filters by botId)
+  try {
+    const openDeals = await gainiumApi.listOpenDeals(uuid);
+    results.listOpenDeals = { success: true, count: openDeals.length, deals: openDeals.map(d => ({ _id: d._id, pair: d.pair, status: d.status })) };
+  } catch (e) {
+    results.listOpenDeals = { success: false, error: e.message };
+  }
+
+  // Test 3: API configured check
+  results.apiConfigured = gainiumApi.isConfigured();
+
+  res.json({
+    bot: bot.name,
+    uuid,
+    mongoId: bot.mongoId,
+    apiConfigured: results.apiConfigured,
+    getBotDeals: results.getBotDeals,
+    listOpenDeals: results.listOpenDeals,
+    timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+  });
 });
 
 // Main webhook endpoint — TradingView sends alerts here
