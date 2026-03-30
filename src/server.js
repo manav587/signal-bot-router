@@ -359,6 +359,29 @@ app.get('/', (req, res) => {
   });
 });
 
+// Test endpoint — verifies REST API can read bot state (read-only, no trades)
+app.get('/test-verify/:uuid', async (req, res) => {
+  const uuid = req.params.uuid;
+  const bot = BOT_MAP[uuid];
+  if (!bot) {
+    return res.status(404).json({ error: 'UUID not in BOT_MAP', uuid });
+  }
+  if (!gainiumApi.isConfigured()) {
+    return res.status(500).json({ error: 'Gainium API not configured' });
+  }
+
+  log(`[test] Testing getBotDeals for ${bot.name} (UUID: ${uuid})...`);
+  const deals = await gainiumApi.getBotDeals(uuid);
+
+  if (deals) {
+    log(`[test] ✅ SUCCESS — ${bot.name}: deals.active=${deals.active}, deals.all=${deals.all}`);
+    res.json({ success: true, bot: bot.name, uuid, deals });
+  } else {
+    log(`[test] ❌ FAILED — ${bot.name}: getBotDeals returned null`);
+    res.status(502).json({ success: false, bot: bot.name, uuid, error: 'getBotDeals returned null' });
+  }
+});
+
 // Main webhook endpoint — TradingView sends alerts here
 app.post('/webhook', (req, res) => {
   // Generate a short request ID for log correlation
