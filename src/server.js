@@ -36,7 +36,7 @@ async function sendTelegramAlert(message) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: TELEGRAM_CHAT_ID,
-        text: `🚨 Signal Bot Router Alert\n\n${message}`,
+        text: message,
         parse_mode: 'HTML',
       }),
     });
@@ -180,7 +180,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
   }
 
   // NOT FLAT — this is critical. Do NOT proceed to startBot.
-  const alertMsg = `FLIP ABORTED for ${targetBot.name}\n\n${result.error}\n\nManual intervention required. The opposite bot was NOT started to prevent position conflict.`;
+  const alertMsg = `🚨 FLIP ABORTED for ${targetBot.name}\n\n${result.error}\n\nManual intervention required. The opposite bot was NOT started to prevent position conflict.`;
   log(`[${requestId}]   🚨 ${alertMsg}`);
   await sendTelegramAlert(alertMsg);
 
@@ -242,6 +242,17 @@ async function processActions(actions, requestId) {
     log(`[${requestId}] ⛔ Sequence PARTIALLY completed — startBot/startDeal skipped (deals not confirmed closed)`);
   } else {
     log(`[${requestId}] ✅ All ${actions.length} action(s) completed`);
+    const completedNames = actions.map(a => a.action).join(' → ');
+    const completedBots = actions
+      .map(a => BOT_MAP[a.uuid]?.name || a.uuid?.substring(0, 8) || '?')
+      .filter((v, i, arr) => arr.indexOf(v) === i);
+    sendTelegramAlert(
+      `✅ Signal Completed\n\n` +
+      `Actions: ${completedNames}\n` +
+      `Bot(s): ${completedBots.join(', ')}\n` +
+      `Time: ${istTimestamp()}\n` +
+      `Request: ${requestId}`
+    ).catch(() => {});
   }
 }
 
@@ -277,6 +288,18 @@ app.post('/webhook', (req, res) => {
   // Log what we received
   const summary = actions.map(a => `${a.action}(${(a.uuid || '').substring(0, 8)})`).join(' → ');
   log(`[${requestId}] 📨 Received: ${summary}`);
+
+  // Build a human-readable description for Telegram
+  const botNames = actions
+    .map(a => BOT_MAP[a.uuid]?.name || a.uuid?.substring(0, 8) || '?')
+    .filter((v, i, arr) => arr.indexOf(v) === i); // dedupe
+  const actionNames = actions.map(a => a.action).join(' → ');
+  const telegramSummary = `📨 Signal Received\n\n` +
+    `Actions: ${actionNames}\n` +
+    `Bot(s): ${botNames.join(', ')}\n` +
+    `Time: ${istTimestamp()}\n` +
+    `Request: ${requestId}`;
+  sendTelegramAlert(telegramSummary).catch(() => {});
 
   // Process in background (don't block the response)
   processActions(actions, requestId).catch(err => {
