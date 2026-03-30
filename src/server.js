@@ -359,16 +359,45 @@ app.get('/', (req, res) => {
   });
 });
 
-// Test force-close — proves forceCloseDeal works via the actual gainium-api code path
+// Test force-close — raw diagnostic version to find the right V1 endpoint
 app.post('/test-force-close/:dealId', async (req, res) => {
   const dealId = req.params.dealId;
   if (!dealId || dealId.length < 10) return res.status(400).json({ error: 'Invalid dealId' });
-  try {
-    const result = await gainiumApi.forceCloseDeal(dealId);
-    res.json({ dealId, success: result, timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) });
-  } catch (e) {
-    res.json({ dealId, success: false, error: e.message });
+
+  const crypto = require('crypto');
+  const apiKey = process.env.GAINIUM_API_KEY || '';
+  const apiSecret = process.env.GAINIUM_API_SECRET || '';
+  const results = {};
+
+  // Try multiple V1 close endpoints to find the right one
+  const attempts = [
+    { label: 'delete_closeDeal', method: 'DELETE', ep: `/api/closeDeal/${dealId}` },
+    { label: 'post_closeDeal', method: 'POST', ep: `/api/closeDeal/${dealId}` },
+    { label: 'delete_deals_dca', method: 'DELETE', ep: `/api/deals/dca/${dealId}` },
+  ];
+
+  for (const a of attempts) {
+    const ts = Date.now().toString();
+    const sig = crypto.createHmac('sha256', apiSecret).update(`${a.method}${a.ep}${ts}`).digest('base64');
+    try {
+      const ctrl = new AbortController();
+      const tm = setTimeout(() => ctrl.abort(), 15000);
+      const r = await fetch(`https://api.gainium.io${a.ep}`, {
+        method: a.method,
+        headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
+        signal: ctrl.signal,
+      });
+      clearTimeout(tm);
+      const body = await r.text();
+      results[a.label] = { status: r.status, body: body.substring(0, 500) };
+      // If we got a 200 OK, stop trying
+      if (r.status === 200) break;
+    } catch (e) {
+      results[a.label] = { error: e.message };
+    }
   }
+
+  res.json({ dealId, results, timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) });
 });
 
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)
