@@ -371,22 +371,25 @@ app.post('/test-force-close/:dealId', async (req, res) => {
 
   // Try multiple V1 close endpoints to find the right one
   const attempts = [
-    { label: 'delete_closeDeal', method: 'DELETE', ep: `/api/closeDeal/${dealId}` },
-    { label: 'post_closeDeal', method: 'POST', ep: `/api/closeDeal/${dealId}` },
-    { label: 'delete_deals_dca', method: 'DELETE', ep: `/api/deals/dca/${dealId}` },
+    { label: 'delete_closeDeal_body', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ type: 'closeByMarket' }) },
+    { label: 'delete_closeDeal_query', method: 'DELETE', ep: `/api/closeDeal/${dealId}?type=closeByMarket`, body: '' },
+    { label: 'delete_closeDeal_cancel', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ type: 'cancel' }) },
   ];
 
   for (const a of attempts) {
     const ts = Date.now().toString();
-    const sig = crypto.createHmac('sha256', apiSecret).update(`${a.method}${a.ep}${ts}`).digest('base64');
+    const bodyStr = a.body || '';
+    const sig = crypto.createHmac('sha256', apiSecret).update(`${bodyStr}${a.method}${a.ep}${ts}`).digest('base64');
     try {
       const ctrl = new AbortController();
       const tm = setTimeout(() => ctrl.abort(), 15000);
-      const r = await fetch(`https://api.gainium.io${a.ep}`, {
+      const fetchOpts = {
         method: a.method,
         headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
         signal: ctrl.signal,
-      });
+      };
+      if (bodyStr) fetchOpts.body = bodyStr;
+      const r = await fetch(`https://api.gainium.io${a.ep}`, fetchOpts);
       clearTimeout(tm);
       const body = await r.text();
       results[a.label] = { status: r.status, body: body.substring(0, 500) };
