@@ -1,11 +1,49 @@
 const express = require('express');
 const app = express();
+const gainiumApi = require('./gainium-api');
 
 // Parse both JSON and plain text bodies (TradingView sends text/plain when message has emoji prefix)
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
+
+// ── UUID → MongoDB ID mapping (for API verification) ────────────────────
+// The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
+// UUID is what TradingView sends; Mongo ID is what the Gainium REST API uses.
+const BOT_MAP = {
+  '108babeb-649f-46ec-8ce8-c8a63a863b39': { mongoId: '69c4ab944c428a9d6a6c2c5d', name: 'ETH Long v2' },
+  '65db6bc2-353c-4590-940a-32bd64f4d3c9': { mongoId: '69c4ab9c4c428a9d6a6c2d07', name: 'ETH Short v2' },
+  'b7d03686-a657-4ced-ad0a-225d28c71ab8': { mongoId: '69c8e321c0cb070ef82a064e', name: 'SOL Long v2' },
+  '87956a3c-4c24-46d1-b071-cd3e6e35c761': { mongoId: '69c4ab8b4c428a9d6a6c2bcb', name: 'SOL Short v2' },
+  '7bd0c5be-6a0e-4d0e-946d-f957ef5a8236': { mongoId: '69c6cb76c0cb070ef8ea2fb8', name: 'XRP Long v2' },
+  '14ea2ce8-c0cd-4eaf-b9b0-54c6ac325921': { mongoId: '69c6cb77c0cb070ef8ea2fd5', name: 'XRP Short v2' },
+};
+
+// ── Telegram Alerts (optional — sends critical failures to Manav) ────────
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+async function sendTelegramAlert(message) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    log(`⚠ Telegram not configured — alert not sent: ${message}`);
+    return;
+  }
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: `🚨 Signal Bot Router Alert\n\n${message}`,
+        parse_mode: 'HTML',
+      }),
+    });
+  } catch (err) {
+    log(`Telegram send failed: ${err.message}`);
+  }
+}
 
 // Delays between action types (milliseconds)
 const DELAYS = {
@@ -75,15 +113,100 @@ async function sendAction(action, attempt = 1) {
   }
 }
 
-// Process actions sequentially with delays
+// ── v1.2.0: Verification logic after closeAllDeals ──────────────────────
+
+/**
+ * Find the bot being CLOSED in this action sequence.
+ * When a crossover fires, closeAllDeals targets the OLD bot (the one being stopped).
+ * The closeAllDeals action contains the UUID of the bot whose deals need closing.
+ */
+function findCloseTargetBot(actions) {
+  const closeAction = actions.find(a => a.action === 'closeAllDeals');
+  if (!closeAction || !closeAction.uuid) return null;
+
+  const bot = BOT_MAP[closeAction.uuid];
+  if (!bot) {
+    log(`⚠ closeAllDeals UUID ${closeAction.uuid} not found in BOT_MAP`);
+    return null;
+  }
+  return { uuid: closeAction.uuid, ...bot };
+}
+
+/**
+ * v1.2.0 enhanced close: double-tap closeAllDeals, then verify and force-close.
+ *
+ * Flow:
+ *   1. Send closeAllDeals (first tap — already done by caller)
+ *   2. Wait 3s, send closeAllDeals again (double-tap)
+ *   3. Wait 5s for Binance to process
+ *   4. Call get_bot → check deals.active
+ *   5. If deals remain → force-close via manage_deal
+ *   6. Re-verify deals.active == 0
+ *   7. If STILL not flat → alert and ABORT (do not proceed to startBot)
+ *
+ * @returns {{ verified: boolean, abortRemaining: boolean }}
+ */
+async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
+  // Step 1: Double-tap — send closeAllDeals again
+  log(`[${requestId}]   🔁 Double-tap: sending closeAllDeals again for ${targetBot.name}...`);
+  await new Promise(r => setTimeout(r, 3000));
+
+  try {
+    await sendAction(closeAction);
+    log(`[${requestId}]   ✓ Double-tap closeAllDeals sent`);
+  } catch (err) {
+    log(`[${requestId}]   ⚠ Double-tap failed: ${err.message} (continuing to verify)`);
+  }
+
+  // Step 2: Wait for Binance to process
+  log(`[${requestId}]   ⏳ Waiting 5s for Binance to settle...`);
+  await new Promise(r => setTimeout(r, 5000));
+
+  // Step 3: Verify via Gainium REST API
+  if (!gainiumApi.isConfigured()) {
+    log(`[${requestId}]   ⚠ Gainium API not configured (GAINIUM_API_KEY/SECRET missing) — skipping verification`);
+    return { verified: false, abortRemaining: false };
+  }
+
+  const result = await gainiumApi.verifyAndForceClose(targetBot.mongoId, targetBot.name);
+
+  if (result.flat) {
+    if (result.forceClosed > 0) {
+      log(`[${requestId}]   ✅ Verified flat — force-closed ${result.forceClosed} deal(s)`);
+    } else {
+      log(`[${requestId}]   ✅ Verified flat — closeAllDeals worked correctly`);
+    }
+    return { verified: true, abortRemaining: false };
+  }
+
+  // NOT FLAT — this is critical. Do NOT proceed to startBot.
+  const alertMsg = `FLIP ABORTED for ${targetBot.name}\n\n${result.error}\n\nManual intervention required. The opposite bot was NOT started to prevent position conflict.`;
+  log(`[${requestId}]   🚨 ${alertMsg}`);
+  await sendTelegramAlert(alertMsg);
+
+  return { verified: false, abortRemaining: true };
+}
+
+// ── Process actions sequentially with delays ─────────────────────────────
+
 async function processActions(actions, requestId) {
   log(`[${requestId}] Processing ${actions.length} action(s)...`);
+
+  // v1.2.0: Identify if this is a crossover flip (has closeAllDeals)
+  const targetBot = findCloseTargetBot(actions);
+  let abortRemaining = false;
 
   for (let i = 0; i < actions.length; i++) {
     const action = actions[i];
     const actionName = action.action || 'unknown';
     const uuid = action.uuid || 'no-uuid';
     const shortUuid = uuid.substring(0, 8);
+
+    // v1.2.0: If verification failed, abort remaining actions (stopBot is OK, but skip startBot/startDeal)
+    if (abortRemaining && (actionName === 'startBot' || actionName === 'startDeal')) {
+      log(`[${requestId}]   ⛔ SKIPPED ${actionName} → ${shortUuid}... (abort: deals not confirmed closed)`);
+      continue;
+    }
 
     log(`[${requestId}]   ${i + 1}/${actions.length}: ${actionName} → ${shortUuid}...`);
 
@@ -95,6 +218,18 @@ async function processActions(actions, requestId) {
       // Continue with remaining actions — don't let one failure block the rest
     }
 
+    // v1.2.0: After closeAllDeals, run verification before proceeding
+    if (actionName === 'closeAllDeals' && targetBot) {
+      const verifyResult = await verifyCloseAllDeals(action, targetBot, requestId);
+      if (verifyResult.abortRemaining) {
+        abortRemaining = true;
+        // Still allow stopBot to proceed (safer to stop the old bot even if close failed)
+        // But skip startBot/startDeal to prevent position conflict
+      }
+      // Skip the normal delay — verification already includes waiting time
+      continue;
+    }
+
     // Apply delay AFTER the action (gives Binance time to process)
     const delayMs = DELAYS[actionName] || 1000;
     if (delayMs > 0 && i < actions.length - 1) {
@@ -103,7 +238,11 @@ async function processActions(actions, requestId) {
     }
   }
 
-  log(`[${requestId}] ✅ All ${actions.length} action(s) completed`);
+  if (abortRemaining) {
+    log(`[${requestId}] ⛔ Sequence PARTIALLY completed — startBot/startDeal skipped (deals not confirmed closed)`);
+  } else {
+    log(`[${requestId}] ✅ All ${actions.length} action(s) completed`);
+  }
 }
 
 // Health check endpoint
@@ -112,7 +251,9 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.1.0',
+    version: '1.2.0',
+    apiConfigured: gainiumApi.isConfigured(),
+    telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
 });
 
@@ -146,8 +287,11 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.1.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.2.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
+  log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
+  log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
+  log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
 });
