@@ -359,6 +359,18 @@ app.get('/', (req, res) => {
   });
 });
 
+// Test force-close — proves forceCloseDeal works via the actual gainium-api code path
+app.post('/test-force-close/:dealId', async (req, res) => {
+  const dealId = req.params.dealId;
+  if (!dealId || dealId.length < 10) return res.status(400).json({ error: 'Invalid dealId' });
+  try {
+    const result = await gainiumApi.forceCloseDeal(dealId);
+    res.json({ dealId, success: result, timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) });
+  } catch (e) {
+    res.json({ dealId, success: false, error: e.message });
+  }
+});
+
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)
 app.get('/test-verify/:uuid', async (req, res) => {
   const uuid = req.params.uuid;
