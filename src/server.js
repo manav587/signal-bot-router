@@ -353,54 +353,10 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.3.5',
+    version: '1.4.0',
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
-});
-
-// Test force-close — raw diagnostic version to find the right V1 endpoint
-app.post('/test-force-close/:dealId', async (req, res) => {
-  const dealId = req.params.dealId;
-  if (!dealId || dealId.length < 10) return res.status(400).json({ error: 'Invalid dealId' });
-
-  const crypto = require('crypto');
-  const apiKey = process.env.GAINIUM_API_KEY || '';
-  const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  const results = {};
-
-  // Try multiple V1 close endpoints to find the right one
-  const attempts = [
-    { label: 'with_dealType', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ dealType: 'dca', type: 'closeByMarket' }) },
-    { label: 'with_closeType', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ dealType: 'dca', closeType: 'closeByMarket' }) },
-    { label: 'with_action', method: 'DELETE', ep: `/api/closeDeal/${dealId}`, body: JSON.stringify({ action: 'close', dealType: 'dca', closeType: 'closeByMarket' }) },
-  ];
-
-  for (const a of attempts) {
-    const ts = Date.now().toString();
-    const bodyStr = a.body || '';
-    const sig = crypto.createHmac('sha256', apiSecret).update(`${bodyStr}${a.method}${a.ep}${ts}`).digest('base64');
-    try {
-      const ctrl = new AbortController();
-      const tm = setTimeout(() => ctrl.abort(), 15000);
-      const fetchOpts = {
-        method: a.method,
-        headers: { 'Content-Type': 'application/json', 'token': apiKey, 'signature': sig, 'time': ts },
-        signal: ctrl.signal,
-      };
-      if (bodyStr) fetchOpts.body = bodyStr;
-      const r = await fetch(`https://api.gainium.io${a.ep}`, fetchOpts);
-      clearTimeout(tm);
-      const body = await r.text();
-      results[a.label] = { status: r.status, body: body.substring(0, 500) };
-      // If we got a 200 OK, stop trying
-      if (r.status === 200) break;
-    } catch (e) {
-      results[a.label] = { error: e.message };
-    }
-  }
-
-  res.json({ dealId, results, timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) });
 });
 
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)

@@ -139,44 +139,38 @@ async function listOpenDeals(botMongoId) {
 }
 
 /**
- * Force-close a single deal by market.
- * V1 endpoint — DELETE /api/closeDeal/{dealId}
- * Returns true on success, false on failure.
+ * Force-close all deals for a bot via the webhook endpoint (closeAllDeals).
+ * The V1 REST DELETE /api/closeDeal/{dealId} returns 400 "Missed required paramas"
+ * with every body format tried — the required params are undocumented.
+ * The webhook closeAllDeals is the proven, reliable close mechanism.
+ *
+ * @param {string} botUuid — Bot UUID (webhook uses UUIDs, not MongoDB IDs)
+ * @returns {boolean} — true if webhook returned 200
  */
-async function forceCloseDeal(dealId) {
-  // V1 endpoint — V2 returns 401 with current API key
-  const endpoint = `/api/closeDeal/${dealId}`;
-  const method = 'DELETE';
-  const url = `${BASE_URL}${endpoint}`;
-  const headers = authHeaders(method, endpoint);
+async function forceCloseDeals(botUuid) {
+  const webhookUrl = 'https://api.gainium.io/trade_signal';
+  const payload = [{ action: 'closeAllDeals', uuid: botUuid }];
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // longer timeout for close
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
-    const res = await fetch(url, {
-      method,
-      headers,
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
     clearTimeout(timeout);
 
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      const text = await res.text();
-      log(`forceCloseDeal non-JSON response (${res.status}): ${text.substring(0, 200)}`);
-      return false;
-    }
-
-    const json = await res.json();
-    if (json.status === 'OK') {
-      log(`forceCloseDeal: deal ${dealId} closed successfully`);
+    if (res.ok) {
+      log(`forceCloseDeals: closeAllDeals webhook sent for bot ${botUuid} — status ${res.status}`);
       return true;
     }
-    log(`forceCloseDeal: deal ${dealId} returned: ${JSON.stringify(json).substring(0, 300)}`);
+    log(`forceCloseDeals: webhook returned ${res.status} for bot ${botUuid}`);
     return false;
   } catch (err) {
-    log(`forceCloseDeal error for ${dealId}: ${err.message}`);
+    log(`forceCloseDeals error for ${botUuid}: ${err.message}`);
     return false;
   }
 }
@@ -235,21 +229,13 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
       return { flat: true, forceClosed: totalForceClosed, error: null };
     }
 
-    log(`[${botName}] ⚠ deals.active = ${deals.active} — fetching open deal IDs...`);
+    log(`[${botName}] ⚠ deals.active = ${deals.active} — sending closeAllDeals webhook...`);
 
-    const openDeals = await listOpenDeals(botMongoId);
-    if (openDeals.length === 0) {
-      // API says active > 0 but no open deals returned — possible lag
-      log(`[${botName}] Mismatch: deals.active=${deals.active} but listOpenDeals returned 0. Waiting 3s...`);
-      await new Promise(r => setTimeout(r, 3000));
-      continue;
-    }
-
-    // Force-close each open deal
-    for (const deal of openDeals) {
-      log(`[${botName}] Force-closing deal ${deal._id} (${deal.pair || 'unknown pair'})...`);
-      const closed = await forceCloseDeal(deal._id);
-      if (closed) totalForceClosed++;
+    const closed = await forceCloseDeals(botUuid);
+    if (closed) {
+      totalForceClosed++;
+    } else {
+      log(`[${botName}] closeAllDeals webhook failed — will retry on next attempt`);
     }
 
     // Wait for Binance to process the close
@@ -279,6 +265,6 @@ module.exports = {
   isConfigured,
   getBotDeals,
   listOpenDeals,
-  forceCloseDeal,
+  forceCloseDeals,
   verifyAndForceClose,
 };
