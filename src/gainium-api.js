@@ -119,12 +119,19 @@ async function listOpenDeals(botMongoId) {
     }
 
     const json = await res.json();
-    // V1 returns { data: { result: [...deals...] } } — deal.botId is a MongoDB ObjectId
-    if (json.status === 'OK' && json.data && json.data.result) {
-      const openDeals = json.data.result.filter(d =>
+    // V1 deals may return { data: [...] } or { data: { result: [...] } } — handle both
+    let allDeals = null;
+    if (json.status === 'OK' && Array.isArray(json.data)) {
+      allDeals = json.data;
+    } else if (json.status === 'OK' && json.data && Array.isArray(json.data.result)) {
+      allDeals = json.data.result;
+    }
+
+    if (allDeals) {
+      const openDeals = allDeals.filter(d =>
         d.botId === botMongoId && d.status === 'open'
       );
-      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botMongoId} (out of ${json.data.result.length} total)`);
+      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botMongoId} (out of ${allDeals.length} total)`);
       return openDeals;
     }
     log(`listOpenDeals unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
