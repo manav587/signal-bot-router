@@ -364,11 +364,13 @@ app.get('/debug-deals', async (req, res) => {
   const crypto = require('crypto');
   const apiKey = process.env.GAINIUM_API_KEY || '';
   const apiSecret = process.env.GAINIUM_API_SECRET || '';
-  const endpoint = '/api/deals';
+  const baseEndpoint = '/api/deals';
   const query = req.query.q || ''; // pass ?q=status%3Dopen%26page%3D8 etc.
-  const url = `https://api.gainium.io${endpoint}${query ? '?' + query : ''}`;
+  const fullEndpoint = query ? `${baseEndpoint}?${query}` : baseEndpoint;
+  const url = `https://api.gainium.io${fullEndpoint}`;
   const ts = Date.now().toString();
-  const sig = crypto.createHmac('sha256', apiSecret).update(`GET${endpoint}${ts}`).digest('base64');
+  // Sign with full endpoint including query params
+  const sig = crypto.createHmac('sha256', apiSecret).update(`GET${fullEndpoint}${ts}`).digest('base64');
   try {
     const ctrl = new AbortController();
     const tm = setTimeout(() => ctrl.abort(), 10000);
@@ -379,7 +381,7 @@ app.get('/debug-deals', async (req, res) => {
     });
     clearTimeout(tm);
     const body = await r.text();
-    res.json({ url, status: r.status, bodyLength: body.length, body: body.substring(0, 2000) });
+    res.json({ url, signedEndpoint: fullEndpoint, status: r.status, bodyLength: body.length, body: body.substring(0, 2000) });
   } catch (e) {
     res.json({ error: e.message });
   }
