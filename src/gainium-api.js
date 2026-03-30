@@ -93,10 +93,11 @@ async function getBotDeals(botId) {
 
 /**
  * List open deals for a specific bot.
- * V1 endpoint — fetches all deals, filters by botId + status client-side.
+ * V1 endpoint — fetches all deals, filters by mongoId + status client-side.
+ * NOTE: V1 deals use MongoDB ObjectId in botId field, NOT UUID.
  * Returns array of { _id, status, pair } or empty array on error.
  */
-async function listOpenDeals(botId) {
+async function listOpenDeals(botMongoId) {
   // V1 endpoint — V2 returns 401 with current API key
   const endpoint = `/api/deals`;
   const url = `${BASE_URL}${endpoint}`;
@@ -118,18 +119,18 @@ async function listOpenDeals(botId) {
     }
 
     const json = await res.json();
-    // V1 returns { data: { result: [...deals...] } }
+    // V1 returns { data: { result: [...deals...] } } — deal.botId is a MongoDB ObjectId
     if (json.status === 'OK' && json.data && json.data.result) {
       const openDeals = json.data.result.filter(d =>
-        (d.botId === botId || d.bot?.uuid === botId) && d.status === 'open'
+        d.botId === botMongoId && d.status === 'open'
       );
-      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botId} (out of ${json.data.result.length} total)`);
+      log(`listOpenDeals: found ${openDeals.length} open deal(s) for bot ${botMongoId} (out of ${json.data.result.length} total)`);
       return openDeals;
     }
     log(`listOpenDeals unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
     return [];
   } catch (err) {
-    log(`listOpenDeals error for bot ${botId}: ${err.message}`);
+    log(`listOpenDeals error for bot ${botMongoId}: ${err.message}`);
     return [];
   }
 }
@@ -209,12 +210,13 @@ async function getBotDealsWithBackoff(botUuid, botName, maxAttempts = 4) {
 /**
  * Verify that a bot has zero active deals. If deals remain, force-close them.
  *
- * @param {string} botUuid    — Gainium bot UUID
+ * @param {string} botUuid    — Gainium bot UUID (for getBotDeals)
+ * @param {string} botMongoId — Gainium MongoDB ObjectId (for listOpenDeals — deals use mongoId, not UUID)
  * @param {string} botName    — Human-readable name (for logging)
  * @param {number} maxRetries — How many verify-then-close cycles (default 2)
  * @returns {{ flat: boolean, forceClosed: number, error: string|null }}
  */
-async function verifyAndForceClose(botUuid, botName, maxRetries = 2) {
+async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2) {
   let totalForceClosed = 0;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -232,7 +234,7 @@ async function verifyAndForceClose(botUuid, botName, maxRetries = 2) {
 
     log(`[${botName}] ⚠ deals.active = ${deals.active} — fetching open deal IDs...`);
 
-    const openDeals = await listOpenDeals(botUuid);
+    const openDeals = await listOpenDeals(botMongoId);
     if (openDeals.length === 0) {
       // API says active > 0 but no open deals returned — possible lag
       log(`[${botName}] Mismatch: deals.active=${deals.active} but listOpenDeals returned 0. Waiting 3s...`);

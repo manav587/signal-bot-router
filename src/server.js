@@ -250,7 +250,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
     return { verified: false, abortRemaining: false };
   }
 
-  const result = await gainiumApi.verifyAndForceClose(targetBot.uuid, targetBot.name);
+  const result = await gainiumApi.verifyAndForceClose(targetBot.uuid, targetBot.mongoId, targetBot.name);
 
   if (result.flat) {
     if (result.forceClosed > 0) {
@@ -353,7 +353,7 @@ app.get('/', (req, res) => {
     service: 'Signal Bot Router',
     status: 'running',
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.3.2',
+    version: '1.3.3',
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -375,9 +375,9 @@ app.get('/test-verify/:uuid', async (req, res) => {
     results.getBotDeals = { success: false, error: e.message };
   }
 
-  // Test 2: listOpenDeals (V1 — lists all deals, filters by botId)
+  // Test 2: listOpenDeals (V1 — lists all deals, filters by mongoId since deals use ObjectId not UUID)
   try {
-    const openDeals = await gainiumApi.listOpenDeals(uuid);
+    const openDeals = await gainiumApi.listOpenDeals(bot.mongoId);
     results.listOpenDeals = { success: true, count: openDeals.length, deals: openDeals.map(d => ({ _id: d._id, pair: d.pair, status: d.status })) };
   } catch (e) {
     results.listOpenDeals = { success: false, error: e.message };
