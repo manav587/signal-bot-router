@@ -359,26 +359,63 @@ app.get('/', (req, res) => {
   });
 });
 
-// Test endpoint — verifies REST API can read bot state (read-only, no trades)
+// Test endpoint — raw diagnostic: shows exact HTTP response from Gainium REST API
 app.get('/test-verify/:uuid', async (req, res) => {
   const uuid = req.params.uuid;
   const bot = BOT_MAP[uuid];
   if (!bot) {
     return res.status(404).json({ error: 'UUID not in BOT_MAP', uuid });
   }
-  if (!gainiumApi.isConfigured()) {
-    return res.status(500).json({ error: 'Gainium API not configured' });
-  }
 
-  log(`[test] Testing getBotDeals for ${bot.name} (UUID: ${uuid})...`);
-  const deals = await gainiumApi.getBotDeals(uuid);
+  // Make the raw API call ourselves so we can capture everything
+  const crypto = require('crypto');
+  const apiKey = process.env.GAINIUM_API_KEY || '';
+  const apiSecret = process.env.GAINIUM_API_SECRET || '';
+  const endpoint = `/api/v2/bots/dca/${uuid}`;
+  const url = `https://api.gainium.io${endpoint}?fields=_id,uuid,settings.name,deals`;
+  const method = 'GET';
+  const timestamp = Date.now().toString();
+  const payload = `${method}${endpoint}${timestamp}`;
+  const signature = crypto.createHmac('sha256', apiSecret).update(payload).digest('base64');
 
-  if (deals) {
-    log(`[test] ✅ SUCCESS — ${bot.name}: deals.active=${deals.active}, deals.all=${deals.all}`);
-    res.json({ success: true, bot: bot.name, uuid, deals });
-  } else {
-    log(`[test] ❌ FAILED — ${bot.name}: getBotDeals returned null`);
-    res.status(502).json({ success: false, bot: bot.name, uuid, error: 'getBotDeals returned null' });
+  log(`[test-diag] Bot: ${bot.name}`);
+  log(`[test-diag] URL: ${url}`);
+  log(`[test-diag] Endpoint (signed): ${endpoint}`);
+  log(`[test-diag] Payload (signed): ${payload}`);
+  log(`[test-diag] API key length: ${apiKey.length}, Secret length: ${apiSecret.length}`);
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'x-api-sign': signature,
+        'x-api-timestamp': timestamp,
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const contentType = response.headers.get('content-type') || '';
+    const body = await response.text();
+
+    log(`[test-diag] Response: ${response.status} ${response.statusText}`);
+    log(`[test-diag] Content-Type: ${contentType}`);
+    log(`[test-diag] Body: ${body.substring(0, 500)}`);
+
+    res.json({
+      bot: bot.name,
+      uuid,
+      request: { url, endpoint, method, apiKeyLength: apiKey.length, secretLength: apiSecret.length },
+      response: { status: response.status, statusText: response.statusText, contentType, body: body.substring(0, 500) },
+    });
+  } catch (err) {
+    log(`[test-diag] Error: ${err.message}`);
+    res.status(500).json({ bot: bot.name, uuid, error: err.message });
   }
 });
 
