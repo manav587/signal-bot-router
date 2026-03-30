@@ -38,9 +38,9 @@ function authHeaders(method, endpoint, body = '') {
   const signature = sign(body, method.toUpperCase(), endpoint, timestamp);
   return {
     'Content-Type': 'application/json',
-    'x-api-key': API_KEY,
-    'x-api-sign': signature,
-    'x-api-timestamp': timestamp,
+    'token': API_KEY,
+    'signature': signature,
+    'time': timestamp,
   };
 }
 

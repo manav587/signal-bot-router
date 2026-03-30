@@ -392,9 +392,9 @@ app.get('/test-verify/:uuid', async (req, res) => {
       method,
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'x-api-sign': signature,
-        'x-api-timestamp': timestamp,
+        'token': apiKey,
+        'signature': signature,
+        'time': timestamp,
       },
       signal: controller.signal,
     });
