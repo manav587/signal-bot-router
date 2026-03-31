@@ -52,6 +52,40 @@ let PAUSED = false;
 let PAUSED_AT = null;    // ISO timestamp of when pause was activated
 let PAUSED_SIGNALS = 0;  // Count of signals received while paused
 
+// ── Rising-Edge Detection (v1.5.1) ─────────────────────────────────────
+// Tracks the last dispatched direction per trading pair.
+// If a signal wants to flip to the SAME direction we already dispatched,
+// it's a duplicate (sustained crossover state, not a new transition) — drop it.
+//
+// Key = pair name (e.g. 'SOLUSDT'), Value = 'LONG' | 'SHORT' | null
+const LAST_DIRECTION = {};
+
+/**
+ * Detect the target direction and pair from a signal's action sequence.
+ * A crossover flip has: closeAllDeals(old) → stopBot(old) → startBot(new)
+ * The direction comes from the startBot target bot name (contains "Long" or "Short").
+ * The pair comes from BOT_MAP.
+ *
+ * @returns {{ pair: string, direction: string } | null}
+ */
+function detectSignalDirection(actions) {
+  const startAction = actions.find(a => a.action === 'startBot');
+  if (!startAction || !startAction.uuid) return null;
+
+  const bot = BOT_MAP[startAction.uuid];
+  if (!bot) return null;
+
+  // Extract direction from bot name: "ETH Long v2" → "LONG", "SOL Short v2" → "SHORT"
+  const direction = bot.name.toLowerCase().includes('long') ? 'LONG' :
+                    bot.name.toLowerCase().includes('short') ? 'SHORT' : null;
+  if (!direction) return null;
+
+  // Extract pair from bot name: "ETH Long v2" → "ETH", "SOL Short v2" → "SOL"
+  const pair = bot.name.split(' ')[0].toUpperCase();
+
+  return { pair, direction, botName: bot.name };
+}
+
 // ── Deferred Flip Queue (v1.3.0) ─────────────────────────────────────────
 // When a flip aborts due to Gainium outage, queue it for retry.
 // Retries every 60s for up to 5 minutes, then gives up with a Telegram alert.
@@ -363,7 +397,8 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.5.0',
+    version: '1.5.1',
+    lastDirections: LAST_DIRECTION,
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -488,6 +523,28 @@ app.post('/webhook', (req, res) => {
     return;
   }
 
+  // ── v1.5.1: Rising-edge detection — suppress duplicate direction ────
+  const signal = detectSignalDirection(actions);
+  if (signal) {
+    const { pair, direction, botName } = signal;
+    if (LAST_DIRECTION[pair] === direction) {
+      log(`[${requestId}] 🔇 DUPLICATE suppressed — ${pair} already ${direction} (last dispatched). Dropping signal.`);
+      sendTelegramAlert(
+        `🔇 Duplicate Signal Suppressed\n\n` +
+        `${pair}: already ${direction}\n` +
+        `Bot: ${botName}\n` +
+        `Actions: ${actionNames}\n` +
+        `Time: ${istTimestamp()}\n` +
+        `Request: ${requestId}\n\n` +
+        `This is the same direction we last dispatched. No action taken.`
+      ).catch(() => {});
+      return;
+    }
+    // Valid new direction — update tracking BEFORE dispatch
+    LAST_DIRECTION[pair] = direction;
+    log(`[${requestId}] 📊 Rising-edge: ${pair} direction change → ${direction}`);
+  }
+
   const telegramSummary = `📨 Signal Received\n\n` +
     `Actions: ${actionNames}\n` +
     `Bot(s): ${botNames.join(', ')}\n` +
@@ -504,7 +561,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.5.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.5.1 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
