@@ -29,12 +29,15 @@ const CONFIG = {
     shortMaximum: 60,      // Only go SHORT if RSI < 60
   },
 
-  // Data providers — CryptoCompare primary (cloud-friendly, no geo-block)
-  // Bybit and Binance blocked from Render's US cloud IPs (403/451)
+  // Data providers — ordered by reliability from US cloud IPs
+  // Binance Data Vision = public read-only data API (works from US cloud)
+  // CryptoCompare = cloud-friendly aggregator (needs API key from server IPs)
+  // Standard Binance/Bybit APIs are geo-blocked from US cloud (451/403)
   providers: [
+    { name: 'Binance-Data', type: 'binance', baseUrl: 'https://data-api.binance.vision' },
     { name: 'CryptoCompare', type: 'cryptocompare', baseUrl: 'https://min-api.cryptocompare.com' },
-    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
     { name: 'Binance', type: 'binance', baseUrl: 'https://api.binance.com' },
+    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
   ],
   fetchTimeout: 5000,      // 5s timeout per API call
 };
