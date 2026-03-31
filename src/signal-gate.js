@@ -29,9 +29,13 @@ const CONFIG = {
     shortMaximum: 60,      // Only go SHORT if RSI < 60
   },
 
-  // Binance API
-  binanceBaseUrl: 'https://api.binance.com',
-  fetchTimeout: 5000,      // 5s timeout for Binance API calls
+  // Data providers (Bybit primary — no geo-block; Binance fallback)
+  providers: [
+    { name: 'Bybit', baseUrl: 'https://api.bybit.com' },
+    { name: 'Binance', baseUrl: 'https://api.binance.com' },
+    { name: 'Binance-1', baseUrl: 'https://api1.binance.com' },
+  ],
+  fetchTimeout: 5000,      // 5s timeout per API call
 };
 
 // ── Pair name mapping ────────────────────────────────────────────────────
@@ -42,29 +46,68 @@ const PAIR_TO_SYMBOL = {
   XRP: 'XRPUSDT',
 };
 
+// ── Bybit interval mapping ────────────────────────────────────────────────
+// Bybit uses different interval names than Binance
+const BYBIT_INTERVALS = {
+  '1d': 'D',
+  '4h': '240',
+  '1h': '60',
+  '15m': '15',
+};
+
 /**
- * Fetch OHLC candles from Binance public API.
- * @param {string} symbol - e.g. 'ETHUSDT'
- * @param {string} interval - e.g. '1d', '4h'
- * @param {number} limit - number of candles
- * @returns {Array<{open: number, high: number, low: number, close: number, time: number}>}
+ * Fetch OHLC candles from Bybit public API.
+ * Bybit returns data in DESCENDING order (newest first) — we reverse it.
  */
-async function fetchCandles(symbol, interval, limit) {
+async function fetchCandlesBybit(baseUrl, symbol, interval, limit) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
 
   try {
-    const url = `${CONFIG.binanceBaseUrl}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const bybitInterval = BYBIT_INTERVALS[interval] || interval;
+    const url = `${baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitInterval}&limit=${limit}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeout);
 
-    if (!res.ok) {
-      throw new Error(`Binance API ${res.status}: ${res.statusText}`);
-    }
+    if (!res.ok) throw new Error(`Bybit API ${res.status}`);
+
+    const json = await res.json();
+    if (json.retCode !== 0) throw new Error(`Bybit error: ${json.retMsg}`);
+
+    // Bybit format: ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
+    // Returned in DESC order — reverse to ASC (oldest first)
+    return json.result.list
+      .map(k => ({
+        time: parseInt(k[0]),
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }))
+      .reverse();
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
+  }
+}
+
+/**
+ * Fetch OHLC candles from Binance public API.
+ */
+async function fetchCandlesBinance(baseUrl, symbol, interval, limit) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
+
+  try {
+    const url = `${baseUrl}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!res.ok) throw new Error(`Binance API ${res.status}`);
 
     const data = await res.json();
-
-    // Binance klines format: [openTime, open, high, low, close, volume, closeTime, ...]
+    // Binance format: [openTime, open, high, low, close, volume, closeTime, ...]
     return data.map(k => ({
       time: k[0],
       open: parseFloat(k[1]),
@@ -75,8 +118,36 @@ async function fetchCandles(symbol, interval, limit) {
     }));
   } catch (err) {
     clearTimeout(timeout);
-    throw new Error(`Binance candle fetch failed for ${symbol} ${interval}: ${err.message}`);
+    throw err;
   }
+}
+
+/**
+ * Fetch candles with automatic provider fallback.
+ * Tries Bybit first (no geo-block), falls back to Binance mirrors.
+ *
+ * @param {string} symbol - e.g. 'ETHUSDT'
+ * @param {string} interval - e.g. '1d', '4h'
+ * @param {number} limit - number of candles
+ * @returns {Array<{open, high, low, close, volume, time}>}
+ */
+async function fetchCandles(symbol, interval, limit) {
+  const errors = [];
+
+  for (const provider of CONFIG.providers) {
+    try {
+      const fetcher = provider.name.startsWith('Binance')
+        ? fetchCandlesBinance
+        : fetchCandlesBybit;
+      const candles = await fetcher(provider.baseUrl, symbol, interval, limit);
+      if (candles.length > 0) return candles;
+      errors.push(`${provider.name}: returned 0 candles`);
+    } catch (err) {
+      errors.push(`${provider.name}: ${err.message}`);
+    }
+  }
+
+  throw new Error(`All providers failed for ${symbol} ${interval}: ${errors.join('; ')}`);
 }
 
 /**
