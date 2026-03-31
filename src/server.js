@@ -53,6 +53,12 @@ let PAUSED = false;
 let PAUSED_AT = null;    // ISO timestamp of when pause was activated
 let PAUSED_SIGNALS = 0;  // Count of signals received while paused
 
+// ── Active Bot Tracker (v1.7.1) ────────────────────────────────────────
+// Tracks which bots the relay has started, so we can re-validate them.
+// Key = UUID, Value = { pair, direction, botName, startedAt }
+// Only populated when the relay dispatches a startBot action.
+const ACTIVE_BOTS = {};
+
 // ── Rising-Edge Detection (v1.5.1) ─────────────────────────────────────
 // Tracks the last dispatched direction per trading pair.
 // If a signal wants to flip to the SAME direction we already dispatched,
@@ -398,8 +404,10 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.7.0',
+    version: '1.7.1',
     lastDirections: LAST_DIRECTION,
+    activeBots: ACTIVE_BOTS,
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)' },
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
@@ -599,10 +607,28 @@ app.post('/webhook', (req, res) => {
         `Actions: ${actionNames}\n` +
         `Bot(s): ${botNames.join(', ')}\n` +
         `Price: $${gateResult.data.currentPrice?.toFixed(2) || '?'} ${gateResult.data.priceVsEma || ''} EMA50\n` +
-        `RSI(14): ${gateResult.data.rsi14 || '?'}\n` +
+        `4H Trend: ${gateResult.data.shortTermTrend || '?'}\n` +
+        `RSI(14): ${gateResult.data.rsi14 || '?'} ${gateResult.data.rsiDirection || ''}\n` +
         `Time: ${istTimestamp()}\n` +
         `Request: ${requestId}`;
       sendTelegramAlert(telegramSummary).catch(() => {});
+
+      // Track the started bot for periodic re-validation
+      const startAction = actions.find(a => a.action === 'startBot');
+      if (startAction && startAction.uuid) {
+        ACTIVE_BOTS[startAction.uuid] = {
+          pair: signal.pair,
+          direction: signal.direction,
+          botName: signal.botName,
+          startedAt: new Date().toISOString(),
+        };
+        log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction})`);
+      }
+      // Clear any stopped bots from tracking
+      const stopAction = actions.find(a => a.action === 'stopBot');
+      if (stopAction && stopAction.uuid) {
+        delete ACTIVE_BOTS[stopAction.uuid];
+      }
 
       processActions(actions, requestId).catch(err => {
         log(`[${requestId}] ❌ Unexpected error: ${err.message}`);
@@ -631,14 +657,87 @@ app.post('/webhook', (req, res) => {
   });
 });
 
+// ── Periodic Re-validation (v1.7.1) ─────────────────────────────────────
+// Every 2 minutes, re-check all running bots against Gate 2 (4H EMA 9/21)
+// and Gate 4 (RSI direction). If conditions have changed, stop the bot.
+// FAIL-CLOSED: If data fetch fails, stop the bot.
+const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
+let revalRunning = false;
+
+async function runRevalidation() {
+  if (revalRunning) return; // prevent overlapping runs
+  revalRunning = true;
+
+  const activeUUIDs = Object.keys(ACTIVE_BOTS);
+  if (activeUUIDs.length === 0) {
+    revalRunning = false;
+    return;
+  }
+
+  for (const uuid of activeUUIDs) {
+    const bot = ACTIVE_BOTS[uuid];
+    if (!bot) continue;
+
+    try {
+      const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
+
+      if (result.allowed) {
+        log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
+      } else {
+        // Conditions changed — stop the bot
+        log(`🔄 Reval FAILED: ${bot.botName} — ${result.reason}`);
+
+        // Send closeAllDeals + stopBot via webhook
+        const closePayload = JSON.stringify([
+          { action: 'closeAllDeals', uuid },
+          { action: 'stopBot', uuid },
+        ]);
+        try {
+          await fetch(GAINIUM_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: closePayload,
+          });
+          log(`🔄 Reval: Sent closeAllDeals + stopBot for ${bot.botName}`);
+        } catch (webhookErr) {
+          log(`🔄 Reval: Webhook failed for ${bot.botName}: ${webhookErr.message}`);
+        }
+
+        // Remove from active tracking
+        delete ACTIVE_BOTS[uuid];
+        // Clear rising-edge so next signal for this pair is treated as fresh
+        delete LAST_DIRECTION[bot.pair];
+
+        // Alert to Telegram
+        const alertMsg = `🔄 REVALIDATION STOP\n\n` +
+          `Bot: ${bot.botName}\n` +
+          `Reason: ${result.reason}\n` +
+          `Data: 4H trend ${result.data.shortTermTrend || '?'}, RSI ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}\n` +
+          `Started: ${bot.startedAt}\n` +
+          `Stopped: ${new Date().toISOString()}\n\n` +
+          `Bot will restart on next valid TradingView signal.`;
+        sendTelegramAlert(alertMsg).catch(() => {});
+      }
+    } catch (err) {
+      log(`🔄 Reval error for ${bot.botName}: ${err.message}`);
+    }
+  }
+
+  revalRunning = false;
+}
+
+// Start the re-validation interval
+setInterval(runRevalidation, REVAL_INTERVAL);
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.7.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.7.1 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
+  log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
 });

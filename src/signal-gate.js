@@ -405,6 +405,112 @@ async function validateSignal(pair, direction) {
 }
 
 /**
+ * Lightweight re-validation for running bots (v1.7.1).
+ * Only checks Gate 2 (4H EMA 9/21) and Gate 4 (RSI direction).
+ * Skips daily EMA50 (doesn't change intraday) and RSI level (less actionable).
+ *
+ * FAIL-CLOSED: If data fetch fails, returns allowed=false.
+ * This is the opposite of the initial gate (fail-open) because:
+ * - Initial gate: deciding whether to START → fail-open (don't miss opportunities)
+ * - Re-validation: bot is already RUNNING → fail-closed (stop if we can't verify)
+ *
+ * @param {string} pair - e.g. 'ETH', 'SOL', 'XRP'
+ * @param {string} direction - 'LONG' or 'SHORT'
+ * @returns {{ allowed: boolean, reason: string, data: object }}
+ */
+async function revalidateSignal(pair, direction) {
+  const pairInfo = PAIR_TO_SYMBOL[pair];
+  if (!pairInfo) {
+    return { allowed: true, reason: 'Unknown pair — passing through', data: {} };
+  }
+
+  const data = {};
+
+  try {
+    // Single API call — only 4H candles needed for both checks
+    const fourHourCandles = await fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded);
+    const fourHourCloses = fourHourCandles.map(c => c.close);
+
+    // Gate 2: 4H EMA 9/21 short-term trend
+    const ema9 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.fast);
+    const ema21 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.slow);
+
+    // Gate 4: RSI direction
+    const rsi14 = calculateRSI(fourHourCloses, CONFIG.rsi.period);
+    let rsiDirection = 'FLAT';
+    const slopeN = CONFIG.rsi.slopeCandles;
+    if (fourHourCloses.length > slopeN) {
+      const olderCloses = fourHourCloses.slice(0, -slopeN);
+      const olderRsi = calculateRSI(olderCloses, CONFIG.rsi.period);
+      if (rsi14 !== null && olderRsi !== null) {
+        const rsiDelta = rsi14 - olderRsi;
+        rsiDirection = rsiDelta > 1.5 ? 'RISING' : rsiDelta < -1.5 ? 'FALLING' : 'FLAT';
+        data.rsiPrevious = olderRsi;
+        data.rsiDelta = parseFloat(rsiDelta.toFixed(2));
+      }
+    }
+
+    data.currentPrice = fourHourCloses[fourHourCloses.length - 1];
+    data.ema9_4h = ema9;
+    data.ema21_4h = ema21;
+    data.shortTermTrend = (ema9 && ema21) ? (ema9 > ema21 ? 'BULLISH' : 'BEARISH') : 'UNKNOWN';
+    data.rsi14 = rsi14;
+    data.rsiDirection = rsiDirection;
+
+    // Check Gate 2: 4H EMA 9/21
+    if (ema9 !== null && ema21 !== null) {
+      if (direction === 'LONG' && ema9 < ema21) {
+        return {
+          allowed: false,
+          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} — short-term bearish, LONG no longer valid`,
+          data,
+        };
+      }
+      if (direction === 'SHORT' && ema9 > ema21) {
+        return {
+          allowed: false,
+          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} — short-term bullish, SHORT no longer valid`,
+          data,
+        };
+      }
+    }
+
+    // Check Gate 4: RSI direction
+    if (rsiDirection !== 'FLAT') {
+      if (direction === 'SHORT' && rsiDirection === 'RISING') {
+        return {
+          allowed: false,
+          reason: `REVALIDATION — RSI DIRECTION: RSI rising (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bullish momentum, SHORT no longer valid`,
+          data,
+        };
+      }
+      if (direction === 'LONG' && rsiDirection === 'FALLING') {
+        return {
+          allowed: false,
+          reason: `REVALIDATION — RSI DIRECTION: RSI falling (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bearish momentum, LONG no longer valid`,
+          data,
+        };
+      }
+    }
+
+    // Still valid
+    return {
+      allowed: true,
+      reason: `REVALIDATION PASSED: 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
+      data,
+    };
+
+  } catch (err) {
+    // FAIL-CLOSED: If we can't verify, stop the bot.
+    return {
+      allowed: false,
+      reason: `REVALIDATION FAIL-CLOSED: Data fetch failed (${err.message}) — stopping bot for safety`,
+      data,
+    };
+  }
+}
+
+/**
  * Get current gate configuration (for health/status endpoints).
  */
 function getConfig() {
@@ -416,4 +522,4 @@ function getConfig() {
   };
 }
 
-module.exports = { validateSignal, getConfig, CONFIG };
+module.exports = { validateSignal, revalidateSignal, getConfig, CONFIG };
