@@ -29,22 +29,71 @@ const CONFIG = {
     shortMaximum: 60,      // Only go SHORT if RSI < 60
   },
 
-  // Data providers (Bybit primary — no geo-block; Binance fallback)
+  // Data providers — CryptoCompare primary (cloud-friendly, no geo-block)
+  // Bybit and Binance blocked from Render's US cloud IPs (403/451)
   providers: [
-    { name: 'Bybit', baseUrl: 'https://api.bybit.com' },
-    { name: 'Binance', baseUrl: 'https://api.binance.com' },
-    { name: 'Binance-1', baseUrl: 'https://api1.binance.com' },
+    { name: 'CryptoCompare', type: 'cryptocompare', baseUrl: 'https://min-api.cryptocompare.com' },
+    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
+    { name: 'Binance', type: 'binance', baseUrl: 'https://api.binance.com' },
   ],
   fetchTimeout: 5000,      // 5s timeout per API call
 };
 
 // ── Pair name mapping ────────────────────────────────────────────────────
-// BOT_MAP uses names like "ETH Long v2" → we need "ETHUSDT" for Binance
 const PAIR_TO_SYMBOL = {
-  ETH: 'ETHUSDT',
-  SOL: 'SOLUSDT',
-  XRP: 'XRPUSDT',
+  ETH: { symbol: 'ETHUSDT', base: 'ETH', quote: 'USDT' },
+  SOL: { symbol: 'SOLUSDT', base: 'SOL', quote: 'USDT' },
+  XRP: { symbol: 'XRPUSDT', base: 'XRP', quote: 'USDT' },
 };
+
+// ── CryptoCompare interval mapping ───────────────────────────────────────
+// CryptoCompare has separate endpoints per timeframe
+const CC_ENDPOINTS = {
+  '1d': 'histoday',
+  '4h': 'histohour',
+  '1h': 'histohour',
+};
+const CC_AGGREGATE = {
+  '1d': 1,
+  '4h': 4,    // aggregate 4 hourly candles
+  '1h': 1,
+};
+
+/**
+ * Fetch OHLC candles from CryptoCompare.
+ * Cloud-friendly — no geo-blocking from Render/AWS/GCP IPs.
+ */
+async function fetchCandlesCryptoCompare(baseUrl, pairInfo, interval, limit) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
+
+  try {
+    const endpoint = CC_ENDPOINTS[interval] || 'histoday';
+    const aggregate = CC_AGGREGATE[interval] || 1;
+    const url = `${baseUrl}/data/v2/${endpoint}?fsym=${pairInfo.base}&tsym=${pairInfo.quote}&limit=${limit}&aggregate=${aggregate}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!res.ok) throw new Error(`CryptoCompare API ${res.status}`);
+
+    const json = await res.json();
+    if (json.Response !== 'Success') throw new Error(`CryptoCompare error: ${json.Message}`);
+
+    // CryptoCompare format: { time, open, high, low, close, volumefrom, volumeto }
+    // Returned in ASC order (oldest first) — no reversal needed
+    return json.Data.Data.map(k => ({
+      time: k.time * 1000,
+      open: k.open,
+      high: k.high,
+      low: k.low,
+      close: k.close,
+      volume: k.volumefrom,
+    }));
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
+  }
+}
 
 // ── Bybit interval mapping ────────────────────────────────────────────────
 // Bybit uses different interval names than Binance
@@ -124,22 +173,26 @@ async function fetchCandlesBinance(baseUrl, symbol, interval, limit) {
 
 /**
  * Fetch candles with automatic provider fallback.
- * Tries Bybit first (no geo-block), falls back to Binance mirrors.
+ * Tries CryptoCompare first (cloud-friendly), falls back to Bybit/Binance.
  *
- * @param {string} symbol - e.g. 'ETHUSDT'
+ * @param {object} pairInfo - { symbol: 'ETHUSDT', base: 'ETH', quote: 'USDT' }
  * @param {string} interval - e.g. '1d', '4h'
  * @param {number} limit - number of candles
  * @returns {Array<{open, high, low, close, volume, time}>}
  */
-async function fetchCandles(symbol, interval, limit) {
+async function fetchCandles(pairInfo, interval, limit) {
   const errors = [];
 
   for (const provider of CONFIG.providers) {
     try {
-      const fetcher = provider.name.startsWith('Binance')
-        ? fetchCandlesBinance
-        : fetchCandlesBybit;
-      const candles = await fetcher(provider.baseUrl, symbol, interval, limit);
+      let candles;
+      if (provider.type === 'cryptocompare') {
+        candles = await fetchCandlesCryptoCompare(provider.baseUrl, pairInfo, interval, limit);
+      } else if (provider.type === 'bybit') {
+        candles = await fetchCandlesBybit(provider.baseUrl, pairInfo.symbol, interval, limit);
+      } else {
+        candles = await fetchCandlesBinance(provider.baseUrl, pairInfo.symbol, interval, limit);
+      }
       if (candles.length > 0) return candles;
       errors.push(`${provider.name}: returned 0 candles`);
     } catch (err) {
@@ -147,7 +200,7 @@ async function fetchCandles(symbol, interval, limit) {
     }
   }
 
-  throw new Error(`All providers failed for ${symbol} ${interval}: ${errors.join('; ')}`);
+  throw new Error(`All providers failed for ${pairInfo.symbol} ${interval}: ${errors.join('; ')}`);
 }
 
 /**
@@ -186,8 +239,8 @@ function calculateRSI(closes, period) {
  * @returns {{ allowed: boolean, reason: string, data: object }}
  */
 async function validateSignal(pair, direction) {
-  const symbol = PAIR_TO_SYMBOL[pair];
-  if (!symbol) {
+  const pairInfo = PAIR_TO_SYMBOL[pair];
+  if (!pairInfo) {
     return { allowed: true, reason: 'Unknown pair — passing through', data: {} };
   }
 
@@ -196,8 +249,8 @@ async function validateSignal(pair, direction) {
   try {
     // Fetch daily candles for trend EMA and 4h candles for RSI in parallel
     const [dailyCandles, fourHourCandles] = await Promise.all([
-      fetchCandles(symbol, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
-      fetchCandles(symbol, CONFIG.rsi.timeframe, CONFIG.rsi.candlesNeeded),
+      fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
+      fetchCandles(pairInfo, CONFIG.rsi.timeframe, CONFIG.rsi.candlesNeeded),
     ]);
 
     // Calculate daily 50 EMA
