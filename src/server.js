@@ -93,6 +93,18 @@ function detectSignalDirection(actions) {
   return { pair, direction, botName: bot.name };
 }
 
+// ── Opposite Bot Lookup (v1.8.0) ────────────────────────────────────────
+// Given a pair and direction, find the UUID of the opposite-direction bot.
+// e.g. ("SOL", "SHORT") → UUID of "SOL Long v2"
+function findOppositeBot(pair, direction) {
+  const oppositeDir = direction === 'LONG' ? 'Short' : 'Long';
+  const targetName = `${pair} ${oppositeDir} v2`;
+  for (const [uuid, bot] of Object.entries(BOT_MAP)) {
+    if (bot.name === targetName) return { uuid, ...bot };
+  }
+  return null;
+}
+
 // ── Deferred Flip Queue (v1.3.0) ─────────────────────────────────────────
 // When a flip aborts due to Gainium outage, queue it for retry.
 // Retries every 60s for up to 5 minutes, then gives up with a Telegram alert.
@@ -404,10 +416,10 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.7.1',
+    version: '1.8.0',
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)' },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)', autoFlip: true },
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
@@ -708,14 +720,67 @@ async function runRevalidation() {
         // Clear rising-edge so next signal for this pair is treated as fresh
         delete LAST_DIRECTION[bot.pair];
 
-        // Alert to Telegram
-        const alertMsg = `🔄 REVALIDATION STOP\n\n` +
+        // ── v1.8.0: Auto-flip — try the opposite direction ──────────
+        const oppositeDir = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
+        const oppositeBot = findOppositeBot(bot.pair, bot.direction);
+        let flipResult = null;
+
+        if (oppositeBot) {
+          log(`🔄 Auto-flip: checking ${bot.pair} ${oppositeDir} through full 4-gate validation...`);
+          try {
+            const gateResult = await signalGate.validateSignal(bot.pair, oppositeDir);
+            if (gateResult.allowed) {
+              // Opposite direction passes all 4 gates — start it
+              log(`🔄 Auto-flip: ${oppositeBot.name} PASSED all gates — starting`);
+              try {
+                await fetch(GAINIUM_WEBHOOK_URL, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify([{ action: 'startBot', uuid: oppositeBot.uuid }]),
+                });
+                // Track the new bot
+                ACTIVE_BOTS[oppositeBot.uuid] = {
+                  pair: bot.pair,
+                  direction: oppositeDir,
+                  botName: oppositeBot.name,
+                  startedAt: new Date().toISOString(),
+                };
+                LAST_DIRECTION[bot.pair] = oppositeDir;
+                flipResult = { flipped: true, botName: oppositeBot.name, gateData: gateResult.data };
+                log(`🔄 Auto-flip: ${oppositeBot.name} started and tracked`);
+              } catch (flipErr) {
+                log(`🔄 Auto-flip: webhook failed for ${oppositeBot.name}: ${flipErr.message}`);
+                flipResult = { flipped: false, reason: `Webhook failed: ${flipErr.message}` };
+              }
+            } else {
+              log(`🔄 Auto-flip: ${bot.pair} ${oppositeDir} BLOCKED — ${gateResult.reason}`);
+              flipResult = { flipped: false, reason: gateResult.reason };
+            }
+          } catch (gateErr) {
+            log(`🔄 Auto-flip: gate error for ${bot.pair} ${oppositeDir}: ${gateErr.message}`);
+            flipResult = { flipped: false, reason: `Gate error: ${gateErr.message}` };
+          }
+        }
+
+        // Alert to Telegram (includes flip result)
+        let alertMsg = `🔄 REVALIDATION STOP\n\n` +
           `Bot: ${bot.botName}\n` +
           `Reason: ${result.reason}\n` +
           `Data: 4H trend ${result.data.shortTermTrend || '?'}, RSI ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}\n` +
           `Started: ${bot.startedAt}\n` +
-          `Stopped: ${new Date().toISOString()}\n\n` +
-          `Bot will restart on next valid TradingView signal.`;
+          `Stopped: ${new Date().toISOString()}`;
+
+        if (flipResult && flipResult.flipped) {
+          alertMsg += `\n\n↔️ AUTO-FLIP: Started ${flipResult.botName}\n` +
+            `Price: $${flipResult.gateData.currentPrice?.toFixed(2) || '?'}\n` +
+            `4H Trend: ${flipResult.gateData.shortTermTrend || '?'}\n` +
+            `RSI: ${flipResult.gateData.rsi14 || '?'} ${flipResult.gateData.rsiDirection || ''}`;
+        } else if (flipResult) {
+          alertMsg += `\n\n⏸️ No flip: ${flipResult.reason}\nBoth directions blocked — staying flat until next signal.`;
+        } else {
+          alertMsg += `\n\nNo opposite bot found for ${bot.pair}.`;
+        }
+
         sendTelegramAlert(alertMsg).catch(() => {});
       }
     } catch (err) {
@@ -732,7 +797,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.7.1 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.8.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
