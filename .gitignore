@@ -2,3 +2,11 @@ node_modules/
 .env
 .DS_Store
 *.log
+
+# Local docs and briefings (not for repo)
+conversation-history.md
+comet-briefing-*.md
+trading_signal_research.md
+daily-briefings/
+config/
+docs/briefings/

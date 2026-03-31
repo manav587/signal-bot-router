@@ -1,6 +1,7 @@
 const express = require('express');
 const app = express();
 const gainiumApi = require('./gainium-api');
+const signalGate = require('./signal-gate');
 
 // Parse both JSON and plain text bodies (TradingView sends text/plain when message has emoji prefix)
 app.use(express.json());
@@ -397,8 +398,9 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.5.1',
+    version: '1.6.0',
     lastDirections: LAST_DIRECTION,
+    signalGate: signalGate.getConfig(),
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -441,6 +443,28 @@ app.get('/resume', (req, res) => {
     `All incoming signals will now be executed normally.`
   ).catch(() => {});
   res.json({ status: 'running', pauseDuration: pauseDuration + 's', signalsMissed });
+});
+
+// Test endpoint — signal gate test (v1.6.0)
+// Returns what the gate would decide for each pair + direction
+app.get('/test-gate/:pair', async (req, res) => {
+  const pair = req.params.pair.toUpperCase();
+  const results = {};
+
+  for (const direction of ['LONG', 'SHORT']) {
+    try {
+      results[direction] = await signalGate.validateSignal(pair, direction);
+    } catch (err) {
+      results[direction] = { error: err.message };
+    }
+  }
+
+  res.json({
+    pair,
+    timestamp: istTimestamp(),
+    gateConfig: signalGate.getConfig(),
+    results,
+  });
 });
 
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)
@@ -545,6 +569,54 @@ app.post('/webhook', (req, res) => {
     log(`[${requestId}] 📊 Rising-edge: ${pair} direction change → ${direction}`);
   }
 
+  // ── v1.6.0: Signal gate — trend + RSI validation ─────────────────────
+  // Only runs for crossover flips (where we detected a direction).
+  // Fetches candles from Binance, checks trend alignment + momentum.
+  if (signal) {
+    const { pair, direction, botName } = signal;
+    signalGate.validateSignal(pair, direction).then(gateResult => {
+      if (!gateResult.allowed) {
+        // Revert the LAST_DIRECTION since we're not dispatching
+        delete LAST_DIRECTION[pair];
+        log(`[${requestId}] 🚫 SIGNAL GATED — ${gateResult.reason}`);
+        sendTelegramAlert(
+          `🚫 Signal Gated (not executed)\n\n` +
+          `${pair} ${direction} → BLOCKED\n` +
+          `Reason: ${gateResult.reason}\n` +
+          `Price: $${gateResult.data.currentPrice?.toFixed(2) || '?'}\n` +
+          `EMA50: $${gateResult.data.ema50?.toFixed(2) || '?'} (${gateResult.data.priceVsEma || '?'})\n` +
+          `RSI(14): ${gateResult.data.rsi14 || '?'}\n` +
+          `Time: ${istTimestamp()}\n` +
+          `Request: ${requestId}`
+        ).catch(() => {});
+        return;
+      }
+
+      // Gate passed — proceed with dispatch
+      log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
+      const telegramSummary = `📨 Signal Received (gate passed)\n\n` +
+        `Actions: ${actionNames}\n` +
+        `Bot(s): ${botNames.join(', ')}\n` +
+        `Price: $${gateResult.data.currentPrice?.toFixed(2) || '?'} ${gateResult.data.priceVsEma || ''} EMA50\n` +
+        `RSI(14): ${gateResult.data.rsi14 || '?'}\n` +
+        `Time: ${istTimestamp()}\n` +
+        `Request: ${requestId}`;
+      sendTelegramAlert(telegramSummary).catch(() => {});
+
+      processActions(actions, requestId).catch(err => {
+        log(`[${requestId}] ❌ Unexpected error: ${err.message}`);
+      });
+    }).catch(err => {
+      // Gate failed to run — let signal through (fail-open)
+      log(`[${requestId}] ⚠ Gate error (passing through): ${err.message}`);
+      processActions(actions, requestId).catch(err2 => {
+        log(`[${requestId}] ❌ Unexpected error: ${err2.message}`);
+      });
+    });
+    return;
+  }
+
+  // Non-crossover signals (no startBot action) — pass through without gating
   const telegramSummary = `📨 Signal Received\n\n` +
     `Actions: ${actionNames}\n` +
     `Bot(s): ${botNames.join(', ')}\n` +
@@ -561,7 +633,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.5.1 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.6.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
