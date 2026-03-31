@@ -67,6 +67,63 @@ const ACTIVE_BOTS = {};
 // Key = pair name (e.g. 'SOLUSDT'), Value = 'LONG' | 'SHORT' | null
 const LAST_DIRECTION = {};
 
+// ── Flip Cooldown (v1.9.0) ─────────────────────────────────────────────
+// After an auto-flip, block further auto-flips on that pair for 10 minutes.
+// TradingView signals still pass — only relay-initiated auto-flips are throttled.
+// Key = pair name, Value = ISO timestamp of last auto-flip
+const FLIP_COOLDOWN = {};
+const FLIP_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
+function isFlipOnCooldown(pair) {
+  const lastFlip = FLIP_COOLDOWN[pair];
+  if (!lastFlip) return false;
+  return (Date.now() - new Date(lastFlip).getTime()) < FLIP_COOLDOWN_MS;
+}
+
+// ── Circuit Breaker (v1.9.0) ───────────────────────────────────────────
+// 3 flips (auto-flip OR TradingView-triggered) on the same pair within 15 min
+// = park that pair for 30 min. During park: no auto-flips, no TradingView signals.
+// Key = pair name, Value = { flips: [timestamps], parkedUntil: ISO | null }
+const CIRCUIT_BREAKER = {};
+const CB_FLIP_THRESHOLD = 3;
+const CB_WINDOW_MS = 15 * 60 * 1000;   // 15-minute window
+const CB_PARK_MS = 30 * 60 * 1000;     // 30-minute park duration
+
+function recordFlip(pair) {
+  if (!CIRCUIT_BREAKER[pair]) {
+    CIRCUIT_BREAKER[pair] = { flips: [], parkedUntil: null };
+  }
+  CIRCUIT_BREAKER[pair].flips.push(Date.now());
+  // Prune old flips outside the window
+  const cutoff = Date.now() - CB_WINDOW_MS;
+  CIRCUIT_BREAKER[pair].flips = CIRCUIT_BREAKER[pair].flips.filter(t => t > cutoff);
+}
+
+function checkCircuitBreaker(pair) {
+  const cb = CIRCUIT_BREAKER[pair];
+  if (!cb) return { parked: false };
+
+  // Check if currently parked
+  if (cb.parkedUntil && Date.now() < new Date(cb.parkedUntil).getTime()) {
+    const remainMs = new Date(cb.parkedUntil).getTime() - Date.now();
+    return { parked: true, remainMs, reason: `Circuit breaker active — parked until ${cb.parkedUntil}` };
+  }
+
+  // Clear expired park
+  if (cb.parkedUntil) cb.parkedUntil = null;
+
+  // Check if threshold reached
+  const cutoff = Date.now() - CB_WINDOW_MS;
+  const recentFlips = cb.flips.filter(t => t > cutoff);
+  if (recentFlips.length >= CB_FLIP_THRESHOLD) {
+    // TRIP the breaker
+    cb.parkedUntil = new Date(Date.now() + CB_PARK_MS).toISOString();
+    return { parked: true, tripped: true, remainMs: CB_PARK_MS, reason: `${recentFlips.length} flips in ${CB_WINDOW_MS / 60000} min — parking for ${CB_PARK_MS / 60000} min` };
+  }
+
+  return { parked: false };
+}
+
 /**
  * Detect the target direction and pair from a signal's action sequence.
  * A crossover flip has: closeAllDeals(old) → stopBot(old) → startBot(new)
@@ -416,10 +473,12 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.8.0',
+    version: '1.9.0',
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)', autoFlip: true },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)', autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
+    circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
+    flipCooldowns: FLIP_COOLDOWN,
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
@@ -588,6 +647,27 @@ app.post('/webhook', (req, res) => {
     // Valid new direction — update tracking BEFORE dispatch
     LAST_DIRECTION[pair] = direction;
     log(`[${requestId}] 📊 Rising-edge: ${pair} direction change → ${direction}`);
+
+    // ── v1.9.0: Circuit breaker — block parked pairs ──────────────────
+    const cbCheck = checkCircuitBreaker(pair);
+    if (cbCheck.parked) {
+      // Revert LAST_DIRECTION since we're not dispatching
+      delete LAST_DIRECTION[pair];
+      log(`[${requestId}] ⚡ CIRCUIT BREAKER — ${pair} is parked: ${cbCheck.reason}`);
+      sendTelegramAlert(
+        `⚡ Signal Blocked (Circuit Breaker)\n\n` +
+        `${pair} ${direction} → PARKED\n` +
+        `Reason: ${cbCheck.reason}\n` +
+        `Bot: ${botName}\n` +
+        `Time: ${istTimestamp()}\n` +
+        `Request: ${requestId}\n\n` +
+        `TradingView signal dropped. Pair will resume when park expires.`
+      ).catch(() => {});
+      return;
+    }
+
+    // Record this TradingView flip for circuit breaker tracking
+    recordFlip(pair);
   }
 
   // ── v1.7.0: Signal gate — trend + short-term EMA + RSI + RSI direction ──
@@ -720,68 +800,95 @@ async function runRevalidation() {
         // Clear rising-edge so next signal for this pair is treated as fresh
         delete LAST_DIRECTION[bot.pair];
 
-        // ── v1.8.0: Auto-flip — try the opposite direction ──────────
-        const oppositeDir = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
-        const oppositeBot = findOppositeBot(bot.pair, bot.direction);
-        let flipResult = null;
+        // Record this stop as a flip event for circuit breaker tracking
+        recordFlip(bot.pair);
 
-        if (oppositeBot) {
-          log(`🔄 Auto-flip: checking ${bot.pair} ${oppositeDir} through full 4-gate validation...`);
-          try {
-            const gateResult = await signalGate.validateSignal(bot.pair, oppositeDir);
-            if (gateResult.allowed) {
-              // Opposite direction passes all 4 gates — start it
-              log(`🔄 Auto-flip: ${oppositeBot.name} PASSED all gates — starting`);
-              try {
-                await fetch(GAINIUM_WEBHOOK_URL, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify([{ action: 'startBot', uuid: oppositeBot.uuid }]),
-                });
-                // Track the new bot
-                ACTIVE_BOTS[oppositeBot.uuid] = {
-                  pair: bot.pair,
-                  direction: oppositeDir,
-                  botName: oppositeBot.name,
-                  startedAt: new Date().toISOString(),
-                };
-                LAST_DIRECTION[bot.pair] = oppositeDir;
-                flipResult = { flipped: true, botName: oppositeBot.name, gateData: gateResult.data };
-                log(`🔄 Auto-flip: ${oppositeBot.name} started and tracked`);
-              } catch (flipErr) {
-                log(`🔄 Auto-flip: webhook failed for ${oppositeBot.name}: ${flipErr.message}`);
-                flipResult = { flipped: false, reason: `Webhook failed: ${flipErr.message}` };
-              }
-            } else {
-              log(`🔄 Auto-flip: ${bot.pair} ${oppositeDir} BLOCKED — ${gateResult.reason}`);
-              flipResult = { flipped: false, reason: gateResult.reason };
-            }
-          } catch (gateErr) {
-            log(`🔄 Auto-flip: gate error for ${bot.pair} ${oppositeDir}: ${gateErr.message}`);
-            flipResult = { flipped: false, reason: `Gate error: ${gateErr.message}` };
-          }
-        }
-
-        // Alert to Telegram (includes flip result)
-        let alertMsg = `🔄 REVALIDATION STOP\n\n` +
-          `Bot: ${bot.botName}\n` +
-          `Reason: ${result.reason}\n` +
-          `Data: 4H trend ${result.data.shortTermTrend || '?'}, RSI ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}\n` +
-          `Started: ${bot.startedAt}\n` +
-          `Stopped: ${new Date().toISOString()}`;
-
-        if (flipResult && flipResult.flipped) {
-          alertMsg += `\n\n↔️ AUTO-FLIP: Started ${flipResult.botName}\n` +
-            `Price: $${flipResult.gateData.currentPrice?.toFixed(2) || '?'}\n` +
-            `4H Trend: ${flipResult.gateData.shortTermTrend || '?'}\n` +
-            `RSI: ${flipResult.gateData.rsi14 || '?'} ${flipResult.gateData.rsiDirection || ''}`;
-        } else if (flipResult) {
-          alertMsg += `\n\n⏸️ No flip: ${flipResult.reason}\nBoth directions blocked — staying flat until next signal.`;
+        // ── v1.9.0: Check circuit breaker BEFORE attempting auto-flip ──
+        const cbCheck = checkCircuitBreaker(bot.pair);
+        if (cbCheck.parked && cbCheck.tripped) {
+          // Circuit breaker just tripped — stop any active bot on this pair and park
+          log(`🔄 ⚡ CIRCUIT BREAKER TRIPPED: ${bot.pair} — ${cbCheck.reason}`);
+          sendTelegramAlert(
+            `⚡ CIRCUIT BREAKER: ${bot.pair} parked for 30 min\n\n` +
+            `Reason: ${cbCheck.reason}\n` +
+            `Market is choppy — no trades on ${bot.pair} until ${CIRCUIT_BREAKER[bot.pair].parkedUntil}\n` +
+            `Other pairs continue normally.\n` +
+            `Time: ${istTimestamp()}`
+          ).catch(() => {});
+          // Skip auto-flip entirely
+        } else if (cbCheck.parked) {
+          // Already parked from earlier trip
+          log(`🔄 ⚡ ${bot.pair} still parked (circuit breaker) — skipping auto-flip`);
         } else {
-          alertMsg += `\n\nNo opposite bot found for ${bot.pair}.`;
-        }
+          // ── v1.8.0 + v1.9.0: Auto-flip with cooldown ──────────────
+          const oppositeDir = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
+          const oppositeBot = findOppositeBot(bot.pair, bot.direction);
+          let flipResult = null;
 
-        sendTelegramAlert(alertMsg).catch(() => {});
+          if (!oppositeBot) {
+            flipResult = { flipped: false, reason: `No opposite bot found for ${bot.pair}` };
+          } else if (isFlipOnCooldown(bot.pair)) {
+            const cooldownRemain = Math.ceil((FLIP_COOLDOWN_MS - (Date.now() - new Date(FLIP_COOLDOWN[bot.pair]).getTime())) / 1000);
+            log(`🔄 Auto-flip: ${bot.pair} on cooldown (${cooldownRemain}s remaining) — skipping`);
+            flipResult = { flipped: false, reason: `Flip cooldown active (${cooldownRemain}s remaining)` };
+          } else {
+            log(`🔄 Auto-flip: checking ${bot.pair} ${oppositeDir} through full 4-gate validation...`);
+            try {
+              const gateResult = await signalGate.validateSignal(bot.pair, oppositeDir);
+              if (gateResult.allowed) {
+                log(`🔄 Auto-flip: ${oppositeBot.name} PASSED all gates — starting`);
+                try {
+                  await fetch(GAINIUM_WEBHOOK_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify([{ action: 'startBot', uuid: oppositeBot.uuid }]),
+                  });
+                  ACTIVE_BOTS[oppositeBot.uuid] = {
+                    pair: bot.pair,
+                    direction: oppositeDir,
+                    botName: oppositeBot.name,
+                    startedAt: new Date().toISOString(),
+                  };
+                  LAST_DIRECTION[bot.pair] = oppositeDir;
+                  // Set cooldown — no further auto-flips on this pair for 10 min
+                  FLIP_COOLDOWN[bot.pair] = new Date().toISOString();
+                  // Record the flip for circuit breaker
+                  recordFlip(bot.pair);
+                  flipResult = { flipped: true, botName: oppositeBot.name, gateData: gateResult.data };
+                  log(`🔄 Auto-flip: ${oppositeBot.name} started and tracked (cooldown set)`);
+                } catch (flipErr) {
+                  log(`🔄 Auto-flip: webhook failed for ${oppositeBot.name}: ${flipErr.message}`);
+                  flipResult = { flipped: false, reason: `Webhook failed: ${flipErr.message}` };
+                }
+              } else {
+                log(`🔄 Auto-flip: ${bot.pair} ${oppositeDir} BLOCKED — ${gateResult.reason}`);
+                flipResult = { flipped: false, reason: gateResult.reason };
+              }
+            } catch (gateErr) {
+              log(`🔄 Auto-flip: gate error for ${bot.pair} ${oppositeDir}: ${gateErr.message}`);
+              flipResult = { flipped: false, reason: `Gate error: ${gateErr.message}` };
+            }
+          }
+
+          // Alert to Telegram (includes flip result)
+          let alertMsg = `🔄 REVALIDATION STOP\n\n` +
+            `Bot: ${bot.botName}\n` +
+            `Reason: ${result.reason}\n` +
+            `Data: 4H trend ${result.data.shortTermTrend || '?'}, RSI ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}\n` +
+            `Started: ${bot.startedAt}\n` +
+            `Stopped: ${new Date().toISOString()}`;
+
+          if (flipResult && flipResult.flipped) {
+            alertMsg += `\n\n↔️ AUTO-FLIP: Started ${flipResult.botName}\n` +
+              `Price: $${flipResult.gateData.currentPrice?.toFixed(2) || '?'}\n` +
+              `4H Trend: ${flipResult.gateData.shortTermTrend || '?'}\n` +
+              `RSI: ${flipResult.gateData.rsi14 || '?'} ${flipResult.gateData.rsiDirection || ''}`;
+          } else if (flipResult) {
+            alertMsg += `\n\n⏸️ No flip: ${flipResult.reason}`;
+          }
+
+          sendTelegramAlert(alertMsg).catch(() => {});
+        }
       }
     } catch (err) {
       log(`🔄 Reval error for ${bot.botName}: ${err.message}`);
@@ -797,7 +904,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.8.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.9.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
