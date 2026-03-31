@@ -45,6 +45,13 @@ async function sendTelegramAlert(message) {
   }
 }
 
+// ── Pause Mode (v1.5.0) ─────────────────────────────────────────────────
+// When paused, the relay logs incoming signals to Telegram but skips execution.
+// This lets you see what TradingView is sending without any bots being started.
+let PAUSED = false;
+let PAUSED_AT = null;    // ISO timestamp of when pause was activated
+let PAUSED_SIGNALS = 0;  // Count of signals received while paused
+
 // ── Deferred Flip Queue (v1.3.0) ─────────────────────────────────────────
 // When a flip aborts due to Gainium outage, queue it for retry.
 // Retries every 60s for up to 5 minutes, then gives up with a Telegram alert.
@@ -351,12 +358,54 @@ async function processActions(actions, requestId, isRetry = false) {
 app.get('/', (req, res) => {
   res.json({
     service: 'Signal Bot Router',
-    status: 'running',
+    status: PAUSED ? 'paused' : 'running',
+    paused: PAUSED,
+    pausedAt: PAUSED_AT,
+    pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.4.0',
+    version: '1.5.0',
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
+});
+
+// ── Pause / Resume endpoints (v1.5.0) ───────────────────────────────────
+app.get('/pause', (req, res) => {
+  if (PAUSED) {
+    return res.json({ status: 'already paused', pausedAt: PAUSED_AT, pausedSignals: PAUSED_SIGNALS });
+  }
+  PAUSED = true;
+  PAUSED_AT = new Date().toISOString();
+  PAUSED_SIGNALS = 0;
+  log('⏸️ SYSTEM PAUSED — signals will be logged but NOT executed');
+  sendTelegramAlert(
+    `⏸️ System PAUSED\n\n` +
+    `All incoming signals will be logged but NOT executed.\n` +
+    `Bots will not be started/stopped.\n` +
+    `Time: ${istTimestamp()}\n\n` +
+    `Resume: GET /resume`
+  ).catch(() => {});
+  res.json({ status: 'paused', pausedAt: PAUSED_AT });
+});
+
+app.get('/resume', (req, res) => {
+  if (!PAUSED) {
+    return res.json({ status: 'already running' });
+  }
+  const pauseDuration = Math.floor((Date.now() - new Date(PAUSED_AT).getTime()) / 1000);
+  const signalsMissed = PAUSED_SIGNALS;
+  PAUSED = false;
+  PAUSED_AT = null;
+  PAUSED_SIGNALS = 0;
+  log(`▶️ SYSTEM RESUMED — was paused for ${pauseDuration}s, ${signalsMissed} signal(s) received while paused`);
+  sendTelegramAlert(
+    `▶️ System RESUMED\n\n` +
+    `Was paused for ${Math.floor(pauseDuration / 60)}m ${pauseDuration % 60}s\n` +
+    `Signals received while paused: ${signalsMissed}\n` +
+    `Time: ${istTimestamp()}\n\n` +
+    `All incoming signals will now be executed normally.`
+  ).catch(() => {});
+  res.json({ status: 'running', pauseDuration: pauseDuration + 's', signalsMissed });
 });
 
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)
@@ -423,6 +472,22 @@ app.post('/webhook', (req, res) => {
     .map(a => BOT_MAP[a.uuid]?.name || a.uuid?.substring(0, 8) || '?')
     .filter((v, i, arr) => arr.indexOf(v) === i); // dedupe
   const actionNames = actions.map(a => a.action).join(' → ');
+
+  // ── v1.5.0: Pause mode — log but don't execute ──────────────────────
+  if (PAUSED) {
+    PAUSED_SIGNALS++;
+    log(`[${requestId}] ⏸️ PAUSED — signal logged but NOT executed: ${summary}`);
+    sendTelegramAlert(
+      `⏸️ Signal Received (PAUSED — not executed)\n\n` +
+      `Actions: ${actionNames}\n` +
+      `Bot(s): ${botNames.join(', ')}\n` +
+      `Time: ${istTimestamp()}\n` +
+      `Request: ${requestId}\n\n` +
+      `Signal #${PAUSED_SIGNALS} since pause. Resume: GET /resume`
+    ).catch(() => {});
+    return;
+  }
+
   const telegramSummary = `📨 Signal Received\n\n` +
     `Actions: ${actionNames}\n` +
     `Bot(s): ${botNames.join(', ')}\n` +
@@ -439,7 +504,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.3.1 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.5.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
