@@ -1,9 +1,13 @@
 /**
- * Signal Gate (v1.6.0)
+ * Signal Gate (v1.7.0)
  *
  * Server-side signal validation using technical indicators.
  * Fetches candles from Binance public API, calculates EMA and RSI,
  * and gates crossover signals before they reach Gainium.
+ *
+ * v1.7.0: Added 4H EMA 9/21 short-term trend filter and RSI direction check.
+ *         Fixes timeframe mismatch where daily trend was bearish but intraday
+ *         price was rallying, causing shorts to get ground up.
  *
  * No API key needed — Binance /api/v3/klines is public.
  */
@@ -20,6 +24,14 @@ const CONFIG = {
     candlesNeeded: 60,     // Need 60 daily candles to stabilize a 50-period EMA
   },
 
+  // 4H EMA 9/21 short-term trend filter — must agree with daily trend
+  shortTermEma: {
+    fast: 9,
+    slow: 21,
+    timeframe: '4h',
+    candlesNeeded: 30,     // Need 30 candles to stabilize a 21-period EMA
+  },
+
   // RSI momentum confirmation (4h timeframe — same as crossover chart)
   rsi: {
     period: 14,
@@ -27,6 +39,7 @@ const CONFIG = {
     candlesNeeded: 20,     // Need 20 candles to stabilize a 14-period RSI
     longMinimum: 40,       // Only go LONG if RSI > 40
     shortMaximum: 60,      // Only go SHORT if RSI < 60
+    slopeCandles: 3,       // Compare RSI now vs N candles ago for direction
   },
 
   // Data providers — ordered by reliability from US cloud IPs
@@ -252,10 +265,11 @@ async function validateSignal(pair, direction) {
   const data = {};
 
   try {
-    // Fetch daily candles for trend EMA and 4h candles for RSI in parallel
+    // Fetch daily candles for trend EMA and 4h candles for RSI + short-term EMA in parallel
+    // We need more 4h candles now (30) for the 21-period EMA to stabilize
     const [dailyCandles, fourHourCandles] = await Promise.all([
       fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
-      fetchCandles(pairInfo, CONFIG.rsi.timeframe, CONFIG.rsi.candlesNeeded),
+      fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded),
     ]);
 
     // Calculate daily 50 EMA
@@ -263,13 +277,35 @@ async function validateSignal(pair, direction) {
     const currentPrice = dailyCloses[dailyCloses.length - 1];
     const ema50 = calculateEMA(dailyCloses, CONFIG.trendEma.period);
 
-    // Calculate 4h RSI(14)
+    // Calculate 4h EMA 9 and EMA 21 (short-term trend)
     const fourHourCloses = fourHourCandles.map(c => c.close);
+    const ema9 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.fast);
+    const ema21 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.slow);
+
+    // Calculate 4h RSI(14) — current value
     const rsi14 = calculateRSI(fourHourCloses, CONFIG.rsi.period);
+
+    // Calculate RSI direction — compare current RSI to N candles ago
+    let rsiDirection = 'FLAT';
+    const slopeN = CONFIG.rsi.slopeCandles;
+    if (fourHourCloses.length > slopeN) {
+      const olderCloses = fourHourCloses.slice(0, -slopeN);
+      const olderRsi = calculateRSI(olderCloses, CONFIG.rsi.period);
+      if (rsi14 !== null && olderRsi !== null) {
+        const rsiDelta = rsi14 - olderRsi;
+        rsiDirection = rsiDelta > 1.5 ? 'RISING' : rsiDelta < -1.5 ? 'FALLING' : 'FLAT';
+        data.rsiPrevious = olderRsi;
+        data.rsiDelta = parseFloat(rsiDelta.toFixed(2));
+      }
+    }
 
     data.currentPrice = currentPrice;
     data.ema50 = ema50;
+    data.ema9_4h = ema9;
+    data.ema21_4h = ema21;
+    data.shortTermTrend = (ema9 && ema21) ? (ema9 > ema21 ? 'BULLISH' : 'BEARISH') : 'UNKNOWN';
     data.rsi14 = rsi14;
+    data.rsiDirection = rsiDirection;
     data.priceVsEma = ema50 ? (currentPrice > ema50 ? 'ABOVE' : 'BELOW') : 'UNKNOWN';
 
     // ── Gate 1: Daily 50 EMA trend filter ──────────────────────────────
@@ -290,7 +326,27 @@ async function validateSignal(pair, direction) {
       }
     }
 
-    // ── Gate 2: RSI momentum confirmation ──────────────────────────────
+    // ── Gate 2: 4H EMA 9/21 short-term trend filter ──────────────────
+    // The short-term trend must agree with the trade direction.
+    // This prevents shorting during intraday rallies in a daily bearish trend.
+    if (ema9 !== null && ema21 !== null) {
+      if (direction === 'LONG' && ema9 < ema21) {
+        return {
+          allowed: false,
+          reason: `SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} — short-term bearish, LONG rejected`,
+          data,
+        };
+      }
+      if (direction === 'SHORT' && ema9 > ema21) {
+        return {
+          allowed: false,
+          reason: `SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} — short-term bullish, SHORT rejected`,
+          data,
+        };
+      }
+    }
+
+    // ── Gate 3: RSI level confirmation ─────────────────────────────────
     if (rsi14 !== null) {
       if (direction === 'LONG' && rsi14 < CONFIG.rsi.longMinimum) {
         return {
@@ -308,10 +364,31 @@ async function validateSignal(pair, direction) {
       }
     }
 
-    // Both gates passed
+    // ── Gate 4: RSI direction confirmation ─────────────────────────────
+    // Block trades when RSI momentum is moving against the trade direction.
+    // RISING RSI = bullish momentum building → block shorts
+    // FALLING RSI = bearish momentum building → block longs
+    if (rsiDirection !== 'FLAT') {
+      if (direction === 'SHORT' && rsiDirection === 'RISING') {
+        return {
+          allowed: false,
+          reason: `RSI DIRECTION: RSI rising (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bullish momentum building, SHORT rejected`,
+          data,
+        };
+      }
+      if (direction === 'LONG' && rsiDirection === 'FALLING') {
+        return {
+          allowed: false,
+          reason: `RSI DIRECTION: RSI falling (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bearish momentum building, LONG rejected`,
+          data,
+        };
+      }
+    }
+
+    // All gates passed
     return {
       allowed: true,
-      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, RSI(14) = ${rsi14 || '?'}`,
+      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
       data,
     };
 
@@ -333,7 +410,9 @@ async function validateSignal(pair, direction) {
 function getConfig() {
   return {
     trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe}`,
+    shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (must agree with trade direction)`,
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
+    rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (RISING blocks SHORT, FALLING blocks LONG)`,
   };
 }
 

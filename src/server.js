@@ -398,7 +398,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.6.0',
+    version: '1.7.0',
     lastDirections: LAST_DIRECTION,
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
@@ -446,7 +446,7 @@ app.get('/resume', (req, res) => {
   res.json({ status: 'running', pauseDuration: pauseDuration + 's', signalsMissed });
 });
 
-// Test endpoint — signal gate test (v1.6.0)
+// Test endpoint — signal gate test (v1.7.0)
 // Returns what the gate would decide for each pair + direction
 app.get('/test-gate/:pair', async (req, res) => {
   const pair = req.params.pair.toUpperCase();
@@ -570,7 +570,7 @@ app.post('/webhook', (req, res) => {
     log(`[${requestId}] 📊 Rising-edge: ${pair} direction change → ${direction}`);
   }
 
-  // ── v1.6.0: Signal gate — trend + RSI validation ─────────────────────
+  // ── v1.7.0: Signal gate — trend + short-term EMA + RSI + RSI direction ──
   // Only runs for crossover flips (where we detected a direction).
   // Fetches candles from Binance, checks trend alignment + momentum.
   if (signal) {
@@ -634,7 +634,7 @@ app.post('/webhook', (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.6.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v1.7.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
