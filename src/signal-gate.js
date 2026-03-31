@@ -70,7 +70,9 @@ async function fetchCandlesCryptoCompare(baseUrl, pairInfo, interval, limit) {
   try {
     const endpoint = CC_ENDPOINTS[interval] || 'histoday';
     const aggregate = CC_AGGREGATE[interval] || 1;
-    const url = `${baseUrl}/data/v2/${endpoint}?fsym=${pairInfo.base}&tsym=${pairInfo.quote}&limit=${limit}&aggregate=${aggregate}`;
+    const apiKey = process.env.CRYPTOCOMPARE_API_KEY || '';
+    const keyParam = apiKey ? `&api_key=${apiKey}` : '';
+    const url = `${baseUrl}/data/v2/${endpoint}?fsym=${pairInfo.base}&tsym=${pairInfo.quote}&limit=${limit}&aggregate=${aggregate}${keyParam}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeout);
 

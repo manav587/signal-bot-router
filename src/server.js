@@ -401,6 +401,7 @@ app.get('/', (req, res) => {
     version: '1.6.0',
     lastDirections: LAST_DIRECTION,
     signalGate: signalGate.getConfig(),
+    cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
