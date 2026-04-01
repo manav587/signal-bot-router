@@ -273,6 +273,7 @@ async function runFundingCheck() {
         direction,
         botName: targetBot.name,
         startedAt: new Date().toISOString(),
+        entryPrice: result.data.markPrice || null,
       };
       if (oppositeBot) {
         delete ACTIVE_BOTS[oppositeBot.uuid];
@@ -645,7 +646,7 @@ app.get('/', (req, res) => {
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21)', autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + price drawdown', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -968,8 +969,9 @@ app.post('/webhook', (req, res) => {
           direction: signal.direction,
           botName: signal.botName,
           startedAt: new Date().toISOString(),
+          entryPrice: gateResult.data.currentPrice || null,
         };
-        log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction})`);
+        log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
       }
       // Clear any stopped bots from tracking
       const stopAction = actions.find(a => a.action === 'stopBot');
@@ -1009,6 +1011,7 @@ app.post('/webhook', (req, res) => {
 // and Gate 4 (RSI direction). If conditions have changed, stop the bot.
 // FAIL-CLOSED: If data fetch fails, stop the bot.
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
+const REVAL_MAX_DRAWDOWN_PCT = 1.5;    // v2.3.0: kill bot if price moves 1.5% against direction
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1027,6 +1030,22 @@ async function runRevalidation() {
 
     try {
       const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
+
+      // v2.3.0: Price drawdown check — catch fast moves that 4H EMAs miss
+      if (result.allowed && bot.entryPrice && result.data.currentPrice) {
+        const currentPrice = result.data.currentPrice;
+        const pctMove = ((currentPrice - bot.entryPrice) / bot.entryPrice) * 100;
+        const drawdown = bot.direction === 'LONG' ? -pctMove : pctMove; // positive = bad
+
+        if (drawdown > REVAL_MAX_DRAWDOWN_PCT) {
+          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${bot.entryPrice.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max)`;
+          log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
+          result.allowed = false;
+          result.reason = reason;
+        } else {
+          log(`🔄 Reval price check: ${bot.botName} @ $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% from entry) — within ${REVAL_MAX_DRAWDOWN_PCT}% limit`);
+        }
+      }
 
       if (result.allowed) {
         log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
@@ -1096,13 +1115,17 @@ async function runRevalidation() {
                   await fetch(GAINIUM_WEBHOOK_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify([{ action: 'startBot', uuid: oppositeBot.uuid }]),
+                    body: JSON.stringify([
+                      { action: 'startBot', uuid: oppositeBot.uuid },
+                      { action: 'startDeal', uuid: oppositeBot.uuid },
+                    ]),
                   });
                   ACTIVE_BOTS[oppositeBot.uuid] = {
                     pair: bot.pair,
                     direction: oppositeDir,
                     botName: oppositeBot.name,
                     startedAt: new Date().toISOString(),
+                    entryPrice: gateResult.data.currentPrice || null,
                   };
                   LAST_DIRECTION[bot.pair] = oppositeDir;
                   // Set cooldown — no further auto-flips on this pair for 10 min
