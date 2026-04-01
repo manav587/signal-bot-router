@@ -27,13 +27,12 @@ const CONFIG = {
   },
 
   // API providers — ordered by reliability from US cloud IPs
-  // Binance Futures is geo-blocked from US cloud → Bybit as primary
+  // Same approach as signal-gate.js: Bybit works from Render, Binance is geo-blocked
   providers: [
     { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
     { name: 'Binance', type: 'binance', baseUrl: 'https://fapi.binance.com' },
-    { name: 'Binance-Mirror', type: 'binance', baseUrl: 'https://fapi1.binance.com' },
   ],
-  fetchTimeout: 5000,
+  fetchTimeout: 8000,  // 8s — generous timeout for cold starts
 
   // Cooldown — don't re-signal the same pair/direction within one funding period
   cooldownMs: 8 * 60 * 60 * 1000, // 8 hours
