@@ -56,6 +56,15 @@ let PAUSED = false;
 let PAUSED_AT = null;    // ISO timestamp of when pause was activated
 let PAUSED_SIGNALS = 0;  // Count of signals received while paused
 
+// ── Strategy Toggle (v2.2.0) ────────────────────────────────────────────
+// Switch between signal sources. Only one active at a time.
+//   'crossover' = TradingView EMA crossover alerts (default, current system)
+//   'funding'   = Binance funding rate mean-reversion (polls every 4h)
+let STRATEGY_MODE = 'crossover';
+let STRATEGY_CHANGED_AT = null;
+let FUNDING_POLL_TIMER = null;
+const FUNDING_POLL_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+
 // ── Active Bot Tracker (v1.7.1) ────────────────────────────────────────
 // Tracks which bots the relay has started, so we can re-validate them.
 // Key = UUID, Value = { pair, direction, botName, startedAt }
@@ -153,6 +162,18 @@ function detectSignalDirection(actions) {
   return { pair, direction, botName: bot.name };
 }
 
+// ── Bot Lookup by Pair + Direction ──────────────────────────────────────
+// Find bot UUID given a pair and direction. Used by both flip logic and funding strategy.
+// e.g. ("SOL", "LONG") → { uuid: '...', mongoId: '...', name: 'SOL Long v2' }
+function findBot(pair, direction) {
+  const dirLabel = direction === 'LONG' ? 'Long' : 'Short';
+  const targetName = `${pair} ${dirLabel} v2`;
+  for (const [uuid, bot] of Object.entries(BOT_MAP)) {
+    if (bot.name === targetName) return { uuid, ...bot };
+  }
+  return null;
+}
+
 // ── Opposite Bot Lookup (v1.8.0) ────────────────────────────────────────
 // Given a pair and direction, find the UUID of the opposite-direction bot.
 // e.g. ("SOL", "SHORT") → UUID of "SOL Long v2"
@@ -163,6 +184,137 @@ function findOppositeBot(pair, direction) {
     if (bot.name === targetName) return { uuid, ...bot };
   }
   return null;
+}
+
+// ── Funding Strategy Execution (v2.2.0) ─────────────────────────────────
+// When STRATEGY_MODE is 'funding', this runs every 4 hours.
+// Checks funding rates for all pairs and dispatches trades through the
+// same pipeline as TradingView signals (same bots, same gates, same everything).
+
+async function runFundingCheck() {
+  if (STRATEGY_MODE !== 'funding') return;
+  if (PAUSED) {
+    log('[FUNDING] System is paused — skipping funding check');
+    return;
+  }
+
+  log('[FUNDING] Running funding rate check across all pairs...');
+
+  try {
+    const results = await fundingStrategy.checkAllPairs();
+
+    for (const result of results) {
+      if (!result.signal) {
+        log(`[FUNDING] ${result.pair}: No signal — ${result.data.reason}`);
+        continue;
+      }
+
+      const { pair, signal: direction } = result;
+      const requestId = 'fund-' + Math.random().toString(36).substring(2, 8);
+
+      log(`[${requestId}] [FUNDING] ${pair} signal: ${direction} — ${result.data.reason}`);
+
+      // Rising-edge: skip if same direction already active
+      if (LAST_DIRECTION[pair] === direction) {
+        log(`[${requestId}] [FUNDING] 🔇 ${pair} already ${direction} — skipping`);
+        continue;
+      }
+
+      // Circuit breaker check
+      const cbCheck = checkCircuitBreaker(pair);
+      if (cbCheck.parked) {
+        log(`[${requestId}] [FUNDING] ⚡ ${pair} parked by circuit breaker — skipping`);
+        continue;
+      }
+
+      // Run signal gate (same 2 blocking gates as crossover)
+      const gateResult = await signalGate.validateSignal(pair, direction);
+      if (!gateResult.allowed) {
+        log(`[${requestId}] [FUNDING] 🚫 ${pair} ${direction} gated: ${gateResult.reason}`);
+        sendTelegramAlert(
+          `🚫 Funding Signal Gated\n\n` +
+          `${pair} ${direction} → BLOCKED\n` +
+          `Funding: ${result.data.fundingPct}\n` +
+          `Reason: ${gateResult.reason}\n` +
+          `Time: ${istTimestamp()}\n` +
+          `Request: ${requestId}`
+        ).catch(() => {});
+        continue;
+      }
+
+      // Build action array — same format as TradingView alerts
+      const targetBot = findBot(pair, direction);
+      const oppositeBot = findOppositeBot(pair, direction);
+
+      if (!targetBot) {
+        log(`[${requestId}] [FUNDING] ❌ No bot found for ${pair} ${direction}`);
+        continue;
+      }
+
+      const actions = [];
+
+      // If there's an active opposite bot, close its deals and stop it first
+      if (oppositeBot) {
+        actions.push({ action: 'closeAllDeals', uuid: oppositeBot.uuid });
+        actions.push({ action: 'stopBot', uuid: oppositeBot.uuid });
+      }
+
+      // Start the target bot
+      actions.push({ action: 'startBot', uuid: targetBot.uuid });
+
+      // Update tracking
+      LAST_DIRECTION[pair] = direction;
+      recordFlip(pair);
+      fundingStrategy.recordSignal(result.data.symbol, direction);
+
+      // Track active bot for revalidation
+      ACTIVE_BOTS[targetBot.uuid] = {
+        pair,
+        direction,
+        botName: targetBot.name,
+        startedAt: new Date().toISOString(),
+      };
+      if (oppositeBot) {
+        delete ACTIVE_BOTS[oppositeBot.uuid];
+      }
+
+      // Send Telegram notification
+      sendTelegramAlert(
+        `📊 Funding Rate Signal\n\n` +
+        `${pair} → ${direction}\n` +
+        `Funding: ${result.data.fundingPct}\n` +
+        `Price: $${result.data.markPrice?.toFixed(2) || '?'}\n` +
+        `Gate: ${gateResult.reason}\n` +
+        `Actions: ${actions.map(a => a.action).join(' → ')}\n` +
+        `Time: ${istTimestamp()}\n` +
+        `Request: ${requestId}`
+      ).catch(() => {});
+
+      // Execute through the same pipeline
+      log(`[${requestId}] [FUNDING] Dispatching: ${actions.map(a => `${a.action}(${a.uuid.substring(0, 8)})`).join(' → ')}`);
+      processActions(actions, requestId).catch(err => {
+        log(`[${requestId}] [FUNDING] ❌ Execution error: ${err.message}`);
+      });
+    }
+  } catch (err) {
+    log(`[FUNDING] ❌ Check failed: ${err.message}`);
+  }
+}
+
+function startFundingPoller() {
+  if (FUNDING_POLL_TIMER) clearInterval(FUNDING_POLL_TIMER);
+  // Run immediately on start, then every 4 hours
+  runFundingCheck();
+  FUNDING_POLL_TIMER = setInterval(runFundingCheck, FUNDING_POLL_INTERVAL);
+  log(`[FUNDING] Poller started — checking every ${FUNDING_POLL_INTERVAL / (60 * 60 * 1000)}h`);
+}
+
+function stopFundingPoller() {
+  if (FUNDING_POLL_TIMER) {
+    clearInterval(FUNDING_POLL_TIMER);
+    FUNDING_POLL_TIMER = null;
+  }
+  log('[FUNDING] Poller stopped');
 }
 
 // ── Deferred Flip Queue (v1.3.0) ─────────────────────────────────────────
@@ -476,7 +628,8 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '2.1.0',
+    version: '2.2.0',
+    strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
     revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21)', autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
@@ -527,6 +680,54 @@ app.get('/resume', (req, res) => {
     `All incoming signals will now be executed normally.`
   ).catch(() => {});
   res.json({ status: 'running', pauseDuration: pauseDuration + 's', signalsMissed });
+});
+
+// ── Strategy Toggle Endpoints (v2.2.0) ──────────────────────────────────
+// Switch between crossover (TradingView) and funding (Binance polling) signal sources.
+
+app.get('/strategy', (req, res) => {
+  res.json({
+    mode: STRATEGY_MODE,
+    changedAt: STRATEGY_CHANGED_AT,
+    fundingPollerActive: !!FUNDING_POLL_TIMER,
+    description: STRATEGY_MODE === 'crossover'
+      ? 'TradingView EMA crossover alerts → webhook → gate → bots'
+      : 'Binance funding rate polling → gate → bots (every 4h)',
+  });
+});
+
+app.get('/strategy/crossover', (req, res) => {
+  if (STRATEGY_MODE === 'crossover') {
+    return res.json({ status: 'already on crossover mode' });
+  }
+  stopFundingPoller();
+  STRATEGY_MODE = 'crossover';
+  STRATEGY_CHANGED_AT = new Date().toISOString();
+  log('🔀 Strategy switched to CROSSOVER (TradingView alerts)');
+  sendTelegramAlert(
+    `🔀 Strategy → CROSSOVER\n\n` +
+    `Signal source: TradingView EMA alerts\n` +
+    `Funding poller: stopped\n` +
+    `Time: ${istTimestamp()}`
+  ).catch(() => {});
+  res.json({ status: 'switched to crossover', mode: STRATEGY_MODE });
+});
+
+app.get('/strategy/funding', (req, res) => {
+  if (STRATEGY_MODE === 'funding') {
+    return res.json({ status: 'already on funding mode' });
+  }
+  STRATEGY_MODE = 'funding';
+  STRATEGY_CHANGED_AT = new Date().toISOString();
+  startFundingPoller();
+  log('🔀 Strategy switched to FUNDING (Binance funding rate polling)');
+  sendTelegramAlert(
+    `🔀 Strategy → FUNDING\n\n` +
+    `Signal source: Binance funding rate (every 4h)\n` +
+    `TradingView webhooks: will be ignored\n` +
+    `Time: ${istTimestamp()}`
+  ).catch(() => {});
+  res.json({ status: 'switched to funding', mode: STRATEGY_MODE });
 });
 
 // Test endpoint — signal gate test (v1.7.0)
@@ -640,6 +841,12 @@ app.post('/webhook', (req, res) => {
   // Log what we received
   const summary = actions.map(a => `${a.action}(${(a.uuid || '').substring(0, 8)})`).join(' → ');
   log(`[${requestId}] 📨 Received: ${summary}`);
+
+  // ── Strategy mode check — ignore TradingView webhooks when in funding mode ──
+  if (STRATEGY_MODE === 'funding') {
+    log(`[${requestId}] 🔀 FUNDING MODE — TradingView webhook ignored (signal logged only)`);
+    return;
+  }
 
   // Build a human-readable description for Telegram
   const botNames = actions
@@ -939,7 +1146,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v2.1.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v2.2.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
