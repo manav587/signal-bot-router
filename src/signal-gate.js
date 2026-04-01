@@ -60,6 +60,7 @@ const PAIR_TO_SYMBOL = {
   ETH: { symbol: 'ETHUSDT', base: 'ETH', quote: 'USDT' },
   SOL: { symbol: 'SOLUSDT', base: 'SOL', quote: 'USDT' },
   XRP: { symbol: 'XRPUSDT', base: 'XRP', quote: 'USDT' },
+  BTC: { symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT' },
 };
 
 // ── CryptoCompare interval mapping ───────────────────────────────────────

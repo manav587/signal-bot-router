@@ -19,6 +19,8 @@ const BOT_MAP = {
   '87956a3c-4c24-46d1-b071-cd3e6e35c761': { mongoId: '69c4ab8b4c428a9d6a6c2bcb', name: 'SOL Short v2' },
   '7bd0c5be-6a0e-4d0e-946d-f957ef5a8236': { mongoId: '69c6cb76c0cb070ef8ea2fb8', name: 'XRP Long v2' },
   '14ea2ce8-c0cd-4eaf-b9b0-54c6ac325921': { mongoId: '69c6cb77c0cb070ef8ea2fd5', name: 'XRP Short v2' },
+  '13b4e9a6-b887-478e-b0cd-3df0e2e17d2d': { mongoId: '69ccb775fdc61f1b454f3c71', name: 'BTC Long v2' },
+  '28ef36b8-1bf6-4149-ac21-fb714a571307': { mongoId: '69ccb77dfdc61f1b454f3cad', name: 'BTC Short v2' },
 };
 
 // ── Telegram Alerts (optional — sends critical failures to Manav) ────────
@@ -473,7 +475,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '1.9.0',
+    version: '2.0.0',
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
     revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)', autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
@@ -904,7 +906,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v1.9.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v2.0.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
