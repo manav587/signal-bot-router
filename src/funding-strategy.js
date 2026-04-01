@@ -27,12 +27,13 @@ const CONFIG = {
   },
 
   // API providers — ordered by reliability from US cloud IPs
-  // Same approach as signal-gate.js: Bybit works from Render, Binance is geo-blocked
+  // data-api.binance.vision is the cloud-friendly endpoint (same fix as signal-gate.js)
   providers: [
-    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
+    { name: 'Binance-Data', type: 'binance', baseUrl: 'https://data-api.binance.vision' },
     { name: 'Binance', type: 'binance', baseUrl: 'https://fapi.binance.com' },
+    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
   ],
-  fetchTimeout: 8000,  // 8s — generous timeout for cold starts
+  fetchTimeout: 8000,
 
   // Cooldown — don't re-signal the same pair/direction within one funding period
   cooldownMs: 8 * 60 * 60 * 1000, // 8 hours
