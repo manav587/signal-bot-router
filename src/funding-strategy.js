@@ -137,7 +137,7 @@ async function fetchFundingData(symbol) {
   }
 
   console.log(`[FUNDING] All providers failed for ${symbol}: ${errors.join('; ')}`);
-  return null;
+  return { error: true, errors };
 }
 
 // ── Signal logic ──────────────────────────────────────────────────────────
@@ -153,11 +153,11 @@ async function checkPair(symbol) {
 
   const marketData = await fetchFundingData(symbol);
 
-  if (!marketData) {
+  if (!marketData || marketData.error) {
     return {
       signal: null,
       pair,
-      data: { symbol, error: 'Failed to fetch funding rate from all providers' },
+      data: { symbol, error: 'Failed to fetch funding rate from all providers', providerErrors: marketData?.errors || [] },
     };
   }
 
