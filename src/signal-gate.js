@@ -41,8 +41,8 @@ const CONFIG = {
     period: 14,
     timeframe: '4h',
     candlesNeeded: 20,     // Need 20 candles to stabilize a 14-period RSI
-    longMinimum: 40,       // Only go LONG if RSI > 40
-    shortMaximum: 60,      // Only go SHORT if RSI < 60
+    longMinimum: 30,       // Only go LONG if RSI > 30 (widened from 40)
+    shortMaximum: 70,      // Only go SHORT if RSI < 70 (widened from 60)
     slopeCandles: 3,       // Compare RSI now vs N candles ago for direction
   },
 
@@ -370,22 +370,19 @@ async function validateSignal(pair, direction) {
     data.rsiDirection = rsiDirection;
     data.priceVsEma = ema50 ? (currentPrice > ema50 ? 'ABOVE' : 'BELOW') : 'UNKNOWN';
 
-    // ── Gate 1: Daily 50 EMA trend filter ──────────────────────────────
+    // ── Gate 1: Daily 50 EMA trend filter (ADVISORY ONLY) ──────────────
+    // Logged but not blocking. Collecting data during prove-it period.
     if (ema50 !== null) {
-      if (direction === 'LONG' && currentPrice < ema50) {
-        return {
-          allowed: false,
-          reason: `TREND FILTER: Price $${currentPrice.toFixed(2)} is BELOW daily 50 EMA $${ema50.toFixed(2)} — bullish signal rejected`,
-          data,
-        };
-      }
-      if (direction === 'SHORT' && currentPrice > ema50) {
-        return {
-          allowed: false,
-          reason: `TREND FILTER: Price $${currentPrice.toFixed(2)} is ABOVE daily 50 EMA $${ema50.toFixed(2)} — bearish signal rejected`,
-          data,
-        };
-      }
+      const g1WouldBlock =
+        (direction === 'LONG' && currentPrice < ema50) ||
+        (direction === 'SHORT' && currentPrice > ema50);
+      data.gate1Advisory = {
+        wouldBlock: g1WouldBlock,
+        mode: 'advisory',
+        detail: g1WouldBlock
+          ? `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — would have blocked ${direction}`
+          : `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — aligned with ${direction}`,
+      };
     }
 
     // ── Gate 2: 4H EMA 9/21 short-term trend filter ──────────────────
@@ -426,25 +423,19 @@ async function validateSignal(pair, direction) {
       }
     }
 
-    // ── Gate 4: RSI direction confirmation ─────────────────────────────
-    // Block trades when RSI momentum is moving against the trade direction.
-    // RISING RSI = bullish momentum building → block shorts
-    // FALLING RSI = bearish momentum building → block longs
+    // ── Gate 4: RSI direction confirmation (ADVISORY ONLY) ─────────────
+    // Logged but not blocking. Collecting data during prove-it period.
     if (rsiDirection !== 'FLAT') {
-      if (direction === 'SHORT' && rsiDirection === 'RISING') {
-        return {
-          allowed: false,
-          reason: `RSI DIRECTION: RSI rising (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bullish momentum building, SHORT rejected`,
-          data,
-        };
-      }
-      if (direction === 'LONG' && rsiDirection === 'FALLING') {
-        return {
-          allowed: false,
-          reason: `RSI DIRECTION: RSI falling (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bearish momentum building, LONG rejected`,
-          data,
-        };
-      }
+      const g4WouldBlock =
+        (direction === 'SHORT' && rsiDirection === 'RISING') ||
+        (direction === 'LONG' && rsiDirection === 'FALLING');
+      data.gate4Advisory = {
+        wouldBlock: g4WouldBlock,
+        mode: 'advisory',
+        detail: g4WouldBlock
+          ? `RSI ${rsiDirection} (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — would have blocked ${direction}`
+          : `RSI ${rsiDirection} — aligned with ${direction}`,
+      };
     }
 
     // ── Gate 5: Smart Money — top trader positioning (ADVISORY ONLY) ───
@@ -559,25 +550,21 @@ async function revalidateSignal(pair, direction) {
       }
     }
 
-    // Check Gate 4: RSI direction
+    // Gate 4 (RSI direction) is now advisory — log but don't block on revalidation either
     if (rsiDirection !== 'FLAT') {
-      if (direction === 'SHORT' && rsiDirection === 'RISING') {
-        return {
-          allowed: false,
-          reason: `REVALIDATION — RSI DIRECTION: RSI rising (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bullish momentum, SHORT no longer valid`,
-          data,
-        };
-      }
-      if (direction === 'LONG' && rsiDirection === 'FALLING') {
-        return {
-          allowed: false,
-          reason: `REVALIDATION — RSI DIRECTION: RSI falling (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — bearish momentum, LONG no longer valid`,
-          data,
-        };
-      }
+      const g4WouldBlock =
+        (direction === 'SHORT' && rsiDirection === 'RISING') ||
+        (direction === 'LONG' && rsiDirection === 'FALLING');
+      data.gate4Advisory = {
+        wouldBlock: g4WouldBlock,
+        mode: 'advisory',
+        detail: g4WouldBlock
+          ? `RSI ${rsiDirection} (${data.rsiPrevious} → ${rsi14}, Δ${data.rsiDelta}) — would have blocked ${direction}`
+          : `RSI ${rsiDirection} — aligned with ${direction}`,
+      };
     }
 
-    // Still valid
+    // Still valid — only Gate 2 (EMA 9/21) is blocking on revalidation
     return {
       allowed: true,
       reason: `REVALIDATION PASSED: 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
@@ -599,11 +586,11 @@ async function revalidateSignal(pair, direction) {
  */
 function getConfig() {
   return {
-    trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe}`,
-    shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (must agree with trade direction)`,
-    rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
-    rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (RISING blocks SHORT, FALLING blocks LONG)`,
-    smartMoney: `Top trader L/S ratio on ${CONFIG.smartMoney.period} (LONG needs >${CONFIG.smartMoney.longMinRatio * 100}% long, SHORT needs <${CONFIG.smartMoney.shortMaxRatio * 100}% long)`,
+    trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (ADVISORY — logged only)`,
+    shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — must agree with trade direction)`,
+    rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
+    rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,
+    smartMoney: `Top trader L/S ratio on ${CONFIG.smartMoney.period} (ADVISORY — logged only)`,
   };
 }
 
