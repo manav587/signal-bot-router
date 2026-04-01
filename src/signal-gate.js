@@ -1,15 +1,19 @@
 /**
- * Signal Gate (v1.7.0)
+ * Signal Gate (v1.8.0)
  *
- * Server-side signal validation using technical indicators.
+ * Server-side signal validation using technical indicators + smart money data.
  * Fetches candles from Binance public API, calculates EMA and RSI,
  * and gates crossover signals before they reach Gainium.
+ *
+ * v1.8.0: Added Gate 5 — Smart Money filter using Binance Futures top trader
+ *         long/short position ratio. Blocks trades when whale positioning
+ *         strongly disagrees with signal direction.
  *
  * v1.7.0: Added 4H EMA 9/21 short-term trend filter and RSI direction check.
  *         Fixes timeframe mismatch where daily trend was bearish but intraday
  *         price was rallying, causing shorts to get ground up.
  *
- * No API key needed — Binance /api/v3/klines is public.
+ * No API key needed — Binance /api/v3/klines and /futures/data/* are public.
  */
 
 const { EMA, RSI } = require('trading-signals');
@@ -40,6 +44,19 @@ const CONFIG = {
     longMinimum: 40,       // Only go LONG if RSI > 40
     shortMaximum: 60,      // Only go SHORT if RSI < 60
     slopeCandles: 3,       // Compare RSI now vs N candles ago for direction
+  },
+
+  // Smart Money gate — Binance Futures top trader long/short ratio
+  // Uses /futures/data/topLongShortPositionRatio (public, no API key)
+  // Only blocks when whale positioning STRONGLY disagrees with signal
+  smartMoney: {
+    period: '4h',             // Match our trading timeframe
+    longMinRatio: 0.35,       // Block LONG if top traders < 35% long (whales heavily short)
+    shortMaxRatio: 0.65,      // Block SHORT if top traders > 65% long (whales heavily long)
+    providers: [
+      'https://fapi.binance.com',    // Primary — may be geo-blocked from some cloud IPs
+      'https://fapi1.binance.com',   // Mirror
+    ],
   },
 
   // Data providers — ordered by reliability from US cloud IPs
@@ -223,6 +240,49 @@ async function fetchCandles(pairInfo, interval, limit) {
 }
 
 /**
+ * Fetch top trader long/short position ratio from Binance Futures API.
+ * Returns the percentage of top trader positions that are long (0.0 to 1.0).
+ * Returns null if all providers fail (gate will pass through).
+ *
+ * @param {string} symbol - e.g. 'SOLUSDT'
+ * @param {string} period - e.g. '4h'
+ * @returns {Promise<{longRatio: number, shortRatio: number, longShortRatio: number} | null>}
+ */
+async function fetchSmartMoneyRatio(symbol, period) {
+  const errors = [];
+
+  for (const baseUrl of CONFIG.smartMoney.providers) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
+
+    try {
+      const url = `${baseUrl}/futures/data/topLongShortPositionRatio?symbol=${symbol}&period=${period}&limit=1`;
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) throw new Error('Empty response');
+
+      const latest = data[0];
+      return {
+        longRatio: parseFloat(latest.longAccount),     // e.g. 0.3930 = 39.30% long
+        shortRatio: parseFloat(latest.shortAccount),    // e.g. 0.6070 = 60.70% short
+        longShortRatio: parseFloat(latest.longShortRatio), // e.g. 0.6477
+        timestamp: latest.timestamp,
+      };
+    } catch (err) {
+      clearTimeout(timeout);
+      errors.push(`${baseUrl}: ${err.message}`);
+    }
+  }
+
+  console.log(`[SMART MONEY] All providers failed for ${symbol}: ${errors.join('; ')}`);
+  return null;
+}
+
+/**
  * Calculate EMA for a series of candle close prices.
  * @param {number[]} closes - array of close prices
  * @param {number} period - EMA period
@@ -266,11 +326,12 @@ async function validateSignal(pair, direction) {
   const data = {};
 
   try {
-    // Fetch daily candles for trend EMA and 4h candles for RSI + short-term EMA in parallel
+    // Fetch daily candles, 4h candles, and smart money ratio in parallel
     // We need more 4h candles now (30) for the 21-period EMA to stabilize
-    const [dailyCandles, fourHourCandles] = await Promise.all([
+    const [dailyCandles, fourHourCandles, smartMoney] = await Promise.all([
       fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
       fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded),
+      fetchSmartMoneyRatio(pairInfo.symbol, CONFIG.smartMoney.period),
     ]);
 
     // Calculate daily 50 EMA
@@ -386,10 +447,40 @@ async function validateSignal(pair, direction) {
       }
     }
 
+    // ── Gate 5: Smart Money — top trader positioning ────────────────────
+    // Block trades when whale positioning strongly disagrees.
+    // Fail-open: if Binance Futures API is unreachable, skip this gate.
+    if (smartMoney) {
+      data.smartMoney = {
+        longRatio: smartMoney.longRatio,
+        shortRatio: smartMoney.shortRatio,
+        longShortRatio: smartMoney.longShortRatio,
+        longPct: (smartMoney.longRatio * 100).toFixed(1) + '%',
+        shortPct: (smartMoney.shortRatio * 100).toFixed(1) + '%',
+      };
+
+      if (direction === 'LONG' && smartMoney.longRatio < CONFIG.smartMoney.longMinRatio) {
+        return {
+          allowed: false,
+          reason: `SMART MONEY: Top traders only ${data.smartMoney.longPct} long (threshold ${CONFIG.smartMoney.longMinRatio * 100}%) — whales heavily short, LONG rejected`,
+          data,
+        };
+      }
+      if (direction === 'SHORT' && smartMoney.longRatio > CONFIG.smartMoney.shortMaxRatio) {
+        return {
+          allowed: false,
+          reason: `SMART MONEY: Top traders ${data.smartMoney.longPct} long (threshold ${CONFIG.smartMoney.shortMaxRatio * 100}%) — whales heavily long, SHORT rejected`,
+          data,
+        };
+      }
+    } else {
+      data.smartMoney = { status: 'unavailable — gate skipped' };
+    }
+
     // All gates passed
     return {
       allowed: true,
-      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
+      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, Smart Money ${data.smartMoney.longPct || 'N/A'} long`,
       data,
     };
 
@@ -520,6 +611,7 @@ function getConfig() {
     shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (must agree with trade direction)`,
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (RISING blocks SHORT, FALLING blocks LONG)`,
+    smartMoney: `Top trader L/S ratio on ${CONFIG.smartMoney.period} (LONG needs >${CONFIG.smartMoney.longMinRatio * 100}% long, SHORT needs <${CONFIG.smartMoney.shortMaxRatio * 100}% long)`,
   };
 }
 
