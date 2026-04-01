@@ -26,10 +26,12 @@ const CONFIG = {
     shortTrigger: 0.0003,    // Funding > 0.03% → SHORT (longs paying, retail long-heavy)
   },
 
-  // API providers — Binance Futures (may be geo-blocked from some cloud IPs)
+  // API providers — ordered by reliability from US cloud IPs
+  // Binance Futures is geo-blocked from US cloud → Bybit as primary
   providers: [
-    'https://fapi.binance.com',
-    'https://fapi1.binance.com',
+    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
+    { name: 'Binance', type: 'binance', baseUrl: 'https://fapi.binance.com' },
+    { name: 'Binance-Mirror', type: 'binance', baseUrl: 'https://fapi1.binance.com' },
   ],
   fetchTimeout: 5000,
 
@@ -51,71 +53,91 @@ const lastSignals = {};
 // ── Data fetching ─────────────────────────────────────────────────────────
 
 /**
- * Fetch premium index (funding rate data) for a symbol.
- * Returns null if all providers fail.
+ * Fetch funding rate from Bybit.
+ * Uses /v5/market/tickers which returns current funding rate + mark price.
  */
-async function fetchPremiumIndex(symbol) {
-  const errors = [];
+async function fetchFromBybit(baseUrl, symbol) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
 
-  for (const baseUrl of CONFIG.providers) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
+  try {
+    const url = `${baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
 
-    try {
-      const url = `${baseUrl}/fapi/v1/premiumIndex?symbol=${symbol}`;
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.retCode !== 0) throw new Error(`Bybit error: ${json.retMsg}`);
 
-      const data = await res.json();
-      return {
-        symbol: data.symbol,
-        markPrice: parseFloat(data.markPrice),
-        lastFundingRate: parseFloat(data.lastFundingRate),
-        nextFundingTime: data.nextFundingTime,
-      };
-    } catch (err) {
-      clearTimeout(timeout);
-      errors.push(`${baseUrl}: ${err.message}`);
-    }
+    const item = json.result.list[0];
+    if (!item) throw new Error('Empty ticker list');
+
+    return {
+      symbol: item.symbol,
+      markPrice: parseFloat(item.markPrice),
+      lastFundingRate: parseFloat(item.fundingRate),
+      nextFundingTime: parseInt(item.nextFundingTime),
+      openInterest: parseFloat(item.openInterest),
+      openInterestValue: parseFloat(item.openInterestValue || 0),
+      provider: 'Bybit',
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
   }
-
-  console.log(`[FUNDING] premiumIndex failed for ${symbol}: ${errors.join('; ')}`);
-  return null;
 }
 
 /**
- * Fetch current open interest for a symbol.
+ * Fetch funding rate from Binance Futures.
+ * Uses /fapi/v1/premiumIndex for funding rate + mark price.
+ */
+async function fetchFromBinance(baseUrl, symbol) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
+
+  try {
+    const url = `${baseUrl}/fapi/v1/premiumIndex?symbol=${symbol}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const data = await res.json();
+    return {
+      symbol: data.symbol,
+      markPrice: parseFloat(data.markPrice),
+      lastFundingRate: parseFloat(data.lastFundingRate),
+      nextFundingTime: data.nextFundingTime,
+      openInterest: null, // Separate endpoint on Binance
+      provider: 'Binance',
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
+  }
+}
+
+/**
+ * Fetch funding rate + market data with provider fallback.
  * Returns null if all providers fail.
  */
-async function fetchOpenInterest(symbol) {
+async function fetchFundingData(symbol) {
   const errors = [];
 
-  for (const baseUrl of CONFIG.providers) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
-
+  for (const provider of CONFIG.providers) {
     try {
-      const url = `${baseUrl}/fapi/v1/openInterest?symbol=${symbol}`;
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-      const data = await res.json();
-      return {
-        symbol: data.symbol,
-        openInterest: parseFloat(data.openInterest),
-        time: data.time,
-      };
+      if (provider.type === 'bybit') {
+        return await fetchFromBybit(provider.baseUrl, symbol);
+      } else {
+        return await fetchFromBinance(provider.baseUrl, symbol);
+      }
     } catch (err) {
-      clearTimeout(timeout);
-      errors.push(`${baseUrl}: ${err.message}`);
+      errors.push(`${provider.name}: ${err.message}`);
     }
   }
 
-  console.log(`[FUNDING] openInterest failed for ${symbol}: ${errors.join('; ')}`);
+  console.log(`[FUNDING] All providers failed for ${symbol}: ${errors.join('; ')}`);
   return null;
 }
 
@@ -130,12 +152,9 @@ async function fetchOpenInterest(symbol) {
 async function checkPair(symbol) {
   const pair = SYMBOL_TO_PAIR[symbol] || symbol;
 
-  const [funding, oi] = await Promise.all([
-    fetchPremiumIndex(symbol),
-    fetchOpenInterest(symbol),
-  ]);
+  const marketData = await fetchFundingData(symbol);
 
-  if (!funding) {
+  if (!marketData) {
     return {
       signal: null,
       pair,
@@ -146,12 +165,13 @@ async function checkPair(symbol) {
   const data = {
     symbol,
     pair,
-    markPrice: funding.markPrice,
-    fundingRate: funding.lastFundingRate,
-    fundingPct: (funding.lastFundingRate * 100).toFixed(4) + '%',
-    nextFundingTime: new Date(funding.nextFundingTime).toISOString(),
-    openInterest: oi ? oi.openInterest : null,
-    openInterestUsd: oi ? `$${(oi.openInterest * funding.markPrice / 1e6).toFixed(1)}M` : null,
+    markPrice: marketData.markPrice,
+    fundingRate: marketData.lastFundingRate,
+    fundingPct: (marketData.lastFundingRate * 100).toFixed(4) + '%',
+    nextFundingTime: new Date(marketData.nextFundingTime).toISOString(),
+    openInterest: marketData.openInterest,
+    openInterestUsd: marketData.openInterest ? `$${(marketData.openInterest * marketData.markPrice / 1e6).toFixed(1)}M` : null,
+    provider: marketData.provider,
   };
 
   // Check cooldown
