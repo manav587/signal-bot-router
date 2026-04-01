@@ -447,34 +447,26 @@ async function validateSignal(pair, direction) {
       }
     }
 
-    // ── Gate 5: Smart Money — top trader positioning ────────────────────
-    // Block trades when whale positioning strongly disagrees.
-    // Fail-open: if Binance Futures API is unreachable, skip this gate.
+    // ── Gate 5: Smart Money — top trader positioning (ADVISORY ONLY) ───
+    // Fetches whale positioning data and includes it in response/logs,
+    // but does NOT block trades. Collecting data during "prove it" period
+    // to evaluate whether this should become a blocking gate later.
     if (smartMoney) {
+      const wouldBlock =
+        (direction === 'LONG' && smartMoney.longRatio < CONFIG.smartMoney.longMinRatio) ||
+        (direction === 'SHORT' && smartMoney.longRatio > CONFIG.smartMoney.shortMaxRatio);
+
       data.smartMoney = {
         longRatio: smartMoney.longRatio,
         shortRatio: smartMoney.shortRatio,
         longShortRatio: smartMoney.longShortRatio,
         longPct: (smartMoney.longRatio * 100).toFixed(1) + '%',
         shortPct: (smartMoney.shortRatio * 100).toFixed(1) + '%',
+        wouldBlock,
+        mode: 'advisory',
       };
-
-      if (direction === 'LONG' && smartMoney.longRatio < CONFIG.smartMoney.longMinRatio) {
-        return {
-          allowed: false,
-          reason: `SMART MONEY: Top traders only ${data.smartMoney.longPct} long (threshold ${CONFIG.smartMoney.longMinRatio * 100}%) — whales heavily short, LONG rejected`,
-          data,
-        };
-      }
-      if (direction === 'SHORT' && smartMoney.longRatio > CONFIG.smartMoney.shortMaxRatio) {
-        return {
-          allowed: false,
-          reason: `SMART MONEY: Top traders ${data.smartMoney.longPct} long (threshold ${CONFIG.smartMoney.shortMaxRatio * 100}%) — whales heavily long, SHORT rejected`,
-          data,
-        };
-      }
     } else {
-      data.smartMoney = { status: 'unavailable — gate skipped' };
+      data.smartMoney = { status: 'unavailable', mode: 'advisory' };
     }
 
     // All gates passed
