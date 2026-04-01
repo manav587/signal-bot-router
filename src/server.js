@@ -2,6 +2,7 @@ const express = require('express');
 const app = express();
 const gainiumApi = require('./gainium-api');
 const signalGate = require('./signal-gate');
+const fundingStrategy = require('./funding-strategy');
 
 // Parse both JSON and plain text bodies (TradingView sends text/plain when message has emoji prefix)
 app.use(express.json());
@@ -475,10 +476,11 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '2.0.0',
+    version: '2.1.0',
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + Gate 4 (RSI direction)', autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21)', autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
+    fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
     signalGate: signalGate.getConfig(),
@@ -547,6 +549,37 @@ app.get('/test-gate/:pair', async (req, res) => {
     gateConfig: signalGate.getConfig(),
     results,
   });
+});
+
+// ── Funding Rate Strategy — status and test endpoints ────────────────────
+// Strategy is on STANDBY — these endpoints show what it WOULD do, not trigger trades.
+
+app.get('/funding-status', async (req, res) => {
+  try {
+    const results = await fundingStrategy.checkAllPairs();
+    res.json({
+      timestamp: istTimestamp(),
+      strategy: fundingStrategy.getConfig(),
+      pairs: results,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/funding-check/:symbol', async (req, res) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase();
+    // Accept both 'SOL' and 'SOLUSDT'
+    const fullSymbol = symbol.endsWith('USDT') ? symbol : symbol + 'USDT';
+    const result = await fundingStrategy.checkPair(fullSymbol);
+    res.json({
+      timestamp: istTimestamp(),
+      ...result,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)
