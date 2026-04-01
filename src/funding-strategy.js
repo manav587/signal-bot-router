@@ -1,5 +1,5 @@
 /**
- * Funding Rate Strategy (v1.0.0) — STANDBY
+ * Funding Rate Strategy (v1.1.0) — STANDBY
  *
  * Mean-reversion strategy based on Binance Futures funding rate.
  * When retail is overleveraged in one direction (extreme funding rate),
@@ -8,11 +8,12 @@
  * Signal logic:
  *   Funding rate strongly positive (>0.03%) → SHORT (retail overleveraged long)
  *   Funding rate strongly negative (<-0.01%) → LONG (retail overleveraged short)
- *   OI confirmation optional — rising OI with extreme funding = stronger signal
  *
- * Uses Binance Futures public API (no key needed):
- *   /fapi/v1/premiumIndex  — current + predicted funding rate
- *   /fapi/v1/openInterest  — current open interest
+ * Data source: CryptoCompare (CCData) futures funding rate API
+ *   Cloud-friendly — works from Render/US cloud IPs (no geo-blocking)
+ *   Same provider family as signal-gate.js candle data
+ *   Single call returns all 4 pairs at once
+ *   No API key required for basic access
  */
 
 // ── Configuration ─────────────────────────────────────────────────────────
@@ -26,20 +27,25 @@ const CONFIG = {
     shortTrigger: 0.0003,    // Funding > 0.03% → SHORT (longs paying, retail long-heavy)
   },
 
-  // API providers — ordered by reliability from US cloud IPs
-  // data-api.binance.vision is the cloud-friendly endpoint (same fix as signal-gate.js)
-  providers: [
-    { name: 'Binance-Data', type: 'binance', baseUrl: 'https://data-api.binance.vision' },
-    { name: 'Binance', type: 'binance', baseUrl: 'https://fapi.binance.com' },
-    { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
-  ],
+  // CryptoCompare (CCData) futures API — cloud-friendly, no geo-blocking
+  ccdata: {
+    baseUrl: 'https://data-api.cryptocompare.com',
+    market: 'binance',
+    // Map our symbols to CCData instrument names
+    instruments: {
+      BTCUSDT: 'BTC-USDT-VANILLA-PERPETUAL',
+      ETHUSDT: 'ETH-USDT-VANILLA-PERPETUAL',
+      SOLUSDT: 'SOL-USDT-VANILLA-PERPETUAL',
+      XRPUSDT: 'XRP-USDT-VANILLA-PERPETUAL',
+    },
+  },
   fetchTimeout: 8000,
 
   // Cooldown — don't re-signal the same pair/direction within one funding period
   cooldownMs: 8 * 60 * 60 * 1000, // 8 hours
 };
 
-// ── Pair name mapping (matches signal-gate.js) ────────────────────────────
+// ── Pair name mapping ────────────────────────────────────────────────────
 const SYMBOL_TO_PAIR = {
   BTCUSDT: 'BTC',
   ETHUSDT: 'ETH',
@@ -53,92 +59,44 @@ const lastSignals = {};
 // ── Data fetching ─────────────────────────────────────────────────────────
 
 /**
- * Fetch funding rate from Bybit.
- * Uses /v5/market/tickers which returns current funding rate + mark price.
+ * Fetch funding rates for ALL pairs in a single API call from CryptoCompare.
+ * Returns a map of symbol → { fundingRate, timestamp } or null on failure.
  */
-async function fetchFromBybit(baseUrl, symbol) {
+async function fetchAllFundingRates() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
 
+  const instruments = Object.values(CONFIG.ccdata.instruments).join(',');
+  const url = `${CONFIG.ccdata.baseUrl}/futures/v1/latest/funding-rate/tick?market=${CONFIG.ccdata.market}&instruments=${instruments}`;
+
   try {
-    const url = `${baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timeout);
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const json = await res.json();
-    if (json.retCode !== 0) throw new Error(`Bybit error: ${json.retMsg}`);
+    if (!json.Data) throw new Error('No Data field in response');
 
-    const item = json.result.list[0];
-    if (!item) throw new Error('Empty ticker list');
-
-    return {
-      symbol: item.symbol,
-      markPrice: parseFloat(item.markPrice),
-      lastFundingRate: parseFloat(item.fundingRate),
-      nextFundingTime: parseInt(item.nextFundingTime),
-      openInterest: parseFloat(item.openInterest),
-      openInterestValue: parseFloat(item.openInterestValue || 0),
-      provider: 'Bybit',
-    };
-  } catch (err) {
-    clearTimeout(timeout);
-    throw err;
-  }
-}
-
-/**
- * Fetch funding rate from Binance Futures.
- * Uses /fapi/v1/premiumIndex for funding rate + mark price.
- */
-async function fetchFromBinance(baseUrl, symbol) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
-
-  try {
-    const url = `${baseUrl}/fapi/v1/premiumIndex?symbol=${symbol}`;
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeout);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    const data = await res.json();
-    return {
-      symbol: data.symbol,
-      markPrice: parseFloat(data.markPrice),
-      lastFundingRate: parseFloat(data.lastFundingRate),
-      nextFundingTime: data.nextFundingTime,
-      openInterest: null, // Separate endpoint on Binance
-      provider: 'Binance',
-    };
-  } catch (err) {
-    clearTimeout(timeout);
-    throw err;
-  }
-}
-
-/**
- * Fetch funding rate + market data with provider fallback.
- * Returns null if all providers fail.
- */
-async function fetchFundingData(symbol) {
-  const errors = [];
-
-  for (const provider of CONFIG.providers) {
-    try {
-      if (provider.type === 'bybit') {
-        return await fetchFromBybit(provider.baseUrl, symbol);
-      } else {
-        return await fetchFromBinance(provider.baseUrl, symbol);
+    // Map CCData instrument names back to our symbols
+    const result = {};
+    for (const [symbol, ccInstrument] of Object.entries(CONFIG.ccdata.instruments)) {
+      const data = json.Data[ccInstrument];
+      if (data) {
+        result[symbol] = {
+          fundingRate: data.VALUE,                    // e.g. 1.977e-05 = 0.001977%
+          timestamp: data.VALUE_LAST_UPDATE_TS * 1000, // Convert to ms
+          provider: 'CCData',
+        };
       }
-    } catch (err) {
-      errors.push(`${provider.name}: ${err.message}`);
     }
-  }
 
-  console.log(`[FUNDING] All providers failed for ${symbol}: ${errors.join('; ')}`);
-  return { error: true, errors };
+    return result;
+  } catch (err) {
+    clearTimeout(timeout);
+    console.log(`[FUNDING] CCData fetch failed: ${err.message}`);
+    return null;
+  }
 }
 
 // ── Signal logic ──────────────────────────────────────────────────────────
@@ -147,31 +105,30 @@ async function fetchFundingData(symbol) {
  * Check a single pair for a funding rate signal.
  *
  * @param {string} symbol - e.g. 'SOLUSDT'
+ * @param {object} allRates - pre-fetched rates from fetchAllFundingRates()
  * @returns {{ signal: string|null, pair: string, data: object }}
  */
-async function checkPair(symbol) {
+function checkPairFromRates(symbol, allRates) {
   const pair = SYMBOL_TO_PAIR[symbol] || symbol;
 
-  const marketData = await fetchFundingData(symbol);
-
-  if (!marketData || marketData.error) {
+  if (!allRates || !allRates[symbol]) {
     return {
       signal: null,
       pair,
-      data: { symbol, error: 'Failed to fetch funding rate from all providers', providerErrors: marketData?.errors || [] },
+      data: { symbol, error: 'No funding rate data available' },
     };
   }
+
+  const rateData = allRates[symbol];
+  const fundingRate = rateData.fundingRate;
 
   const data = {
     symbol,
     pair,
-    markPrice: marketData.markPrice,
-    fundingRate: marketData.lastFundingRate,
-    fundingPct: (marketData.lastFundingRate * 100).toFixed(4) + '%',
-    nextFundingTime: new Date(marketData.nextFundingTime).toISOString(),
-    openInterest: marketData.openInterest,
-    openInterestUsd: marketData.openInterest ? `$${(marketData.openInterest * marketData.markPrice / 1e6).toFixed(1)}M` : null,
-    provider: marketData.provider,
+    fundingRate,
+    fundingPct: (fundingRate * 100).toFixed(4) + '%',
+    lastUpdate: new Date(rateData.timestamp).toISOString(),
+    provider: rateData.provider,
   };
 
   // Check cooldown
@@ -186,10 +143,10 @@ async function checkPair(symbol) {
   // Determine signal direction
   let signal = null;
 
-  if (funding.lastFundingRate > CONFIG.funding.shortTrigger) {
+  if (fundingRate > CONFIG.funding.shortTrigger) {
     signal = 'SHORT';
     data.reason = `Funding ${data.fundingPct} > ${(CONFIG.funding.shortTrigger * 100).toFixed(2)}% threshold — retail overleveraged long → SHORT`;
-  } else if (funding.lastFundingRate < CONFIG.funding.longTrigger) {
+  } else if (fundingRate < CONFIG.funding.longTrigger) {
     signal = 'LONG';
     data.reason = `Funding ${data.fundingPct} < ${(CONFIG.funding.longTrigger * 100).toFixed(2)}% threshold — retail overleveraged short → LONG`;
   } else {
@@ -200,14 +157,21 @@ async function checkPair(symbol) {
 }
 
 /**
+ * Legacy single-pair check (used by /funding-check/:symbol endpoint).
+ */
+async function checkPair(symbol) {
+  const allRates = await fetchAllFundingRates();
+  return checkPairFromRates(symbol, allRates);
+}
+
+/**
  * Run the funding rate check across all configured pairs.
- * Returns array of results for each pair.
+ * Single API call for all pairs, then evaluate each.
  */
 async function checkAllPairs() {
-  const results = await Promise.all(
-    CONFIG.pairs.map(symbol => checkPair(symbol))
-  );
-  return results;
+  const allRates = await fetchAllFundingRates();
+
+  return CONFIG.pairs.map(symbol => checkPairFromRates(symbol, allRates));
 }
 
 /**
@@ -226,6 +190,7 @@ function getConfig() {
     longTrigger: `Funding < ${(CONFIG.funding.longTrigger * 100).toFixed(2)}%`,
     shortTrigger: `Funding > ${(CONFIG.funding.shortTrigger * 100).toFixed(2)}%`,
     cooldown: `${CONFIG.cooldownMs / (60 * 60 * 1000)}h between signals per pair`,
+    provider: 'CCData (data-api.cryptocompare.com)',
     status: 'STANDBY — not triggering trades',
   };
 }
