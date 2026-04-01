@@ -404,8 +404,8 @@ const DELAYS = {
   closeAllDeals: 5000,  // 5s — wait for Binance to clear the position
   closeDealSl:   5000,  // 5s — same as closeAllDeals
   stopBot:       2000,  // 2s — let bot state settle
-  startBot:      0,     // No delay needed after start
-  startDeal:     0,
+  startBot:      3000,  // 3s — let bot initialize before startDeal (v2.3.0)
+  startDeal:     0,     // No delay needed after deal start
   addFunds:      0,
 };
 
@@ -544,6 +544,19 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false) {
+  // v2.3.0: Auto-inject startDeal after every startBot.
+  // Bots use startCondition=Manual to prevent ASAP deal churning.
+  // The relay explicitly opens exactly ONE deal per signal.
+  const expanded = [];
+  for (const a of actions) {
+    expanded.push(a);
+    if (a.action === 'startBot' && a.uuid) {
+      expanded.push({ action: 'startDeal', uuid: a.uuid });
+      log(`[${requestId}]   ↳ Auto-injected startDeal for ${BOT_MAP[a.uuid]?.name || a.uuid.substring(0, 8)}`);
+    }
+  }
+  actions = expanded;
+
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
 
   // v1.2.0: Identify if this is a crossover flip (has closeAllDeals)
@@ -628,7 +641,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '2.2.0',
+    version: '2.3.0',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
