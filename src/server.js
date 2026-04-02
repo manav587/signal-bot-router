@@ -13,15 +13,18 @@ const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
 // The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
 // UUID is what TradingView sends; Mongo ID is what the Gainium REST API uses.
+// V3 bots — startCondition: TechnicalIndicators (EMA 9/21 + RSI gate inside Gainium)
+// Migrated 2 Apr 2026 from ASAP bots to eliminate deal churning.
+// Old ASAP bots archived — see reference_bot_uuids.md for history.
 const BOT_MAP = {
-  '108babeb-649f-46ec-8ce8-c8a63a863b39': { mongoId: '69c4ab944c428a9d6a6c2c5d', name: 'ETH Long v2' },
-  '65db6bc2-353c-4590-940a-32bd64f4d3c9': { mongoId: '69c4ab9c4c428a9d6a6c2d07', name: 'ETH Short v2' },
-  'b7d03686-a657-4ced-ad0a-225d28c71ab8': { mongoId: '69c8e321c0cb070ef82a064e', name: 'SOL Long v2' },
-  '87956a3c-4c24-46d1-b071-cd3e6e35c761': { mongoId: '69c4ab8b4c428a9d6a6c2bcb', name: 'SOL Short v2' },
-  '7bd0c5be-6a0e-4d0e-946d-f957ef5a8236': { mongoId: '69c6cb76c0cb070ef8ea2fb8', name: 'XRP Long v2' },
-  '14ea2ce8-c0cd-4eaf-b9b0-54c6ac325921': { mongoId: '69c6cb77c0cb070ef8ea2fd5', name: 'XRP Short v2' },
-  'b3f25502-d982-4c6e-a29a-ce2c8cef5349': { mongoId: '69ccbd69fdc61f1b4550190a', name: 'BTC Long v2' },
-  'c302bc15-990c-4722-aba9-1d27b1f549d4': { mongoId: '69ccbd6afdc61f1b4550191e', name: 'BTC Short v2' },
+  '61a66c9f-7463-46db-a72f-2ef39565bc20': { mongoId: '69ce1dc4228af151def7f93e', name: 'SOL Long v2' },
+  '3af77f4f-73a7-45c1-a0fd-b7c3ce9f16ee': { mongoId: '69ce1dc6228af151def7f97b', name: 'SOL Short v2' },
+  '4d6f6265-4c9a-42e7-bf85-8956a1c03f6c': { mongoId: '69ce1dc8228af151def7f9a0', name: 'ETH Long v2' },
+  '69c91263-68c9-4f88-a543-7c319b5fde8b': { mongoId: '69ce1dca228af151def7fa03', name: 'ETH Short v2' },
+  'eb74f76c-c6ec-48c2-a74d-d9fd27c2fab5': { mongoId: '69ce1dcc228af151def7fa3c', name: 'XRP Long v2' },
+  '2751574b-cc46-4f62-bd01-cb404c21f8d7': { mongoId: '69ce1dcd228af151def7fab8', name: 'XRP Short v2' },
+  'd0ea54dc-7218-4666-8c81-85bcd0271a3f': { mongoId: '69ce1dcf228af151def7faf7', name: 'BTC Long v2' },
+  '21c9985a-db38-440d-9313-ac13825852be': { mongoId: '69ce1dd1228af151def7fb2e', name: 'BTC Short v2' },
 };
 
 // ── Telegram Alerts (optional — sends critical failures to Manav) ────────
@@ -545,11 +548,16 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false) {
-  // v2.4.0: startDeal injection removed — bots use startCondition=ASAP (only option
-  // that works with webhook architecture). Churning is controlled by:
-  //   1. 5-min cooldown between deals (Gainium-side)
-  //   2. 2-min revalidation with 1.5% drawdown kill (relay-side)
-  //   3. Gated re-entry: bot stopped if gates fail after deal closes
+  // v3.0.0: Bots use startCondition=TechnicalIndicators (EMA 9/21 + RSI gate).
+  // Webhook startBot activates the bot; Gainium's internal indicators control
+  // when deals open. No more ASAP churning — deals only open when:
+  //   1. EMA 9 > EMA 21 on 4H (LONG) or EMA 9 < EMA 21 (SHORT)
+  //   2. RSI > 30 (LONG) or RSI < 70 (SHORT) on 4H
+  //   3. Both conditions AND'd together per deal
+  // Relay safety layers remain as backup:
+  //   - 5-min cooldown between deals (Gainium-side)
+  //   - 2-min revalidation with 1.5% drawdown kill (relay-side)
+  //   - Gated re-entry: bot stopped if gates fail after deal closes
 
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
 
@@ -635,7 +643,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '2.4.0',
+    version: '3.0.0',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1089,35 +1097,35 @@ async function runRevalidation() {
       if (result.allowed) {
         log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
 
-        // v2.3.1: Gated re-entry — if bot is running but deal closed (TP/SL), open a new one.
-        // This replaces the old ASAP behavior with gate-checked re-entry every 2 min.
+        // v3.0.0: Gated re-entry — if bot is running but deal closed (TP/SL).
+        // With TechnicalIndicators, Gainium's internal EMA/RSI gate controls deal re-entry.
+        // Relay still validates external gates — if they fail, stop the bot to prevent
+        // the internal indicators from opening a deal into bad structure.
         if (gainiumApi.isConfigured()) {
           const botInfo = BOT_MAP[uuid];
           if (botInfo) {
             try {
               const deals = await gainiumApi.getBotDeals(uuid);
               if (deals && deals.active === 0) {
-                // v2.4.0: Deal closed (TP/SL). With ASAP, bot will auto-open next deal
-                // after cooldown (5 min). Re-run FULL gate validation — if gates fail,
-                // stop the bot BEFORE the next ASAP deal opens.
+                // Deal closed (TP/SL). Gainium's internal indicators will gate re-entry,
+                // but relay's external gates provide an additional safety layer.
                 const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
                 if (fullGate.allowed) {
-                  // Gates still pass — let ASAP reopen the next deal naturally
-                  // Update entry price for drawdown tracking on the upcoming deal
+                  // External gates pass — let Gainium's internal indicators decide re-entry
                   bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
-                  log(`🔄 Re-entry: ${bot.botName} deal closed, gates PASS — ASAP will reopen @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
+                  log(`🔄 Re-entry: ${bot.botName} deal closed, external gates PASS — internal indicators will gate re-entry @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
                   sendTelegramAlert(
-                    `🔄 Gated Re-entry (ASAP)\n\n` +
-                    `${bot.pair} ${bot.direction} — deal closed, gates re-checked\n` +
+                    `🔄 Gated Re-entry (TechnicalIndicators)\n\n` +
+                    `${bot.pair} ${bot.direction} — deal closed, external gates re-checked\n` +
                     `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
                     `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
                     `RSI: ${fullGate.data.rsi14 || '?'}\n` +
-                    `Gates pass — bot will reopen after cooldown.\n` +
+                    `External gates pass — internal EMA/RSI will gate next deal.\n` +
                     `Time: ${istTimestamp()}`
                   ).catch(() => {});
                 } else {
-                  // Gates no longer pass — stop the bot BEFORE ASAP reopens
-                  log(`🔄 Re-entry: ${bot.botName} deal closed, gates FAILED — stopping before ASAP reopens`);
+                  // External gates fail — stop bot to prevent internal indicators from opening
+                  log(`🔄 Re-entry: ${bot.botName} deal closed, external gates FAILED — stopping bot`);
                   try {
                     await sendAction({ action: 'stopBot', uuid });
                   } catch (stopErr) {
@@ -1126,9 +1134,9 @@ async function runRevalidation() {
                   delete ACTIVE_BOTS[uuid];
                   delete LAST_DIRECTION[bot.pair];
                   sendTelegramAlert(
-                    `⏹️ Bot Stopped (deal closed, gates no longer pass)\n\n` +
+                    `⏹️ Bot Stopped (deal closed, external gates fail)\n\n` +
                     `${bot.botName}: ${fullGate.reason}\n` +
-                    `Stopped before ASAP could reopen.\n` +
+                    `Stopped to prevent re-entry into bad structure.\n` +
                     `Time: ${istTimestamp()}`
                   ).catch(() => {});
                 }
