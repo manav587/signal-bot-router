@@ -405,7 +405,7 @@ const DELAYS = {
   closeAllDeals: 5000,  // 5s — wait for Binance to clear the position
   closeDealSl:   5000,  // 5s — same as closeAllDeals
   stopBot:       2000,  // 2s — let bot state settle
-  startBot:      3000,  // 3s — let bot initialize before startDeal (v2.3.0)
+  startBot:      0,     // No delay needed — ASAP opens deal on its own
   startDeal:     0,     // No delay needed after deal start
   addFunds:      0,
 };
@@ -545,18 +545,11 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false) {
-  // v2.3.0: Auto-inject startDeal after every startBot.
-  // Bots use startCondition=Manual to prevent ASAP deal churning.
-  // The relay explicitly opens exactly ONE deal per signal.
-  const expanded = [];
-  for (const a of actions) {
-    expanded.push(a);
-    if (a.action === 'startBot' && a.uuid) {
-      expanded.push({ action: 'startDeal', uuid: a.uuid });
-      log(`[${requestId}]   ↳ Auto-injected startDeal for ${BOT_MAP[a.uuid]?.name || a.uuid.substring(0, 8)}`);
-    }
-  }
-  actions = expanded;
+  // v2.4.0: startDeal injection removed — bots use startCondition=ASAP (only option
+  // that works with webhook architecture). Churning is controlled by:
+  //   1. 5-min cooldown between deals (Gainium-side)
+  //   2. 2-min revalidation with 1.5% drawdown kill (relay-side)
+  //   3. Gated re-entry: bot stopped if gates fail after deal closes
 
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
 
@@ -642,7 +635,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '2.3.1',
+    version: '2.4.0',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1104,31 +1097,27 @@ async function runRevalidation() {
             try {
               const deals = await gainiumApi.getBotDeals(uuid);
               if (deals && deals.active === 0) {
-                // Deal closed — re-run FULL gate validation (not just revalidation)
+                // v2.4.0: Deal closed (TP/SL). With ASAP, bot will auto-open next deal
+                // after cooldown (5 min). Re-run FULL gate validation — if gates fail,
+                // stop the bot BEFORE the next ASAP deal opens.
                 const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
                 if (fullGate.allowed) {
-                  // Gates still pass — open a new deal
-                  log(`🔄 Re-entry: ${bot.botName} has 0 active deals, gates PASS — sending startDeal`);
-                  try {
-                    await sendAction({ action: 'startDeal', uuid });
-                    // Update entry price to current for drawdown tracking
-                    bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
-                    log(`🔄 Re-entry: startDeal sent for ${bot.botName} @ $${bot.entryPrice?.toFixed(2) || '?'}`);
-                    sendTelegramAlert(
-                      `🔄 Gated Re-entry\n\n` +
-                      `${bot.pair} ${bot.direction} — new deal opened\n` +
-                      `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
-                      `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
-                      `RSI: ${fullGate.data.rsi14 || '?'}\n` +
-                      `Previous deal closed (TP/SL), gates re-checked and passed.\n` +
-                      `Time: ${istTimestamp()}`
-                    ).catch(() => {});
-                  } catch (dealErr) {
-                    log(`🔄 Re-entry: startDeal FAILED for ${bot.botName}: ${dealErr.message}`);
-                  }
+                  // Gates still pass — let ASAP reopen the next deal naturally
+                  // Update entry price for drawdown tracking on the upcoming deal
+                  bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
+                  log(`🔄 Re-entry: ${bot.botName} deal closed, gates PASS — ASAP will reopen @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
+                  sendTelegramAlert(
+                    `🔄 Gated Re-entry (ASAP)\n\n` +
+                    `${bot.pair} ${bot.direction} — deal closed, gates re-checked\n` +
+                    `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
+                    `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
+                    `RSI: ${fullGate.data.rsi14 || '?'}\n` +
+                    `Gates pass — bot will reopen after cooldown.\n` +
+                    `Time: ${istTimestamp()}`
+                  ).catch(() => {});
                 } else {
-                  // Gates no longer pass — stop the bot, clean up
-                  log(`🔄 Re-entry: ${bot.botName} has 0 active deals, gates FAILED — stopping bot`);
+                  // Gates no longer pass — stop the bot BEFORE ASAP reopens
+                  log(`🔄 Re-entry: ${bot.botName} deal closed, gates FAILED — stopping before ASAP reopens`);
                   try {
                     await sendAction({ action: 'stopBot', uuid });
                   } catch (stopErr) {
@@ -1139,14 +1128,14 @@ async function runRevalidation() {
                   sendTelegramAlert(
                     `⏹️ Bot Stopped (deal closed, gates no longer pass)\n\n` +
                     `${bot.botName}: ${fullGate.reason}\n` +
-                    `No re-entry — conditions changed.\n` +
+                    `Stopped before ASAP could reopen.\n` +
                     `Time: ${istTimestamp()}`
                   ).catch(() => {});
                 }
               }
             } catch (dealCheckErr) {
               log(`🔄 Re-entry: deal check failed for ${bot.botName}: ${dealCheckErr.message}`);
-              // Don't kill the bot on API errors — just skip re-entry this cycle
+              // Don't kill the bot on API errors — just skip this cycle
             }
           }
         }
@@ -1216,10 +1205,7 @@ async function runRevalidation() {
                   await fetch(GAINIUM_WEBHOOK_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify([
-                      { action: 'startBot', uuid: oppositeBot.uuid },
-                      { action: 'startDeal', uuid: oppositeBot.uuid },
-                    ]),
+                    body: JSON.stringify([{ action: 'startBot', uuid: oppositeBot.uuid }]),
                   });
                   ACTIVE_BOTS[oppositeBot.uuid] = {
                     pair: bot.pair,
