@@ -797,6 +797,52 @@ app.get('/funding-check/:symbol', async (req, res) => {
   }
 });
 
+// ── Gate Check Endpoint (v2.3.0) ───────────────────────────────────────
+// Quick-check whether a pair+direction would pass or fail the signal gate right now.
+// GET /gate-check/SOL/LONG  or  /gate-check/ETH/SHORT
+app.get('/gate-check/:pair/:direction', async (req, res) => {
+  try {
+    const pair = req.params.pair.toUpperCase();
+    const direction = req.params.direction.toUpperCase();
+    if (!['LONG', 'SHORT'].includes(direction)) {
+      return res.status(400).json({ error: 'Direction must be LONG or SHORT' });
+    }
+    const result = await signalGate.validateSignal(pair, direction);
+    res.json({
+      timestamp: istTimestamp(),
+      pair,
+      direction,
+      wouldPass: result.allowed,
+      reason: result.reason,
+      data: result.data,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /gate-check — all pairs, both directions at once
+app.get('/gate-check', async (req, res) => {
+  try {
+    const pairs = ['SOL', 'ETH', 'BTC', 'XRP'];
+    const results = {};
+    for (const pair of pairs) {
+      const [longResult, shortResult] = await Promise.all([
+        signalGate.validateSignal(pair, 'LONG'),
+        signalGate.validateSignal(pair, 'SHORT'),
+      ]);
+      results[pair] = {
+        price: longResult.data.currentPrice || shortResult.data.currentPrice || null,
+        LONG: { wouldPass: longResult.allowed, reason: longResult.reason, data: longResult.data },
+        SHORT: { wouldPass: shortResult.allowed, reason: shortResult.reason, data: shortResult.data },
+      };
+    }
+    res.json({ timestamp: istTimestamp(), results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Test endpoint — end-to-end verification test (calls actual gainium-api functions)
 app.get('/test-verify/:uuid', async (req, res) => {
   const uuid = req.params.uuid;
