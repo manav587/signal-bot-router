@@ -642,11 +642,11 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '2.3.0',
+    version: '2.3.1',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + price drawdown', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -1095,6 +1095,61 @@ async function runRevalidation() {
 
       if (result.allowed) {
         log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
+
+        // v2.3.1: Gated re-entry — if bot is running but deal closed (TP/SL), open a new one.
+        // This replaces the old ASAP behavior with gate-checked re-entry every 2 min.
+        if (gainiumApi.isConfigured()) {
+          const botInfo = BOT_MAP[uuid];
+          if (botInfo) {
+            try {
+              const deals = await gainiumApi.getBotDeals(uuid);
+              if (deals && deals.active === 0) {
+                // Deal closed — re-run FULL gate validation (not just revalidation)
+                const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
+                if (fullGate.allowed) {
+                  // Gates still pass — open a new deal
+                  log(`🔄 Re-entry: ${bot.botName} has 0 active deals, gates PASS — sending startDeal`);
+                  try {
+                    await sendAction({ action: 'startDeal', uuid });
+                    // Update entry price to current for drawdown tracking
+                    bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
+                    log(`🔄 Re-entry: startDeal sent for ${bot.botName} @ $${bot.entryPrice?.toFixed(2) || '?'}`);
+                    sendTelegramAlert(
+                      `🔄 Gated Re-entry\n\n` +
+                      `${bot.pair} ${bot.direction} — new deal opened\n` +
+                      `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
+                      `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
+                      `RSI: ${fullGate.data.rsi14 || '?'}\n` +
+                      `Previous deal closed (TP/SL), gates re-checked and passed.\n` +
+                      `Time: ${istTimestamp()}`
+                    ).catch(() => {});
+                  } catch (dealErr) {
+                    log(`🔄 Re-entry: startDeal FAILED for ${bot.botName}: ${dealErr.message}`);
+                  }
+                } else {
+                  // Gates no longer pass — stop the bot, clean up
+                  log(`🔄 Re-entry: ${bot.botName} has 0 active deals, gates FAILED — stopping bot`);
+                  try {
+                    await sendAction({ action: 'stopBot', uuid });
+                  } catch (stopErr) {
+                    log(`🔄 Re-entry: stopBot failed for ${bot.botName}: ${stopErr.message}`);
+                  }
+                  delete ACTIVE_BOTS[uuid];
+                  delete LAST_DIRECTION[bot.pair];
+                  sendTelegramAlert(
+                    `⏹️ Bot Stopped (deal closed, gates no longer pass)\n\n` +
+                    `${bot.botName}: ${fullGate.reason}\n` +
+                    `No re-entry — conditions changed.\n` +
+                    `Time: ${istTimestamp()}`
+                  ).catch(() => {});
+                }
+              }
+            } catch (dealCheckErr) {
+              log(`🔄 Re-entry: deal check failed for ${bot.botName}: ${dealCheckErr.message}`);
+              // Don't kill the bot on API errors — just skip re-entry this cycle
+            }
+          }
+        }
       } else {
         // Conditions changed — stop the bot
         log(`🔄 Reval FAILED: ${bot.botName} — ${result.reason}`);
