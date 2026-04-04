@@ -308,7 +308,8 @@ async function runFundingCheck() {
 
       // Execute through the same pipeline
       log(`[${requestId}] [FUNDING] Dispatching: ${actions.map(a => `${a.action}(${a.uuid.substring(0, 8)})`).join(' → ')}`);
-      processActions(actions, requestId).catch(err => {
+      const fundingContext = { pair, direction, price: result.data.markPrice?.toFixed(2) };
+      processActions(actions, requestId, false, fundingContext).catch(err => {
         log(`[${requestId}] [FUNDING] ❌ Execution error: ${err.message}`);
       });
     }
@@ -340,7 +341,7 @@ const DEFERRED_QUEUE = []; // { actions, requestId, targetBot, queuedAt, retryCo
 const DEFERRED_MAX_RETRIES = 5;      // 5 retries × 60s = 5 minutes
 const DEFERRED_RETRY_INTERVAL = 60000; // 60 seconds
 
-function queueDeferredFlip(actions, requestId, targetBot) {
+function queueDeferredFlip(actions, requestId, targetBot, context = {}) {
   // Don't double-queue the same bot
   const existing = DEFERRED_QUEUE.find(q => q.targetBot.mongoId === targetBot.mongoId);
   if (existing) {
@@ -352,6 +353,7 @@ function queueDeferredFlip(actions, requestId, targetBot) {
     actions,
     requestId,
     targetBot,
+    context,
     queuedAt: Date.now(),
     retryCount: 0,
   });
@@ -376,7 +378,7 @@ async function processDeferredQueue() {
 
     // Re-attempt the full action sequence
     try {
-      const result = await processActions(item.actions, item.requestId + `-r${item.retryCount}`, true);
+      const result = await processActions(item.actions, item.requestId + `-r${item.retryCount}`, true, item.context || {});
 
       if (result && result.completed) {
         log(`[${item.requestId}] ✅ Deferred flip SUCCEEDED for ${item.targetBot.name} on retry ${item.retryCount}`);
@@ -557,7 +559,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 
 // ── Process actions sequentially with delays ─────────────────────────────
 
-async function processActions(actions, requestId, isRetry = false) {
+async function processActions(actions, requestId, isRetry = false, context = {}) {
   // v3.1.1: Bots use startCondition=ASAP, controlled by relay webhook start/stop.
   // Webhook startBot activates the bot; ASAP opens a deal immediately.
   // After TP/SL, ASAP re-enters after 5-min cooldown (Gainium-side).
@@ -619,22 +621,45 @@ async function processActions(actions, requestId, isRetry = false) {
 
     // Queue for deferred retry (only on first attempt, not on retries to avoid infinite loops)
     if (!isRetry && targetBot) {
-      queueDeferredFlip(actions, requestId, targetBot);
+      queueDeferredFlip(actions, requestId, targetBot, context);
     }
 
     return { completed: false };
   } else {
     log(`[${requestId}] ✅ All ${actions.length} action(s) completed`);
-    const completedNames = actions.map(a => a.action).join(' → ');
     const completedBots = actions
       .map(a => BOT_MAP[a.uuid]?.name || a.uuid?.substring(0, 8) || '?')
       .filter((v, i, arr) => arr.indexOf(v) === i);
-    sendTelegramAlert(
-      `✅ Trade executed\n\n` +
-      `Done: ${completedNames}\n` +
-      `Bot(s): ${completedBots.join(', ')}\n\n` +
-      `${istTimestamp()}`
-    ).catch(() => {});
+
+    // Build plain-English completion message with technical context in brackets
+    const hasClose = actions.some(a => a.action === 'closeAllDeals');
+    const hasStart = actions.some(a => a.action === 'startBot');
+    const { pair, direction, price } = context;
+
+    let tradeMsg;
+    if (hasClose && hasStart && pair) {
+      // Crossover flip: closed old position, opened new one
+      tradeMsg = `✅ Trade switch complete\n\n` +
+        `Closed the previous ${pair} position and opened a new ${direction} at $${price || '?'}.\n` +
+        `(closeAllDeals → stopBot → startBot)\n\n` +
+        `Bot: ${completedBots.join(', ')}\n` +
+        `${istTimestamp()}`;
+    } else if (hasStart && pair) {
+      // Fresh entry, no close needed
+      tradeMsg = `✅ Trade opened\n\n` +
+        `Opened a ${direction} on ${pair} at $${price || '?'}.\n` +
+        `(startBot)\n\n` +
+        `Bot: ${completedBots.join(', ')}\n` +
+        `${istTimestamp()}`;
+    } else {
+      // Fallback for non-crossover signals (stopBot only, etc.)
+      const completedNames = actions.map(a => a.action).join(' → ');
+      tradeMsg = `✅ Action complete\n\n` +
+        `Done: ${completedNames}\n` +
+        `Bot: ${completedBots.join(', ')}\n` +
+        `${istTimestamp()}`;
+    }
+    sendTelegramAlert(tradeMsg).catch(() => {});
 
     return { completed: true };
   }
@@ -649,7 +674,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.1.1',
+    version: '3.1.2',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1014,7 +1039,8 @@ app.post('/webhook', (req, res) => {
         delete ACTIVE_BOTS[stopAction.uuid];
       }
 
-      processActions(actions, requestId).catch(err => {
+      const tradeContext = { pair, direction, price: gateResult.data.currentPrice?.toFixed(2) };
+      processActions(actions, requestId, false, tradeContext).catch(err => {
         log(`[${requestId}] ❌ Unexpected error: ${err.message}`);
       });
     }).catch(err => {
@@ -1273,7 +1299,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.1.1 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.1.2 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
