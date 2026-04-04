@@ -13,9 +13,9 @@ const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
 // The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
 // UUID is what TradingView sends; Mongo ID is what the Gainium REST API uses.
-// V3 bots — startCondition: TechnicalIndicators (EMA 9/21 + RSI gate inside Gainium)
-// Migrated 2 Apr 2026 from ASAP bots to eliminate deal churning.
-// Old ASAP bots archived — see reference_bot_uuids.md for history.
+// V3.1 bots — startCondition: ASAP, gated by relay webhook start/stop
+// TechnicalIndicators tested 2-4 Apr 2026 but Gainium never evaluated them.
+// ASAP + 5-min cooldown + 2-min revalidation = controlled re-entry without churning.
 const BOT_MAP = {
   '61a66c9f-7463-46db-a72f-2ef39565bc20': { mongoId: '69ce1dc4228af151def7f93e', name: 'SOL Long v2' },
   '3af77f4f-73a7-45c1-a0fd-b7c3ce9f16ee': { mongoId: '69ce1dc6228af151def7f97b', name: 'SOL Short v2' },
@@ -73,6 +73,23 @@ const FUNDING_POLL_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 // Key = UUID, Value = { pair, direction, botName, startedAt }
 // Only populated when the relay dispatches a startBot action.
 const ACTIVE_BOTS = {};
+
+// ── Telegram Alert Cooldown (v3.1.0) ──────────────────────────────────
+// Prevents spamming the same alert type per bot. Tracks last send time.
+// Key = `${uuid}:${alertType}`, Value = timestamp (ms)
+const TELEGRAM_COOLDOWNS = {};
+const TELEGRAM_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between same alert per bot
+
+function canSendTelegramAlert(uuid, alertType) {
+  const key = `${uuid}:${alertType}`;
+  const last = TELEGRAM_COOLDOWNS[key];
+  if (!last) return true;
+  return (Date.now() - last) >= TELEGRAM_COOLDOWN_MS;
+}
+
+function markTelegramAlertSent(uuid, alertType) {
+  TELEGRAM_COOLDOWNS[`${uuid}:${alertType}`] = Date.now();
+}
 
 // ── Rising-Edge Detection (v1.5.1) ─────────────────────────────────────
 // Tracks the last dispatched direction per trading pair.
@@ -548,16 +565,13 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false) {
-  // v3.0.0: Bots use startCondition=TechnicalIndicators (EMA 9/21 + RSI gate).
-  // Webhook startBot activates the bot; Gainium's internal indicators control
-  // when deals open. No more ASAP churning — deals only open when:
-  //   1. EMA 9 > EMA 21 on 4H (LONG) or EMA 9 < EMA 21 (SHORT)
-  //   2. RSI > 30 (LONG) or RSI < 70 (SHORT) on 4H
-  //   3. Both conditions AND'd together per deal
-  // Relay safety layers remain as backup:
-  //   - 5-min cooldown between deals (Gainium-side)
+  // v3.1.0: Bots use startCondition=ASAP, controlled by relay webhook start/stop.
+  // Webhook startBot activates the bot; ASAP opens a deal immediately.
+  // After TP/SL, ASAP re-enters after 5-min cooldown (Gainium-side).
+  // Relay safety layers prevent churning:
+  //   - 5-min cooldown between deals (Gainium-side, longer than 2-min reval)
   //   - 2-min revalidation with 1.5% drawdown kill (relay-side)
-  //   - Gated re-entry: bot stopped if gates fail after deal closes
+  //   - Bot stopped if external gates fail while deal is closed (pre-re-entry)
 
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
 
@@ -643,7 +657,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.0.0',
+    version: '3.1.0',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1097,34 +1111,38 @@ async function runRevalidation() {
       if (result.allowed) {
         log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
 
-        // v3.0.0: Gated re-entry — if bot is running but deal closed (TP/SL).
-        // With TechnicalIndicators, Gainium's internal EMA/RSI gate controls deal re-entry.
-        // Relay still validates external gates — if they fail, stop the bot to prevent
-        // the internal indicators from opening a deal into bad structure.
+        // v3.1.0: ASAP re-entry monitoring — if bot is running but deal closed (TP/SL).
+        // With ASAP startCondition, Gainium auto-opens next deal after 5-min cooldown.
+        // Relay validates external gates — if they fail, stop the bot to prevent
+        // ASAP from opening a deal into bad structure.
         if (gainiumApi.isConfigured()) {
           const botInfo = BOT_MAP[uuid];
           if (botInfo) {
             try {
               const deals = await gainiumApi.getBotDeals(uuid);
               if (deals && deals.active === 0) {
-                // Deal closed (TP/SL). Gainium's internal indicators will gate re-entry,
-                // but relay's external gates provide an additional safety layer.
+                // Deal closed (TP/SL). ASAP will auto-open next deal after cooldown.
+                // Relay's external gates provide safety — stop bot if gates fail.
                 const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
                 if (fullGate.allowed) {
-                  // External gates pass — let Gainium's internal indicators decide re-entry
+                  // External gates pass — ASAP will re-open after 5-min cooldown
                   bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
-                  log(`🔄 Re-entry: ${bot.botName} deal closed, external gates PASS — internal indicators will gate re-entry @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
-                  sendTelegramAlert(
-                    `🔄 Gated Re-entry (TechnicalIndicators)\n\n` +
-                    `${bot.pair} ${bot.direction} — deal closed, external gates re-checked\n` +
-                    `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
-                    `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
-                    `RSI: ${fullGate.data.rsi14 || '?'}\n` +
-                    `External gates pass — internal EMA/RSI will gate next deal.\n` +
-                    `Time: ${istTimestamp()}`
-                  ).catch(() => {});
+                  log(`🔄 Re-entry: ${bot.botName} deal closed, external gates PASS — ASAP will re-enter after cooldown @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
+                  // Only send Telegram once per hour per bot (not every 2 min)
+                  if (canSendTelegramAlert(uuid, 'gated-reentry')) {
+                    markTelegramAlertSent(uuid, 'gated-reentry');
+                    sendTelegramAlert(
+                      `🔄 Re-entry OK\n\n` +
+                      `${bot.pair} ${bot.direction} — deal closed, gates pass\n` +
+                      `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
+                      `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
+                      `RSI: ${fullGate.data.rsi14 || '?'}\n` +
+                      `ASAP will re-enter after cooldown.\n` +
+                      `Time: ${istTimestamp()}`
+                    ).catch(() => {});
+                  }
                 } else {
-                  // External gates fail — stop bot to prevent internal indicators from opening
+                  // External gates fail — stop bot before ASAP reopens
                   log(`🔄 Re-entry: ${bot.botName} deal closed, external gates FAILED — stopping bot`);
                   try {
                     await sendAction({ action: 'stopBot', uuid });
@@ -1134,9 +1152,9 @@ async function runRevalidation() {
                   delete ACTIVE_BOTS[uuid];
                   delete LAST_DIRECTION[bot.pair];
                   sendTelegramAlert(
-                    `⏹️ Bot Stopped (deal closed, external gates fail)\n\n` +
+                    `⏹️ Bot Stopped (deal closed, gates fail)\n\n` +
                     `${bot.botName}: ${fullGate.reason}\n` +
-                    `Stopped to prevent re-entry into bad structure.\n` +
+                    `Stopped before ASAP could reopen.\n` +
                     `Time: ${istTimestamp()}`
                   ).catch(() => {});
                 }
@@ -1277,7 +1295,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v2.2.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.1.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
