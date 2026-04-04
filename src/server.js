@@ -74,7 +74,7 @@ const FUNDING_POLL_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 // Only populated when the relay dispatches a startBot action.
 const ACTIVE_BOTS = {};
 
-// ── Telegram Alert Cooldown (v3.1.0) ──────────────────────────────────
+// ── Telegram Alert Cooldown (v3.1.1) ──────────────────────────────────
 // Prevents spamming the same alert type per bot. Tracks last send time.
 // Key = `${uuid}:${alertType}`, Value = timestamp (ms)
 const TELEGRAM_COOLDOWNS = {};
@@ -252,12 +252,11 @@ async function runFundingCheck() {
       if (!gateResult.allowed) {
         log(`[${requestId}] [FUNDING] 🚫 ${pair} ${direction} gated: ${gateResult.reason}`);
         sendTelegramAlert(
-          `🚫 Funding Signal Gated\n\n` +
-          `${pair} ${direction} → BLOCKED\n` +
-          `Funding: ${result.data.fundingPct}\n` +
-          `Reason: ${gateResult.reason}\n` +
-          `Time: ${istTimestamp()}\n` +
-          `Request: ${requestId}`
+          `🚫 Funding signal blocked\n\n` +
+          `Tried to open a ${direction} on ${pair} because the funding rate (${result.data.fundingPct}) favours it, but the safety checks didn't pass.\n\n` +
+          `Why: ${gateResult.reason}\n` +
+          `No trade was placed.\n\n` +
+          `${istTimestamp()}`
         ).catch(() => {});
         continue;
       }
@@ -301,14 +300,10 @@ async function runFundingCheck() {
 
       // Send Telegram notification
       sendTelegramAlert(
-        `📊 Funding Rate Signal\n\n` +
-        `${pair} → ${direction}\n` +
-        `Funding: ${result.data.fundingPct}\n` +
-        `Price: $${result.data.markPrice?.toFixed(2) || '?'}\n` +
-        `Gate: ${gateResult.reason}\n` +
-        `Actions: ${actions.map(a => a.action).join(' → ')}\n` +
-        `Time: ${istTimestamp()}\n` +
-        `Request: ${requestId}`
+        `📊 Funding rate trade\n\n` +
+        `Opening a ${direction} on ${pair} at $${result.data.markPrice?.toFixed(2) || '?'}.\n\n` +
+        `The funding rate (${result.data.fundingPct}) suggests traders are leaning the other way, which creates an opportunity. All safety checks passed.\n\n` +
+        `${istTimestamp()}`
       ).catch(() => {});
 
       // Execute through the same pipeline
@@ -363,11 +358,9 @@ function queueDeferredFlip(actions, requestId, targetBot) {
 
   log(`[${requestId}] 📋 Queued deferred flip for ${targetBot.name} — will retry every 60s for up to 5 min`);
   sendTelegramAlert(
-    `📋 Flip Queued for Retry\n\n` +
-    `Bot: ${targetBot.name}\n` +
-    `Will retry every 60s for up to 5 min\n` +
-    `Time: ${istTimestamp()}\n` +
-    `Request: ${requestId}`
+    `📋 Waiting to switch direction\n\n` +
+    `Trying to start ${targetBot.name}, but Binance still has the old position open (a "position conflict"). Will keep retrying every 60 seconds for up to 5 minutes while it clears.\n\n` +
+    `${istTimestamp()}`
   ).catch(() => {});
 }
 
@@ -388,11 +381,9 @@ async function processDeferredQueue() {
       if (result && result.completed) {
         log(`[${item.requestId}] ✅ Deferred flip SUCCEEDED for ${item.targetBot.name} on retry ${item.retryCount}`);
         sendTelegramAlert(
-          `✅ Deferred Flip Succeeded\n\n` +
-          `Bot: ${item.targetBot.name}\n` +
-          `Retry: ${item.retryCount}/${DEFERRED_MAX_RETRIES}\n` +
-          `Time: ${istTimestamp()}\n` +
-          `Request: ${item.requestId}`
+          `✅ Direction switch succeeded\n\n` +
+          `${item.targetBot.name} is now running. The old position cleared and the new bot started after ${item.retryCount} retries.\n\n` +
+          `${istTimestamp()}`
         ).catch(() => {});
         DEFERRED_QUEUE.splice(i, 1);
         continue;
@@ -405,12 +396,10 @@ async function processDeferredQueue() {
     if (item.retryCount >= DEFERRED_MAX_RETRIES) {
       log(`[${item.requestId}] ❌ Deferred flip GAVE UP for ${item.targetBot.name} after ${DEFERRED_MAX_RETRIES} retries`);
       sendTelegramAlert(
-        `❌ Deferred Flip Failed\n\n` +
-        `Bot: ${item.targetBot.name}\n` +
-        `Gave up after ${DEFERRED_MAX_RETRIES} retries (5 min)\n` +
-        `Manual intervention required.\n` +
-        `Time: ${istTimestamp()}\n` +
-        `Request: ${item.requestId}`
+        `❌ Direction switch failed\n\n` +
+        `Couldn't start ${item.targetBot.name} after 5 minutes of retrying. The old position on Binance didn't close in time.\n\n` +
+        `⚠️ Check Gainium manually — you may need to close the stuck position and restart the bot.\n\n` +
+        `${istTimestamp()}`
       ).catch(() => {});
       DEFERRED_QUEUE.splice(i, 1);
     }
@@ -555,7 +544,11 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
   }
 
   // NOT FLAT — this is critical. Do NOT proceed to startBot.
-  const alertMsg = `🚨 FLIP ABORTED for ${targetBot.name}\n\n${result.error}\n\nManual intervention required. The opposite bot was NOT started to prevent position conflict.`;
+  const alertMsg = `🚨 Trade switch cancelled — ${targetBot.name}\n\n` +
+    `${result.error}\n\n` +
+    `The system tried to switch direction but couldn't verify the old position closed properly on Binance. To be safe, the new bot was NOT started — this avoids having two opposite positions open at once (a "position conflict").\n\n` +
+    `⚠️ Check Gainium/Binance manually.\n\n` +
+    `${istTimestamp()}`;
   log(`[${requestId}]   🚨 ${alertMsg}`);
   await sendTelegramAlert(alertMsg);
 
@@ -565,7 +558,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false) {
-  // v3.1.0: Bots use startCondition=ASAP, controlled by relay webhook start/stop.
+  // v3.1.1: Bots use startCondition=ASAP, controlled by relay webhook start/stop.
   // Webhook startBot activates the bot; ASAP opens a deal immediately.
   // After TP/SL, ASAP re-enters after 5-min cooldown (Gainium-side).
   // Relay safety layers prevent churning:
@@ -637,11 +630,10 @@ async function processActions(actions, requestId, isRetry = false) {
       .map(a => BOT_MAP[a.uuid]?.name || a.uuid?.substring(0, 8) || '?')
       .filter((v, i, arr) => arr.indexOf(v) === i);
     sendTelegramAlert(
-      `✅ Signal Completed\n\n` +
-      `Actions: ${completedNames}\n` +
-      `Bot(s): ${completedBots.join(', ')}\n` +
-      `Time: ${istTimestamp()}\n` +
-      `Request: ${requestId}`
+      `✅ Trade executed\n\n` +
+      `Done: ${completedNames}\n` +
+      `Bot(s): ${completedBots.join(', ')}\n\n` +
+      `${istTimestamp()}`
     ).catch(() => {});
 
     return { completed: true };
@@ -682,11 +674,9 @@ app.get('/pause', (req, res) => {
   PAUSED_SIGNALS = 0;
   log('⏸️ SYSTEM PAUSED — signals will be logged but NOT executed');
   sendTelegramAlert(
-    `⏸️ System PAUSED\n\n` +
-    `All incoming signals will be logged but NOT executed.\n` +
-    `Bots will not be started/stopped.\n` +
-    `Time: ${istTimestamp()}\n\n` +
-    `Resume: GET /resume`
+    `⏸️ System paused\n\n` +
+    `The relay is on hold. Any signals from TradingView will be logged but no trades will be placed until you resume.\n\n` +
+    `${istTimestamp()}`
   ).catch(() => {});
   res.json({ status: 'paused', pausedAt: PAUSED_AT });
 });
@@ -702,11 +692,9 @@ app.get('/resume', (req, res) => {
   PAUSED_SIGNALS = 0;
   log(`▶️ SYSTEM RESUMED — was paused for ${pauseDuration}s, ${signalsMissed} signal(s) received while paused`);
   sendTelegramAlert(
-    `▶️ System RESUMED\n\n` +
-    `Was paused for ${Math.floor(pauseDuration / 60)}m ${pauseDuration % 60}s\n` +
-    `Signals received while paused: ${signalsMissed}\n` +
-    `Time: ${istTimestamp()}\n\n` +
-    `All incoming signals will now be executed normally.`
+    `▶️ System resumed\n\n` +
+    `Back online after ${Math.floor(pauseDuration / 60)}m ${pauseDuration % 60}s. ${signalsMissed > 0 ? `${signalsMissed} signal(s) came in while paused and were skipped.` : 'No signals were missed.'} Trading is active again.\n\n` +
+    `${istTimestamp()}`
   ).catch(() => {});
   res.json({ status: 'running', pauseDuration: pauseDuration + 's', signalsMissed });
 });
@@ -734,10 +722,9 @@ app.get('/strategy/crossover', (req, res) => {
   STRATEGY_CHANGED_AT = new Date().toISOString();
   log('🔀 Strategy switched to CROSSOVER (TradingView alerts)');
   sendTelegramAlert(
-    `🔀 Strategy → CROSSOVER\n\n` +
-    `Signal source: TradingView EMA alerts\n` +
-    `Funding poller: stopped\n` +
-    `Time: ${istTimestamp()}`
+    `🔀 Switched to crossover mode\n\n` +
+    `Now using TradingView moving average alerts (EMA crossovers) to decide trades. Funding rate polling is off.\n\n` +
+    `${istTimestamp()}`
   ).catch(() => {});
   res.json({ status: 'switched to crossover', mode: STRATEGY_MODE });
 });
@@ -751,10 +738,9 @@ app.get('/strategy/funding', (req, res) => {
   startFundingPoller();
   log('🔀 Strategy switched to FUNDING (Binance funding rate polling)');
   sendTelegramAlert(
-    `🔀 Strategy → FUNDING\n\n` +
-    `Signal source: Binance funding rate (every 4h)\n` +
-    `TradingView webhooks: will be ignored\n` +
-    `Time: ${istTimestamp()}`
+    `🔀 Switched to funding rate mode\n\n` +
+    `Now using Binance funding rates (checked every 4 hours) to decide trades. TradingView crossover alerts will be ignored.\n\n` +
+    `${istTimestamp()}`
   ).catch(() => {});
   res.json({ status: 'switched to funding', mode: STRATEGY_MODE });
 });
@@ -934,12 +920,9 @@ app.post('/webhook', (req, res) => {
     PAUSED_SIGNALS++;
     log(`[${requestId}] ⏸️ PAUSED — signal logged but NOT executed: ${summary}`);
     sendTelegramAlert(
-      `⏸️ Signal Received (PAUSED — not executed)\n\n` +
-      `Actions: ${actionNames}\n` +
-      `Bot(s): ${botNames.join(', ')}\n` +
-      `Time: ${istTimestamp()}\n` +
-      `Request: ${requestId}\n\n` +
-      `Signal #${PAUSED_SIGNALS} since pause. Resume: GET /resume`
+      `⏸️ Signal received but system is paused\n\n` +
+      `TradingView sent a signal for ${botNames.join(', ')}, but the system is paused so no trade was placed. This is signal #${PAUSED_SIGNALS} since the pause.\n\n` +
+      `${istTimestamp()}`
     ).catch(() => {});
     return;
   }
@@ -951,13 +934,9 @@ app.post('/webhook', (req, res) => {
     if (LAST_DIRECTION[pair] === direction) {
       log(`[${requestId}] 🔇 DUPLICATE suppressed — ${pair} already ${direction} (last dispatched). Dropping signal.`);
       sendTelegramAlert(
-        `🔇 Duplicate Signal Suppressed\n\n` +
-        `${pair}: already ${direction}\n` +
-        `Bot: ${botName}\n` +
-        `Actions: ${actionNames}\n` +
-        `Time: ${istTimestamp()}\n` +
-        `Request: ${requestId}\n\n` +
-        `This is the same direction we last dispatched. No action taken.`
+        `🔇 Duplicate signal ignored\n\n` +
+        `TradingView said go ${direction} on ${pair}, but we're already ${direction}. This is a repeat of the last signal — no action needed.\n\n` +
+        `${istTimestamp()}`
       ).catch(() => {});
       return;
     }
@@ -972,13 +951,10 @@ app.post('/webhook', (req, res) => {
       delete LAST_DIRECTION[pair];
       log(`[${requestId}] ⚡ CIRCUIT BREAKER — ${pair} is parked: ${cbCheck.reason}`);
       sendTelegramAlert(
-        `⚡ Signal Blocked (Circuit Breaker)\n\n` +
-        `${pair} ${direction} → PARKED\n` +
-        `Reason: ${cbCheck.reason}\n` +
-        `Bot: ${botName}\n` +
-        `Time: ${istTimestamp()}\n` +
-        `Request: ${requestId}\n\n` +
-        `TradingView signal dropped. Pair will resume when park expires.`
+        `⚡ Circuit breaker — ${pair} paused\n\n` +
+        `${pair} has been flipping direction too quickly (a sign of a choppy, indecisive market). The "circuit breaker" has kicked in to prevent losses from rapid back-and-forth trading.\n\n` +
+        `${pair} is parked for 30 min. Other pairs continue normally.\n\n` +
+        `${istTimestamp()}`
       ).catch(() => {});
       return;
     }
@@ -998,28 +974,26 @@ app.post('/webhook', (req, res) => {
         delete LAST_DIRECTION[pair];
         log(`[${requestId}] 🚫 SIGNAL GATED — ${gateResult.reason}`);
         sendTelegramAlert(
-          `🚫 Signal Gated (not executed)\n\n` +
-          `${pair} ${direction} → BLOCKED\n` +
-          `Reason: ${gateResult.reason}\n` +
-          `Price: $${gateResult.data.currentPrice?.toFixed(2) || '?'}\n` +
-          `EMA50: $${gateResult.data.ema50?.toFixed(2) || '?'} (${gateResult.data.priceVsEma || '?'})\n` +
-          `RSI(14): ${gateResult.data.rsi14 || '?'}\n` +
-          `Time: ${istTimestamp()}\n` +
-          `Request: ${requestId}`
+          `🚫 Trade signal rejected\n\n` +
+          `TradingView said go ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}, but the safety checks ("signal gate") blocked it.\n\n` +
+          `Why: ${gateResult.reason}\n` +
+          `RSI(14): ${gateResult.data.rsi14 || '?'} · EMA50: $${gateResult.data.ema50?.toFixed(2) || '?'} (price ${gateResult.data.priceVsEma || '?'})\n\n` +
+          `No trade placed — waiting for better alignment.\n\n` +
+          `${istTimestamp()}`
         ).catch(() => {});
         return;
       }
 
       // Gate passed — proceed with dispatch
       log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
-      const telegramSummary = `📨 Signal Received (gate passed)\n\n` +
-        `Actions: ${actionNames}\n` +
-        `Bot(s): ${botNames.join(', ')}\n` +
-        `Price: $${gateResult.data.currentPrice?.toFixed(2) || '?'} ${gateResult.data.priceVsEma || ''} EMA50\n` +
-        `4H Trend: ${gateResult.data.shortTermTrend || '?'}\n` +
-        `RSI(14): ${gateResult.data.rsi14 || '?'} ${gateResult.data.rsiDirection || ''}\n` +
-        `Time: ${istTimestamp()}\n` +
-        `Request: ${requestId}`;
+      const startedBot = botNames.find(n => n !== '?') || '?';
+      const telegramSummary = `📨 New trade opening\n\n` +
+        `TradingView crossover alert → going ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}.\n\n` +
+        `✅ 4H trend: ${gateResult.data.shortTermTrend || '?'} (EMA9 vs EMA21 — the short-term moving averages agree)\n` +
+        `✅ RSI(14): ${gateResult.data.rsi14 || '?'} ${gateResult.data.rsiDirection || ''} (momentum indicator is in range)\n` +
+        `✅ Price is ${gateResult.data.priceVsEma || '?'} the 50-period EMA ($${gateResult.data.ema50?.toFixed(2) || '?'})\n\n` +
+        `Bot: ${botNames.join(', ')}\n` +
+        `${istTimestamp()}`;
       sendTelegramAlert(telegramSummary).catch(() => {});
 
       // Track the started bot for periodic re-validation
@@ -1054,11 +1028,9 @@ app.post('/webhook', (req, res) => {
   }
 
   // Non-crossover signals (no startBot action) — pass through without gating
-  const telegramSummary = `📨 Signal Received\n\n` +
-    `Actions: ${actionNames}\n` +
-    `Bot(s): ${botNames.join(', ')}\n` +
-    `Time: ${istTimestamp()}\n` +
-    `Request: ${requestId}`;
+  const telegramSummary = `📨 Signal received\n\n` +
+    `${actionNames} on ${botNames.join(', ')}.\n\n` +
+    `${istTimestamp()}`;
   sendTelegramAlert(telegramSummary).catch(() => {});
 
   // Process in background (don't block the response)
@@ -1111,7 +1083,7 @@ async function runRevalidation() {
       if (result.allowed) {
         log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
 
-        // v3.1.0: ASAP re-entry monitoring — if bot is running but deal closed (TP/SL).
+        // v3.1.1: ASAP re-entry monitoring — if bot is running but deal closed (TP/SL).
         // With ASAP startCondition, Gainium auto-opens next deal after 5-min cooldown.
         // Relay validates external gates — if they fail, stop the bot to prevent
         // ASAP from opening a deal into bad structure.
@@ -1132,13 +1104,13 @@ async function runRevalidation() {
                   if (canSendTelegramAlert(uuid, 'gated-reentry')) {
                     markTelegramAlertSent(uuid, 'gated-reentry');
                     sendTelegramAlert(
-                      `🔄 Re-entry OK\n\n` +
-                      `${bot.pair} ${bot.direction} — deal closed, gates pass\n` +
-                      `Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n` +
-                      `4H Trend: ${fullGate.data.shortTermTrend || '?'}\n` +
-                      `RSI: ${fullGate.data.rsi14 || '?'}\n` +
-                      `ASAP will re-enter after cooldown.\n` +
-                      `Time: ${istTimestamp()}`
+                      `🔄 Deal closed — re-entering\n\n` +
+                      `${bot.botName} took profit or hit stop loss. The market still supports a ${bot.direction} on ${bot.pair}:\n\n` +
+                      `• 4H EMAs (9 vs 21): ${fullGate.data.shortTermTrend || '?'} — moving averages still aligned\n` +
+                      `• RSI(14): ${fullGate.data.rsi14 || '?'} — momentum in range\n` +
+                      `• Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n\n` +
+                      `A new deal will open automatically after the 5-minute cooldown.\n\n` +
+                      `${istTimestamp()}`
                     ).catch(() => {});
                   }
                 } else {
@@ -1152,10 +1124,11 @@ async function runRevalidation() {
                   delete ACTIVE_BOTS[uuid];
                   delete LAST_DIRECTION[bot.pair];
                   sendTelegramAlert(
-                    `⏹️ Bot Stopped (deal closed, gates fail)\n\n` +
-                    `${bot.botName}: ${fullGate.reason}\n` +
-                    `Stopped before ASAP could reopen.\n` +
-                    `Time: ${istTimestamp()}`
+                    `⏹️ ${bot.botName} stopped — market shifted\n\n` +
+                    `The deal closed, but the market no longer supports a ${bot.direction}:\n` +
+                    `${fullGate.reason}\n\n` +
+                    `The bot has been paused to avoid opening a new deal into a bad setup. It will wait for the next TradingView crossover signal to re-enter.\n\n` +
+                    `${istTimestamp()}`
                   ).catch(() => {});
                 }
               }
@@ -1199,11 +1172,10 @@ async function runRevalidation() {
           // Circuit breaker just tripped — stop any active bot on this pair and park
           log(`🔄 ⚡ CIRCUIT BREAKER TRIPPED: ${bot.pair} — ${cbCheck.reason}`);
           sendTelegramAlert(
-            `⚡ CIRCUIT BREAKER: ${bot.pair} parked for 30 min\n\n` +
-            `Reason: ${cbCheck.reason}\n` +
-            `Market is choppy — no trades on ${bot.pair} until ${CIRCUIT_BREAKER[bot.pair].parkedUntil}\n` +
-            `Other pairs continue normally.\n` +
-            `Time: ${istTimestamp()}`
+            `⚡ Circuit breaker tripped — ${bot.pair}\n\n` +
+            `${bot.pair} has flipped direction too many times in a short window. This usually means the market is choppy and indecisive, so the system is stepping back.\n\n` +
+            `No trades on ${bot.pair} for 30 minutes. Other pairs continue normally.\n\n` +
+            `${istTimestamp()}`
           ).catch(() => {});
           // Skip auto-flip entirely
         } else if (cbCheck.parked) {
@@ -1262,21 +1234,27 @@ async function runRevalidation() {
           }
 
           // Alert to Telegram (includes flip result)
-          let alertMsg = `🔄 REVALIDATION STOP\n\n` +
-            `Bot: ${bot.botName}\n` +
-            `Reason: ${result.reason}\n` +
-            `Data: 4H trend ${result.data.shortTermTrend || '?'}, RSI ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}\n` +
-            `Started: ${bot.startedAt}\n` +
-            `Stopped: ${new Date().toISOString()}`;
+          const isDrawdown = result.reason && result.reason.includes('PRICE DRAWDOWN');
+          let alertMsg;
+          if (isDrawdown) {
+            alertMsg = `🛑 ${bot.botName} closed — price moved against us\n\n` +
+              `The ${bot.direction} position was losing too much (past the 1.5% safety limit), so the deal was closed to cut losses.\n\n` +
+              `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
+          } else {
+            alertMsg = `🛑 ${bot.botName} closed — market structure changed\n\n` +
+              `The 4H checks ("revalidation") found the market no longer supports this ${bot.direction}:\n` +
+              `${result.reason}\n\n` +
+              `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
+          }
 
           if (flipResult && flipResult.flipped) {
-            alertMsg += `\n\n↔️ AUTO-FLIP: Started ${flipResult.botName}\n` +
-              `Price: $${flipResult.gateData.currentPrice?.toFixed(2) || '?'}\n` +
-              `4H Trend: ${flipResult.gateData.shortTermTrend || '?'}\n` +
-              `RSI: ${flipResult.gateData.rsi14 || '?'} ${flipResult.gateData.rsiDirection || ''}`;
+            alertMsg += `\n\n↔️ Auto-flipped to ${flipResult.botName}\n` +
+              `The opposite direction passed all checks, so it was started automatically at $${flipResult.gateData.currentPrice?.toFixed(2) || '?'}.\n` +
+              `4H trend: ${flipResult.gateData.shortTermTrend || '?'} · RSI(14): ${flipResult.gateData.rsi14 || '?'} ${flipResult.gateData.rsiDirection || ''}`;
           } else if (flipResult) {
-            alertMsg += `\n\n⏸️ No flip: ${flipResult.reason}`;
+            alertMsg += `\n\n⏸️ Didn't flip to the other direction: ${flipResult.reason}`;
           }
+          alertMsg += `\n\n${istTimestamp()}`;
 
           sendTelegramAlert(alertMsg).catch(() => {});
         }
@@ -1295,7 +1273,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.1.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.1.1 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
