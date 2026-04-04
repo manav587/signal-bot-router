@@ -46,17 +46,36 @@ const CONFIG = {
     slopeCandles: 3,       // Compare RSI now vs N candles ago for direction
   },
 
-  // Smart Money gate — Binance Futures top trader long/short ratio
-  // Uses /futures/data/topLongShortPositionRatio (public, no API key)
-  // Only blocks when whale positioning STRONGLY disagrees with signal
+  // Smart Money gate — Hyperliquid whale positioning (v3.2.0)
+  // Tracks specific high-performing whale wallets on Hyperliquid.
+  // Public API, no auth needed: POST https://api.hyperliquid.xyz/info
+  // Blocks trades when tracked whales are positioned in the OPPOSITE direction.
+  // Falls back to Binance top trader L/S ratio if Hyperliquid fails.
   smartMoney: {
-    period: '4h',             // Match our trading timeframe
-    longMinRatio: 0.35,       // Block LONG if top traders < 35% long (whales heavily short)
-    shortMaxRatio: 0.65,      // Block SHORT if top traders > 65% long (whales heavily long)
+    period: '4h',             // Fallback: Binance L/S ratio timeframe
+    longMinRatio: 0.35,       // Fallback: Block LONG if top traders < 35% long
+    shortMaxRatio: 0.65,      // Fallback: Block SHORT if top traders > 65% long
     providers: [
-      'https://fapi.binance.com',    // Primary — may be geo-blocked from some cloud IPs
-      'https://fapi1.binance.com',   // Mirror
+      'https://fapi.binance.com',    // Binance fallback — may be geo-blocked
+      'https://fapi1.binance.com',
     ],
+    // Hyperliquid whale tracking (primary data source)
+    hyperliquid: {
+      apiUrl: 'https://api.hyperliquid.xyz/info',
+      // Tracked wallets — high win-rate traders with verified track records
+      wallets: [
+        {
+          address: '0x0ddf9bae2af4b874b96d287a5ad42eb47138a902',
+          label: 'pension-usdt.eth',
+          // 80%+ win rate, $30M+ profit, 20 consecutive wins, 3x leverage
+          weight: 1.0,  // Primary signal — full weight
+        },
+      ],
+      // Coin name mapping: Hyperliquid uses 'BTC', 'ETH', 'SOL' — same as our pair names
+      // If a tracked whale has a position on the same coin as the signal,
+      // and it's the opposite direction, BLOCK the trade.
+      mode: 'blocking',  // 'blocking' or 'advisory'
+    },
   },
 
   // Data providers — ordered by reliability from US cloud IPs
@@ -240,7 +259,71 @@ async function fetchCandles(pairInfo, interval, limit) {
 }
 
 /**
- * Fetch top trader long/short position ratio from Binance Futures API.
+ * Fetch whale positions from Hyperliquid (v3.2.0).
+ * Queries the clearinghouseState endpoint for each tracked wallet.
+ * Returns an array of { label, coin, direction, size, leverage, unrealizedPnl, roe }.
+ * Free API — no auth needed.
+ *
+ * @param {string} coin - e.g. 'BTC', 'ETH', 'SOL' — filter positions for this coin
+ * @returns {Promise<Array<{label: string, direction: string, size: string, leverage: number, unrealizedPnl: string, roe: string}>>}
+ */
+async function fetchHyperliquidWhalePositions(coin) {
+  const hlConfig = CONFIG.smartMoney.hyperliquid;
+  if (!hlConfig || !hlConfig.wallets.length) return [];
+
+  const results = [];
+
+  for (const wallet of hlConfig.wallets) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout);
+
+    try {
+      const res = await fetch(hlConfig.apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'clearinghouseState',
+          user: wallet.address,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`Hyperliquid API ${res.status}`);
+
+      const data = await res.json();
+      const positions = data.assetPositions || [];
+
+      // Find position matching our coin
+      for (const pos of positions) {
+        const p = pos.position;
+        if (p.coin === coin) {
+          const size = parseFloat(p.szi);
+          results.push({
+            label: wallet.label,
+            address: wallet.address,
+            weight: wallet.weight,
+            coin: p.coin,
+            direction: size < 0 ? 'SHORT' : 'LONG',
+            size: p.szi,
+            leverage: p.leverage?.value || 0,
+            entryPx: p.entryPx,
+            unrealizedPnl: p.unrealizedPnl,
+            roe: p.returnOnEquity,
+          });
+        }
+      }
+    } catch (err) {
+      clearTimeout(timeout);
+      console.log(`[WHALE GATE] Failed to fetch ${wallet.label}: ${err.message}`);
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Fetch top trader long/short position ratio from Binance Futures API (fallback).
  * Returns the percentage of top trader positions that are long (0.0 to 1.0).
  * Returns null if all providers fail (gate will pass through).
  *
@@ -278,7 +361,7 @@ async function fetchSmartMoneyRatio(symbol, period) {
     }
   }
 
-  console.log(`[SMART MONEY] All providers failed for ${symbol}: ${errors.join('; ')}`);
+  console.log(`[SMART MONEY] All Binance providers failed for ${symbol}: ${errors.join('; ')}`);
   return null;
 }
 
@@ -326,13 +409,15 @@ async function validateSignal(pair, direction) {
   const data = {};
 
   try {
-    // Fetch daily candles, 4h candles, and smart money ratio in parallel
+    // Fetch daily candles, 4h candles, Binance L/S ratio, and Hyperliquid whale positions in parallel
     // We need more 4h candles now (30) for the 21-period EMA to stabilize
     const [dailyCandles, fourHourCandles, smartMoney] = await Promise.all([
       fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
       fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded),
       fetchSmartMoneyRatio(pairInfo.symbol, CONFIG.smartMoney.period),
     ]);
+    // Note: Hyperliquid whale positions are fetched in Gate 5 block below
+    // (needs 'pair' not 'symbol', and is a separate concern from candle data)
 
     // Calculate daily 50 EMA
     const dailyCloses = dailyCandles.map(c => c.close);
@@ -438,10 +523,48 @@ async function validateSignal(pair, direction) {
       };
     }
 
-    // ── Gate 5: Smart Money — top trader positioning (ADVISORY ONLY) ───
-    // Fetches whale positioning data and includes it in response/logs,
-    // but does NOT block trades. Collecting data during "prove it" period
-    // to evaluate whether this should become a blocking gate later.
+    // ── Gate 5: Whale Positioning — Hyperliquid whale tracker (v3.2.0) ──
+    // Primary: Check tracked whale wallets on Hyperliquid.
+    // If a whale has a position on this coin in the OPPOSITE direction, BLOCK.
+    // If no whale has a position on this coin, fall through to Binance L/S ratio (advisory).
+    const hlConfig = CONFIG.smartMoney.hyperliquid;
+    const whalePositions = await fetchHyperliquidWhalePositions(pair);
+
+    if (whalePositions.length > 0) {
+      const opposing = whalePositions.filter(w => w.direction !== direction);
+      const aligned = whalePositions.filter(w => w.direction === direction);
+
+      data.whaleGate = {
+        source: 'hyperliquid',
+        positions: whalePositions.map(w => ({
+          label: w.label,
+          direction: w.direction,
+          size: w.size,
+          leverage: w.leverage,
+          entryPx: w.entryPx,
+          unrealizedPnl: w.unrealizedPnl,
+          roe: w.roe,
+        })),
+        aligned: aligned.length,
+        opposing: opposing.length,
+        mode: hlConfig.mode,
+      };
+
+      if (hlConfig.mode === 'blocking' && opposing.length > 0) {
+        const whaleDetail = opposing.map(w =>
+          `${w.label} is ${w.direction} ${w.coin} (${w.size} @ ${w.entryPx}, ${w.leverage}x, PnL: $${parseFloat(w.unrealizedPnl).toFixed(0)})`
+        ).join('; ');
+        return {
+          allowed: false,
+          reason: `WHALE GATE: ${whaleDetail} — opposes your ${direction} signal`,
+          data,
+        };
+      }
+    } else {
+      data.whaleGate = { source: 'hyperliquid', positions: [], note: 'No whale position on this coin' };
+    }
+
+    // Binance L/S ratio — advisory fallback (logged, not blocking)
     if (smartMoney) {
       const wouldBlock =
         (direction === 'LONG' && smartMoney.longRatio < CONFIG.smartMoney.longMinRatio) ||
@@ -461,9 +584,12 @@ async function validateSignal(pair, direction) {
     }
 
     // All gates passed
+    const whaleInfo = data.whaleGate?.positions?.length > 0
+      ? `Whale: ${data.whaleGate.positions.map(w => `${w.label} ${w.direction}`).join(', ')}`
+      : 'Whale: no position';
     return {
       allowed: true,
-      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, Smart Money ${data.smartMoney.longPct || 'N/A'} long`,
+      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, ${whaleInfo}`,
       data,
     };
 
@@ -590,7 +716,8 @@ function getConfig() {
     shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — must agree with trade direction)`,
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,
-    smartMoney: `Top trader L/S ratio on ${CONFIG.smartMoney.period} (ADVISORY — logged only)`,
+    smartMoney: `Binance top trader L/S ratio on ${CONFIG.smartMoney.period} (ADVISORY — fallback)`,
+    whaleGate: `Hyperliquid whale tracking: ${CONFIG.smartMoney.hyperliquid.wallets.map(w => w.label).join(', ')} (${CONFIG.smartMoney.hyperliquid.mode.toUpperCase()} — blocks opposing direction)`,
   };
 }
 
