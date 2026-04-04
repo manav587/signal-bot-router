@@ -634,10 +634,16 @@ async function processActions(actions, requestId, isRetry = false, context = {})
     // Build plain-English completion message with technical context in brackets
     const hasClose = actions.some(a => a.action === 'closeAllDeals');
     const hasStart = actions.some(a => a.action === 'startBot');
-    const { pair, direction, price } = context;
+    const { pair, direction, price, isNoOp } = context;
 
     let tradeMsg;
-    if (hasClose && hasStart && pair) {
+    if (isNoOp && pair) {
+      // No-op: bot was already running in this direction, nothing changed on Binance
+      tradeMsg = `ℹ️ Already in position — no change\n\n` +
+        `${pair} is already ${direction}. TradingView sent a repeat signal, and all API calls succeeded, but no new orders were placed on Binance.\n\n` +
+        `Your existing position continues as-is.\n` +
+        `${istTimestamp()}`;
+    } else if (hasClose && hasStart && pair) {
       // Crossover flip: closed old position, opened new one
       tradeMsg = `✅ Trade switch complete\n\n` +
         `Closed the previous ${pair} position and opened a new ${direction} at $${price || '?'}.\n` +
@@ -674,7 +680,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.1.2',
+    version: '3.1.3',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1021,15 +1027,23 @@ app.post('/webhook', (req, res) => {
         `${istTimestamp()}`;
       sendTelegramAlert(telegramSummary).catch(() => {});
 
-      // Track the started bot for periodic re-validation
+      // Detect no-op: if the startBot target is already active in the same direction,
+      // the API calls will succeed but nothing changes on Binance.
       const startAction = actions.find(a => a.action === 'startBot');
+      let isNoOp = false;
       if (startAction && startAction.uuid) {
+        const existing = ACTIVE_BOTS[startAction.uuid];
+        if (existing && existing.direction === direction) {
+          isNoOp = true;
+          log(`[${requestId}] ℹ️ NO-OP: ${signal.botName} is already ${direction} — API calls will succeed but nothing changes on Binance`);
+        }
+        // Update tracking regardless (refreshes timestamp)
         ACTIVE_BOTS[startAction.uuid] = {
           pair: signal.pair,
           direction: signal.direction,
           botName: signal.botName,
-          startedAt: new Date().toISOString(),
-          entryPrice: gateResult.data.currentPrice || null,
+          startedAt: existing?.startedAt || new Date().toISOString(),
+          entryPrice: existing?.entryPrice || gateResult.data.currentPrice || null,
         };
         log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
       }
@@ -1039,7 +1053,7 @@ app.post('/webhook', (req, res) => {
         delete ACTIVE_BOTS[stopAction.uuid];
       }
 
-      const tradeContext = { pair, direction, price: gateResult.data.currentPrice?.toFixed(2) };
+      const tradeContext = { pair, direction, price: gateResult.data.currentPrice?.toFixed(2), isNoOp };
       processActions(actions, requestId, false, tradeContext).catch(err => {
         log(`[${requestId}] ❌ Unexpected error: ${err.message}`);
       });
@@ -1299,7 +1313,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.1.2 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.1.3 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
