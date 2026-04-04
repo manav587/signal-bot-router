@@ -76,6 +76,23 @@ const CONFIG = {
       // and it's the opposite direction, BLOCK the trade.
       mode: 'blocking',  // 'blocking' or 'advisory'
     },
+    // Binance copy trader tracking (second data source — v3.2.1)
+    // Polls abccan's closed position history to derive directional bias per coin.
+    // Public API, no auth needed. positionShow=false hides live positions,
+    // but closed history is available.
+    binanceCopyTrader: {
+      portfolioId: '4962739966991556097',
+      label: 'abccan',
+      // 95.5% win rate, $175K profit in 2 weeks, 82% short bias
+      apiUrl: 'https://www.binance.com/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/position-history',
+      lookback: 10,             // Check last 10 closed trades per coin
+      biasThreshold: 0.6,     // 60%+ trades in one direction = directional bias
+    },
+    // Consensus logic (v3.2.1):
+    // - Both trackers oppose signal → BLOCK
+    // - One opposes, one agrees or no data → ALLOW (log disagreement)
+    // - Both agree or both no data → ALLOW
+    consensusMode: 'both-must-oppose',
   },
 
   // Data providers — ordered by reliability from US cloud IPs
@@ -323,6 +340,70 @@ async function fetchHyperliquidWhalePositions(coin) {
 }
 
 /**
+ * Fetch Binance copy trader directional bias (v3.2.1).
+ * Polls closed position history and derives directional bias per coin.
+ * Returns { direction: 'SHORT'|'LONG'|null, confidence: 0.0-1.0, trades: number }
+ *
+ * @param {string} coin - e.g. 'BTC', 'ETH', 'SOL'
+ * @returns {Promise<{label: string, direction: string|null, confidence: number, shortCount: number, longCount: number, trades: number}>}
+ */
+async function fetchBinanceCopyTraderBias(coin) {
+  const ctConfig = CONFIG.smartMoney.binanceCopyTrader;
+  if (!ctConfig) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.fetchTimeout + 2000); // extra time for Binance
+
+  try {
+    const res = await fetch(ctConfig.apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        portfolioId: ctConfig.portfolioId,
+        pageNumber: 1,
+        pageSize: 50, // Fetch enough to get lookback trades per coin
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) throw new Error(`Binance copy trade API ${res.status}`);
+
+    const data = await res.json();
+    if (data.code !== '000000' || !data.data?.list) throw new Error('Bad response');
+
+    // Filter trades for this coin
+    const symbol = `${coin}USDT`;
+    const coinTrades = data.data.list
+      .filter(t => t.symbol === symbol && t.status === 'All Closed')
+      .slice(0, ctConfig.lookback);
+
+    if (coinTrades.length === 0) {
+      return { label: ctConfig.label, direction: null, confidence: 0, shortCount: 0, longCount: 0, trades: 0 };
+    }
+
+    const shortCount = coinTrades.filter(t => t.side === 'Short').length;
+    const longCount = coinTrades.filter(t => t.side === 'Long').length;
+    const total = coinTrades.length;
+    const dominantDirection = shortCount >= longCount ? 'SHORT' : 'LONG';
+    const confidence = Math.max(shortCount, longCount) / total;
+
+    return {
+      label: ctConfig.label,
+      direction: confidence >= ctConfig.biasThreshold ? dominantDirection : null,
+      confidence,
+      shortCount,
+      longCount,
+      trades: total,
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    console.log(`[WHALE GATE] Failed to fetch ${ctConfig.label} bias: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetch top trader long/short position ratio from Binance Futures API (fallback).
  * Returns the percentage of top trader positions that are long (0.0 to 1.0).
  * Returns null if all providers fail (gate will pass through).
@@ -523,45 +604,96 @@ async function validateSignal(pair, direction) {
       };
     }
 
-    // ── Gate 5: Whale Positioning — Hyperliquid whale tracker (v3.2.0) ──
-    // Primary: Check tracked whale wallets on Hyperliquid.
-    // If a whale has a position on this coin in the OPPOSITE direction, BLOCK.
-    // If no whale has a position on this coin, fall through to Binance L/S ratio (advisory).
+    // ── Gate 5: Two-Tracker Consensus Whale Gate (v3.2.1) ──────────────
+    // Tracker 1: pension-usdt.eth (Hyperliquid) — live positions
+    // Tracker 2: abccan (Binance Copy Trade) — closed-trade directional bias
+    // Consensus: both-must-oppose → BLOCK only when BOTH trackers oppose signal
+    //   Both oppose → BLOCK | Both agree → ALLOW | Disagree → ALLOW (log)
+    //   One has no data → defer to the other | Neither has data → PASS THROUGH
     const hlConfig = CONFIG.smartMoney.hyperliquid;
-    const whalePositions = await fetchHyperliquidWhalePositions(pair);
+    const consensusMode = CONFIG.smartMoney.consensusMode || 'both-must-oppose';
 
+    // Fetch both trackers in parallel
+    const [whalePositions, copyTraderBias] = await Promise.all([
+      fetchHyperliquidWhalePositions(pair),
+      fetchBinanceCopyTraderBias(pair),
+    ]);
+
+    // ── Tracker 1: Hyperliquid whale stance ──
+    let tracker1 = { label: 'pension-usdt.eth', stance: 'no-data', detail: null };
     if (whalePositions.length > 0) {
       const opposing = whalePositions.filter(w => w.direction !== direction);
       const aligned = whalePositions.filter(w => w.direction === direction);
+      tracker1.stance = opposing.length > 0 ? 'opposing' : 'aligned';
+      tracker1.detail = whalePositions.map(w => ({
+        label: w.label, direction: w.direction, size: w.size,
+        leverage: w.leverage, entryPx: w.entryPx,
+        unrealizedPnl: w.unrealizedPnl, roe: w.roe,
+      }));
+      tracker1.opposing = opposing.length;
+      tracker1.aligned = aligned.length;
+    }
 
-      data.whaleGate = {
-        source: 'hyperliquid',
-        positions: whalePositions.map(w => ({
-          label: w.label,
-          direction: w.direction,
-          size: w.size,
-          leverage: w.leverage,
-          entryPx: w.entryPx,
-          unrealizedPnl: w.unrealizedPnl,
-          roe: w.roe,
-        })),
-        aligned: aligned.length,
-        opposing: opposing.length,
-        mode: hlConfig.mode,
+    // ── Tracker 2: Binance copy trader stance ──
+    let tracker2 = { label: 'abccan', stance: 'no-data', detail: null };
+    if (copyTraderBias && copyTraderBias.direction) {
+      tracker2.stance = copyTraderBias.direction !== direction ? 'opposing' : 'aligned';
+      tracker2.detail = {
+        direction: copyTraderBias.direction, confidence: copyTraderBias.confidence,
+        shortCount: copyTraderBias.shortCount, longCount: copyTraderBias.longCount,
+        trades: copyTraderBias.trades,
       };
+    } else if (copyTraderBias) {
+      tracker2.detail = {
+        direction: null, confidence: copyTraderBias.confidence,
+        trades: copyTraderBias.trades, note: 'Insufficient bias — below threshold',
+      };
+    }
 
-      if (hlConfig.mode === 'blocking' && opposing.length > 0) {
-        const whaleDetail = opposing.map(w =>
-          `${w.label} is ${w.direction} ${w.coin} (${w.size} @ ${w.entryPx}, ${w.leverage}x, PnL: $${parseFloat(w.unrealizedPnl).toFixed(0)})`
+    // ── Consensus logic ──
+    data.whaleGate = { version: '3.2.1', consensusMode, tracker1, tracker2 };
+
+    const t1Opposes = tracker1.stance === 'opposing';
+    const t2Opposes = tracker2.stance === 'opposing';
+    const t1HasData = tracker1.stance !== 'no-data';
+    const t2HasData = tracker2.stance !== 'no-data';
+
+    let gatePassed = true;
+    let gateReason = '';
+
+    if (consensusMode === 'both-must-oppose') {
+      if (t1Opposes && t2Opposes) {
+        gatePassed = false;
+        const whaleDetail = whalePositions.filter(w => w.direction !== direction).map(w =>
+          `${w.label} ${w.direction} ${w.coin} (${w.size} @ ${w.entryPx}, ${w.leverage}x, PnL: $${parseFloat(w.unrealizedPnl).toFixed(0)})`
         ).join('; ');
-        return {
-          allowed: false,
-          reason: `WHALE GATE: ${whaleDetail} — opposes your ${direction} signal`,
-          data,
-        };
+        gateReason = `CONSENSUS BLOCK: Both trackers oppose ${direction} — ${whaleDetail} + ${tracker2.label} bias ${copyTraderBias?.direction} (${(copyTraderBias?.confidence * 100).toFixed(0)}% conf)`;
+      } else if (t1Opposes && !t2HasData) {
+        gatePassed = false;
+        const whaleDetail = whalePositions.filter(w => w.direction !== direction).map(w =>
+          `${w.label} ${w.direction} ${w.coin} (${w.size} @ ${w.entryPx}, ${w.leverage}x)`
+        ).join('; ');
+        gateReason = `WHALE GATE (solo): ${whaleDetail} opposes ${direction} — ${tracker2.label} has no data, deferring to whale`;
+      } else if (!t1HasData && t2Opposes) {
+        gatePassed = false;
+        gateReason = `COPY TRADER GATE (solo): ${tracker2.label} bias ${copyTraderBias?.direction} (${(copyTraderBias?.confidence * 100).toFixed(0)}% conf) opposes ${direction} — whale has no position, deferring to copy trader`;
+      } else if (t1Opposes !== t2Opposes && t1HasData && t2HasData) {
+        const opposer = t1Opposes ? tracker1.label : tracker2.label;
+        const supporter = t1Opposes ? tracker2.label : tracker1.label;
+        gateReason = `SPLIT SIGNAL: ${opposer} opposes but ${supporter} aligns — allowing ${direction} (disagreement logged)`;
+        data.whaleGate.disagreement = true;
+      } else {
+        gateReason = t1HasData || t2HasData
+          ? `CONSENSUS PASS: ${[t1HasData ? `${tracker1.label} ${tracker1.stance}` : null, t2HasData ? `${tracker2.label} ${tracker2.stance}` : null].filter(Boolean).join(', ')}`
+          : 'CONSENSUS PASS: Neither tracker has position data for this coin';
       }
-    } else {
-      data.whaleGate = { source: 'hyperliquid', positions: [], note: 'No whale position on this coin' };
+    }
+
+    data.whaleGate.result = gatePassed ? 'PASS' : 'BLOCK';
+    data.whaleGate.reason = gateReason;
+
+    if (!gatePassed) {
+      return { allowed: false, reason: gateReason, data };
     }
 
     // Binance L/S ratio — advisory fallback (logged, not blocking)
@@ -584,12 +716,10 @@ async function validateSignal(pair, direction) {
     }
 
     // All gates passed
-    const whaleInfo = data.whaleGate?.positions?.length > 0
-      ? `Whale: ${data.whaleGate.positions.map(w => `${w.label} ${w.direction}`).join(', ')}`
-      : 'Whale: no position';
+    const consensusInfo = data.whaleGate.reason || 'no whale data';
     return {
       allowed: true,
-      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, ${whaleInfo}`,
+      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, ${consensusInfo}`,
       data,
     };
 
@@ -717,7 +847,13 @@ function getConfig() {
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,
     smartMoney: `Binance top trader L/S ratio on ${CONFIG.smartMoney.period} (ADVISORY — fallback)`,
-    whaleGate: `Hyperliquid whale tracking: ${CONFIG.smartMoney.hyperliquid.wallets.map(w => w.label).join(', ')} (${CONFIG.smartMoney.hyperliquid.mode.toUpperCase()} — blocks opposing direction)`,
+    whaleGate: {
+      version: '3.2.1',
+      consensusMode: CONFIG.smartMoney.consensusMode,
+      tracker1: `Hyperliquid: ${CONFIG.smartMoney.hyperliquid.wallets.map(w => w.label).join(', ')} (live positions)`,
+      tracker2: CONFIG.smartMoney.binanceCopyTrader ? `Binance Copy: ${CONFIG.smartMoney.binanceCopyTrader.label} (closed-trade bias, lookback ${CONFIG.smartMoney.binanceCopyTrader.lookback}, threshold ${CONFIG.smartMoney.binanceCopyTrader.biasThreshold})` : 'disabled',
+      logic: 'BLOCK only when both trackers oppose signal direction',
+    },
   };
 }
 
