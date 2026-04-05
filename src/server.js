@@ -72,7 +72,22 @@ const FUNDING_POLL_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 // Tracks which bots the relay has started, so we can re-validate them.
 // Key = UUID, Value = { pair, direction, botName, startedAt }
 // Only populated when the relay dispatches a startBot action.
+// origin: 'signal' (TradingView), 'auto-flip' (reval), 'funding', 'self-heal'
 const ACTIVE_BOTS = {};
+
+// ── Pair Activity Tracker (v3.2.7) ─────────────────────────────────────
+// Records when each pair last had an active bot (any origin).
+// Used by self-heal to distinguish orphaned pairs from intentionally flat ones.
+// Key = pair name (e.g. 'SOL'), Value = timestamp (ms)
+const LAST_ACTIVE = {};
+
+// ── Self-Heal Cooldown (v3.2.7) ────────────────────────────────────────
+// Max one self-heal restart per pair per 30 minutes.
+// Prevents silent churn if gate keeps flip-flopping on an orphaned pair.
+// Key = pair name, Value = timestamp (ms) of last self-heal restart
+const SELF_HEAL_COOLDOWNS = {};
+const SELF_HEAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const SELF_HEAL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — only recover pairs active within this window
 
 // ── Telegram Alert Cooldown (v3.1.1) ──────────────────────────────────
 // Prevents spamming the same alert type per bot. Tracks last send time.
@@ -293,7 +308,9 @@ async function runFundingCheck() {
         botName: targetBot.name,
         startedAt: new Date().toISOString(),
         entryPrice: result.data.markPrice || null,
+        origin: 'funding',
       };
+      LAST_ACTIVE[pair] = Date.now();
       if (oppositeBot) {
         delete ACTIVE_BOTS[oppositeBot.uuid];
       }
@@ -680,7 +697,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.6',
+    version: '3.2.7',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1044,7 +1061,9 @@ app.post('/webhook', (req, res) => {
           botName: signal.botName,
           startedAt: existing?.startedAt || new Date().toISOString(),
           entryPrice: existing?.entryPrice || gateResult.data.currentPrice || null,
+          origin: 'signal',
         };
+        LAST_ACTIVE[signal.pair] = Date.now();
         log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
       }
       // Clear any stopped bots from tracking
@@ -1294,7 +1313,9 @@ async function runRevalidation() {
               botName: oppositeBot.name,
               startedAt: new Date().toISOString(),
               entryPrice: gateResult.data?.currentPrice || result.data.currentPrice || null,
+              origin: 'auto-flip',
             };
+            LAST_ACTIVE[bot.pair] = Date.now();
             LAST_DIRECTION[bot.pair] = oppositeDir;
             FLIP_COOLDOWN[bot.pair] = new Date().toISOString();
             recordFlip(bot.pair);
@@ -1354,7 +1375,7 @@ async function runRevalidation() {
 // Start the re-validation interval
 setInterval(runRevalidation, REVAL_INTERVAL);
 
-// ── Bot Self-Heal Monitor (v3.2.6) ─────────────────────────────────────
+// ── Bot Self-Heal Monitor (v3.2.7) ─────────────────────────────────────
 // Catches orphaned pairs — where both Long and Short bots are "closed"
 // with 0 active deals and no bot is tracked in ACTIVE_BOTS.
 //
@@ -1411,6 +1432,29 @@ async function runSelfHeal() {
 
 async function selfHealPair(pair, botStatuses) {
   try {
+    // v3.2.7 Guardrail 1: Recent-activity requirement
+    // Only recover pairs that were active within the last 6 hours.
+    // A pair that's been intentionally flat won't get auto-restarted.
+    const lastActive = LAST_ACTIVE[pair];
+    if (!lastActive) {
+      log(`🩺 Self-heal: ${pair} — no activity record (never started by this relay instance) — skipping`);
+      return;
+    }
+    const ageMs = Date.now() - lastActive;
+    if (ageMs > SELF_HEAL_MAX_AGE_MS) {
+      log(`🩺 Self-heal: ${pair} — last active ${Math.round(ageMs / 60000)}min ago (>${SELF_HEAL_MAX_AGE_MS / 3600000}h) — too old, skipping`);
+      return;
+    }
+
+    // v3.2.7 Guardrail 2: Per-pair self-heal cooldown
+    // Max one restart per pair per 30 minutes to prevent silent churn.
+    const lastHeal = SELF_HEAL_COOLDOWNS[pair];
+    if (lastHeal && (Date.now() - lastHeal) < SELF_HEAL_COOLDOWN_MS) {
+      const remainMin = Math.ceil((SELF_HEAL_COOLDOWN_MS - (Date.now() - lastHeal)) / 60000);
+      log(`🩺 Self-heal: ${pair} — cooldown active (${remainMin}min remaining) — skipping`);
+      return;
+    }
+
     // Check circuit breaker
     const cbCheck = checkCircuitBreaker(pair + 'USDT');
     if (cbCheck.parked) {
@@ -1493,7 +1537,10 @@ async function selfHealPair(pair, botStatuses) {
       botName: targetBot.name,
       startedAt: new Date().toISOString(),
       entryPrice: bestGateResult.data?.currentPrice || null,
+      origin: 'self-heal',
     };
+    LAST_ACTIVE[pair] = Date.now();
+    SELF_HEAL_COOLDOWNS[pair] = Date.now();
     LAST_DIRECTION[pair] = bestDirection;
 
     log(`🩺 Self-heal: ✅ ${targetBot.name} restarted successfully`);
@@ -1521,7 +1568,7 @@ setInterval(runSelfHeal, SELF_HEAL_INTERVAL);
 // Run once on startup after a short delay (catches orphans from redeploys)
 setTimeout(runSelfHeal, 30 * 1000);
 
-// ── Telegram Bot Commands (v3.2.6) ──────────────────────────────────────
+// ── Telegram Bot Commands (v3.2.7) ──────────────────────────────────────
 // Lets Manav query the system from Telegram on his phone.
 // POST /telegram — receives updates from Telegram webhook.
 // Supported commands: /positions, /status, /bots
@@ -1598,7 +1645,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.2.6`,
+      `Version: v3.2.7`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -1691,7 +1738,7 @@ async function registerTelegramWebhook() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.2.6 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.2.7 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
