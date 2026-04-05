@@ -86,7 +86,7 @@ const LAST_ACTIVE = {};
 // Prevents silent churn if gate keeps flip-flopping on an orphaned pair.
 // Key = pair name, Value = timestamp (ms) of last self-heal restart
 const SELF_HEAL_COOLDOWNS = {};
-const SELF_HEAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const SELF_HEAL_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (circuit breaker handles real churn)
 const SELF_HEAL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — only recover pairs active within this window
 
 // ── Telegram Alert Cooldown (v3.1.1) ──────────────────────────────────
