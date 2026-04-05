@@ -680,7 +680,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.5',
+    version: '3.2.6',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1354,7 +1354,174 @@ async function runRevalidation() {
 // Start the re-validation interval
 setInterval(runRevalidation, REVAL_INTERVAL);
 
-// ── Telegram Bot Commands (v3.2.5) ──────────────────────────────────────
+// ── Bot Self-Heal Monitor (v3.2.6) ─────────────────────────────────────
+// Catches orphaned pairs — where both Long and Short bots are "closed"
+// with 0 active deals and no bot is tracked in ACTIVE_BOTS.
+//
+// This happens when:
+//   1. Relay stops a bot (reval flip / direction change)
+//   2. The old deal keeps running on Binance (TP/SL not yet hit)
+//   3. Deal eventually closes, but bot is already stopped → no ASAP re-entry
+//   4. Pair goes dark until the next TradingView signal (could be hours)
+//
+// Self-heal checks every 5 minutes: if a pair is orphaned, runs the signal
+// gate to determine the correct direction and restarts the appropriate bot.
+//
+// Respects: pause mode, circuit breaker parks, active deals still running.
+
+const SELF_HEAL_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const SELF_HEAL_PAIRS = ['SOL', 'ETH', 'XRP', 'BTC'];
+let selfHealRunning = false;
+
+async function runSelfHeal() {
+  if (selfHealRunning) return;
+  if (PAUSED) return;
+  if (!gainiumApi.isConfigured()) return;
+
+  selfHealRunning = true;
+
+  try {
+    // Skip if all pairs have active bots (common case — fast exit)
+    const activePairs = new Set(Object.values(ACTIVE_BOTS).map(b => b.pair));
+    const orphanedPairs = SELF_HEAL_PAIRS.filter(p => !activePairs.has(p));
+    if (orphanedPairs.length === 0) {
+      selfHealRunning = false;
+      return;
+    }
+
+    log(`🩺 Self-heal: checking ${orphanedPairs.length} pair(s) with no active bot: ${orphanedPairs.join(', ')}`);
+
+    // Single API call to get all bot statuses
+    const botStatuses = await gainiumApi.getAllBotStatuses();
+    if (!botStatuses) {
+      log(`🩺 Self-heal: API call failed — skipping this cycle`);
+      selfHealRunning = false;
+      return;
+    }
+
+    for (const pair of orphanedPairs) {
+      await selfHealPair(pair, botStatuses);
+    }
+  } catch (err) {
+    log(`🩺 Self-heal: unexpected error: ${err.message}`);
+  }
+
+  selfHealRunning = false;
+}
+
+async function selfHealPair(pair, botStatuses) {
+  try {
+    // Check circuit breaker
+    const cbCheck = checkCircuitBreaker(pair + 'USDT');
+    if (cbCheck.parked) {
+      log(`🩺 Self-heal: ${pair} parked by circuit breaker — skipping`);
+      return;
+    }
+
+    // Find both bots for this pair
+    const longBot = findBot(pair, 'LONG');
+    const shortBot = findBot(pair, 'SHORT');
+    if (!longBot || !shortBot) {
+      log(`🩺 Self-heal: ${pair} missing Long or Short bot in BOT_MAP — skipping`);
+      return;
+    }
+
+    // Check their status on Gainium
+    const longStatus = botStatuses.get(longBot.uuid);
+    const shortStatus = botStatuses.get(shortBot.uuid);
+
+    if (!longStatus || !shortStatus) {
+      log(`🩺 Self-heal: ${pair} — couldn't find bot status on Gainium — skipping`);
+      return;
+    }
+
+    // Only self-heal if BOTH bots are closed/stopped with 0 active deals
+    const longIdle = (longStatus.status === 'closed' && longStatus.deals.active === 0);
+    const shortIdle = (shortStatus.status === 'closed' && shortStatus.deals.active === 0);
+
+    if (!longIdle || !shortIdle) {
+      if (longStatus.deals.active > 0 || shortStatus.deals.active > 0) {
+        log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active}) — waiting`);
+      }
+      return;
+    }
+
+    // Both bots are closed with 0 deals — pair is orphaned
+    log(`🩺 Self-heal: ${pair} ORPHANED — both bots closed, 0 deals. Running signal gate...`);
+
+    // Run signal gate for both directions to find the correct one
+    let bestDirection = null;
+    let bestGateResult = null;
+
+    for (const dir of ['LONG', 'SHORT']) {
+      try {
+        const gateResult = await signalGate.validateSignal(pair, dir);
+        if (gateResult.allowed) {
+          bestDirection = dir;
+          bestGateResult = gateResult;
+          break;
+        }
+      } catch (gateErr) {
+        log(`🩺 Self-heal: ${pair} ${dir} gate error: ${gateErr.message}`);
+      }
+    }
+
+    if (!bestDirection) {
+      log(`🩺 Self-heal: ${pair} — neither direction passes signal gate. Will retry next cycle.`);
+      if (canSendTelegramAlert(pair, 'self-heal-blocked')) {
+        markTelegramAlertSent(pair, 'self-heal-blocked');
+        sendTelegramAlert(
+          `🩺 Self-heal: ${pair} idle but no clear direction\n\n` +
+          `Both ${pair} bots are stopped with no deals. Neither LONG nor SHORT passed the 4H signal gate.\n\n` +
+          `Will keep checking every 5 minutes.\n\n` +
+          `${istTimestamp()}`
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    // Found a valid direction — restart the bot
+    const targetBot = bestDirection === 'LONG' ? longBot : shortBot;
+    log(`🩺 Self-heal: ${pair} → starting ${targetBot.name} (${bestDirection})`);
+
+    await sendAction({ action: 'startBot', uuid: targetBot.uuid });
+
+    // Track in ACTIVE_BOTS
+    ACTIVE_BOTS[targetBot.uuid] = {
+      pair,
+      direction: bestDirection,
+      botName: targetBot.name,
+      startedAt: new Date().toISOString(),
+      entryPrice: bestGateResult.data?.currentPrice || null,
+    };
+    LAST_DIRECTION[pair] = bestDirection;
+
+    log(`🩺 Self-heal: ✅ ${targetBot.name} restarted successfully`);
+    sendTelegramAlert(
+      `🩺 Self-heal: ${targetBot.name} restarted\n\n` +
+      `Both ${pair} bots were stopped with no active deals (orphaned pair). Confirmed ${bestDirection} is correct:\n\n` +
+      `• 4H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
+      `• RSI(14): ${bestGateResult.data?.rsi14 || '?'} ${bestGateResult.data?.rsiDirection || ''}\n` +
+      `• Price: $${bestGateResult.data?.currentPrice?.toFixed(2) || '?'}\n\n` +
+      `New deal will open via ASAP start.\n\n` +
+      `${istTimestamp()}`
+    ).catch(() => {});
+  } catch (pairErr) {
+    log(`🩺 Self-heal: error processing ${pair}: ${pairErr.message}`);
+    if (pairErr.message && pairErr.message.includes('startBot')) {
+      sendTelegramAlert(
+        `🩺 Self-heal FAILED: ${pair}\n\nWebhook error: ${pairErr.message}\nWill retry next cycle.\n\n${istTimestamp()}`
+      ).catch(() => {});
+    }
+  }
+}
+
+// Start the self-heal interval
+setInterval(runSelfHeal, SELF_HEAL_INTERVAL);
+// Run once on startup after a short delay (catches orphans from redeploys)
+setTimeout(runSelfHeal, 30 * 1000);
+
+// ── Telegram Bot Commands (v3.2.6) ──────────────────────────────────────
 // Lets Manav query the system from Telegram on his phone.
 // POST /telegram — receives updates from Telegram webhook.
 // Supported commands: /positions, /status, /bots
@@ -1431,7 +1598,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.2.5`,
+      `Version: v3.2.6`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -1524,7 +1691,7 @@ async function registerTelegramWebhook() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.2.5 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.2.6 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);

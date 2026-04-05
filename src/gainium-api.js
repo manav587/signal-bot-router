@@ -255,6 +255,53 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
   return { flat: false, forceClosed: totalForceClosed, error: msg };
 }
 
+/**
+ * Get bot status and deal counts for ALL DCA bots in one API call.
+ * Returns a Map of UUID → { status, deals: { active, all }, name }
+ * Used by the self-heal monitor to detect orphaned pairs.
+ */
+async function getAllBotStatuses() {
+  const endpoint = `/api/bots/dca`;
+  const url = `${BASE_URL}${endpoint}`;
+  const method = 'GET';
+  const headers = authHeaders(method, endpoint);
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(url, { method, headers, signal: controller.signal });
+    clearTimeout(timeout);
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      const text = await res.text();
+      log(`getAllBotStatuses non-JSON response (${res.status}): ${text.substring(0, 200)}`);
+      return null;
+    }
+
+    const json = await res.json();
+    if (json.status === 'OK' && json.data && json.data.result) {
+      const statusMap = new Map();
+      for (const bot of json.data.result) {
+        const key = bot.uuid || bot._id;
+        statusMap.set(key, {
+          status: bot.status,
+          deals: bot.deals || { active: 0, all: 0 },
+          name: bot.settings?.name || bot.name || key,
+        });
+      }
+      log(`getAllBotStatuses: fetched ${statusMap.size} bot(s)`);
+      return statusMap;
+    }
+    log(`getAllBotStatuses unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
+    return null;
+  } catch (err) {
+    log(`getAllBotStatuses error: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /**
@@ -301,6 +348,7 @@ function isConfigured() {
 module.exports = {
   isConfigured,
   getBotDeals,
+  getAllBotStatuses,
   listOpenDeals,
   listAllOpenDeals,
   forceCloseDeals,
