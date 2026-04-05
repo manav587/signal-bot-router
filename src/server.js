@@ -1447,9 +1447,9 @@ async function handleTelegramCommand(text, chatId) {
     let botLines = ['🤖 <b>Bot Overview</b>\n'];
     for (const [uuid, botInfo] of Object.entries(BOT_MAP)) {
       const active = ACTIVE_BOTS[uuid];
-      const icon = active ? '🟢' : '⚪';
-      const extra = active ? ` — ${active.direction} since ${active.startedAt?.substring(11, 16) || '?'} UTC` : '';
-      botLines.push(`${icon} ${botInfo.name}${extra}`);
+      const icon = active ? '🟢' : '⚫';
+      const status = active ? `${active.direction} since ${active.startedAt?.substring(11, 16) || '?'} UTC` : 'Stopped';
+      botLines.push(`${icon} ${botInfo.name} — ${status}`);
     }
     botLines.push(`\n${istTimestamp()} IST`);
     return botLines.join('\n');
