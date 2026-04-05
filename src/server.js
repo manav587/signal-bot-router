@@ -680,11 +680,11 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.2',
+    version: '3.2.3',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -1085,6 +1085,10 @@ app.post('/webhook', (req, res) => {
 // FAIL-CLOSED: If data fetch fails, stop the bot.
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
 const REVAL_MAX_DRAWDOWN_PCT = 1.5;    // v2.3.0: kill bot if price moves 1.5% against direction
+// v3.2.3: Profit protection — don't flip a deal that's significantly in profit
+// unless the EMA spread is convincingly wide. If a deal is up > this threshold,
+// the revalidation result is overridden to "allowed" with a log note.
+const REVAL_PROFIT_SHIELD_PCT = 2.0;   // Skip flip if deal is > 2% in profit
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1103,6 +1107,25 @@ async function runRevalidation() {
 
     try {
       const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
+
+      // v3.2.3: Profit shield — if the deal is significantly in profit,
+      // don't flip on a marginal EMA cross. The micro-cross filter in
+      // signal-gate.js handles the spread threshold; this is the second
+      // line of defense checking actual deal P&L.
+      if (!result.allowed && bot.entryPrice && result.data.currentPrice) {
+        const currentPrice = result.data.currentPrice;
+        const pctProfit = bot.direction === 'LONG'
+          ? ((currentPrice - bot.entryPrice) / bot.entryPrice) * 100
+          : ((bot.entryPrice - currentPrice) / bot.entryPrice) * 100;
+
+        if (pctProfit >= REVAL_PROFIT_SHIELD_PCT) {
+          log(`🛡️ Profit shield: ${bot.botName} is ${pctProfit.toFixed(2)}% in profit (≥ ${REVAL_PROFIT_SHIELD_PCT}%) — overriding reval failure. Original reason: ${result.reason}`);
+          result.allowed = true;
+          result.reason = `PROFIT SHIELD: Deal is ${pctProfit.toFixed(2)}% in profit — EMA micro-cross ignored. Original: ${result.reason}`;
+          result.data.profitShielded = true;
+          result.data.dealProfitPct = parseFloat(pctProfit.toFixed(2));
+        }
+      }
 
       // v2.3.0: Price drawdown check — catch fast moves that 4H EMAs miss
       if (result.allowed && bot.entryPrice && result.data.currentPrice) {
@@ -1313,7 +1336,7 @@ setInterval(runRevalidation, REVAL_INTERVAL);
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.2.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.2.3 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);

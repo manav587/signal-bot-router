@@ -34,6 +34,11 @@ const CONFIG = {
     slow: 21,
     timeframe: '4h',
     candlesNeeded: 30,     // Need 30 candles to stabilize a 21-period EMA
+    // v3.2.3: Minimum percentage spread between EMA9 and EMA21 before
+    // revalidation considers the cross "real". Prevents micro-crosses
+    // (e.g. $80.53 vs $80.52 = 0.01%) from flipping profitable positions.
+    // Only applies to revalidation — initial entry still uses exact cross.
+    minRevalSpreadPct: 0.15, // 0.15% minimum spread to trigger reval flip
   },
 
   // RSI momentum confirmation (4h timeframe — same as crossover chart)
@@ -783,20 +788,33 @@ async function revalidateSignal(pair, direction) {
     data.rsiDirection = rsiDirection;
 
     // Check Gate 2: 4H EMA 9/21
+    // v3.2.3: Require minimum spread before flipping — prevents micro-crosses
+    // from closing profitable positions. E.g. EMA9 $80.53 vs EMA21 $80.52
+    // is 0.01% spread — noise, not a trend change.
     if (ema9 !== null && ema21 !== null) {
-      if (direction === 'LONG' && ema9 < ema21) {
+      const emaSpreadPct = Math.abs(ema9 - ema21) / ema21 * 100;
+      const minSpread = CONFIG.shortTermEma.minRevalSpreadPct || 0;
+      data.emaSpreadPct = parseFloat(emaSpreadPct.toFixed(4));
+      data.minRevalSpreadPct = minSpread;
+
+      if (direction === 'LONG' && ema9 < ema21 && emaSpreadPct >= minSpread) {
         return {
           allowed: false,
-          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} — short-term bearish, LONG no longer valid`,
+          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} (spread ${emaSpreadPct.toFixed(3)}% ≥ ${minSpread}%) — short-term bearish, LONG no longer valid`,
           data,
         };
       }
-      if (direction === 'SHORT' && ema9 > ema21) {
+      if (direction === 'SHORT' && ema9 > ema21 && emaSpreadPct >= minSpread) {
         return {
           allowed: false,
-          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} — short-term bullish, SHORT no longer valid`,
+          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} (spread ${emaSpreadPct.toFixed(3)}% ≥ ${minSpread}%) — short-term bullish, SHORT no longer valid`,
           data,
         };
+      }
+      // v3.2.3: If cross exists but spread is below threshold, log but allow
+      if ((direction === 'LONG' && ema9 < ema21) || (direction === 'SHORT' && ema9 > ema21)) {
+        data.microCrossIgnored = true;
+        data.microCrossDetail = `EMA cross detected but spread ${emaSpreadPct.toFixed(3)}% < ${minSpread}% threshold — treating as noise`;
       }
     }
 
