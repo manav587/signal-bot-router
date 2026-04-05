@@ -1391,11 +1391,15 @@ async function handleTelegramCommand(text, chatId) {
         totalProfit += pnl;
 
         const dir = botInfo.name.includes('Short') ? 'SHORT' : 'LONG';
-        const bar = buildProgressBar(parseFloat(pctPrice), 5);
+        const pctFloat = parseFloat(pctPrice);
+        const shieldStatus = pctFloat >= 2.0 ? '✅' : `${(2.0 - pctFloat).toFixed(1)}% away`;
+        const movingSLStatus = pctFloat >= 2.5 ? '✅ Active' : `${(2.5 - pctFloat).toFixed(1)}% away`;
+        const toTP = (5.0 - pctFloat).toFixed(1);
 
         lines.push(`<b>${pair} ${dir}</b>`);
         lines.push(`  Entry: $${entry}  |  P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pctPrice}%)`);
-        lines.push(`  ${bar} → 5% TP`);
+        lines.push(`  ${buildProgressBar(pctFloat, 5)} → 5% TP (${toTP}% to go)`);
+        lines.push(`  Profit Shield: ${shieldStatus}  |  Moving SL: ${movingSLStatus}`);
         lines.push('');
       }
     } catch (err) {
