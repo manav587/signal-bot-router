@@ -257,6 +257,43 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+/**
+ * List ALL open deals (unfiltered). Single API call.
+ * Used by Telegram /positions command.
+ */
+async function listAllOpenDeals() {
+  const endpoint = `/api/deals?status=open`;
+  const url = `${BASE_URL}${endpoint}`;
+  const method = 'GET';
+  const headers = authHeaders(method, endpoint);
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(url, { method, headers, signal: controller.signal });
+    clearTimeout(timeout);
+
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      const text = await res.text();
+      log(`listAllOpenDeals non-JSON response (${res.status}): ${text.substring(0, 200)}`);
+      return [];
+    }
+
+    const json = await res.json();
+    if (json.status === 'OK' && json.data && Array.isArray(json.data.result)) {
+      log(`listAllOpenDeals: found ${json.data.result.length} total open deal(s)`);
+      return json.data.result;
+    }
+    log(`listAllOpenDeals unexpected response: ${JSON.stringify(json).substring(0, 300)}`);
+    return [];
+  } catch (err) {
+    log(`listAllOpenDeals error: ${err.message}`);
+    return [];
+  }
+}
+
 function isConfigured() {
   return API_KEY.length > 0 && API_SECRET.length > 0;
 }
@@ -265,6 +302,7 @@ module.exports = {
   isConfigured,
   getBotDeals,
   listOpenDeals,
+  listAllOpenDeals,
   forceCloseDeals,
   verifyAndForceClose,
 };

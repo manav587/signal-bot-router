@@ -680,7 +680,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.4',
+    version: '3.2.5',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1354,15 +1354,181 @@ async function runRevalidation() {
 // Start the re-validation interval
 setInterval(runRevalidation, REVAL_INTERVAL);
 
+// ── Telegram Bot Commands (v3.2.5) ──────────────────────────────────────
+// Lets Manav query the system from Telegram on his phone.
+// POST /telegram — receives updates from Telegram webhook.
+// Supported commands: /positions, /status, /bots
+
+async function handleTelegramCommand(text, chatId) {
+  const cmd = (text || '').trim().toLowerCase().split(/\s+/)[0];
+
+  if (cmd === '/positions') {
+    // Single API call to get ALL open deals, then match to our bots
+    let lines = ['📊 <b>Active Positions</b>\n'];
+    let totalProfit = 0;
+    let foundDeals = 0;
+
+    // Build mongoId → botInfo lookup
+    const mongoToBot = {};
+    for (const [uuid, botInfo] of Object.entries(BOT_MAP)) {
+      mongoToBot[botInfo.mongoId] = { ...botInfo, uuid };
+    }
+
+    try {
+      // One API call — listAllOpenDeals returns every open deal
+      const allDeals = await gainiumApi.listAllOpenDeals();
+      for (const deal of allDeals) {
+        const botInfo = mongoToBot[deal.botId];
+        if (!botInfo) continue; // not one of our bots
+
+        foundDeals++;
+        const pair = deal.symbol?.symbol || botInfo.name;
+        const entry = deal.avgPrice || 0;
+        const pnl = deal.stats?.unrealizedProfit || 0;
+        const margin = deal.usage?.currentUsd || deal.cost || 0;
+        // Price deviation % (what TP is measured against)
+        const pctPrice = margin > 0 ? ((pnl / (margin * 5)) * 100).toFixed(1) : '0.0';
+        totalProfit += pnl;
+
+        const dir = botInfo.name.includes('Short') ? 'SHORT' : 'LONG';
+        const bar = buildProgressBar(parseFloat(pctPrice), 5);
+
+        lines.push(`<b>${pair} ${dir}</b>`);
+        lines.push(`  Entry: $${entry}  |  P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pctPrice}%)`);
+        lines.push(`  ${bar} → 5% TP`);
+        lines.push('');
+      }
+    } catch (err) {
+      log(`Telegram /positions error: ${err.message}`);
+      lines.push('⚠️ Could not fetch deals from Gainium API.');
+    }
+
+    if (foundDeals === 0) {
+      lines.push('No open deals.');
+    } else {
+      lines.push(`<b>Combined: ${totalProfit >= 0 ? '+' : ''}$${totalProfit.toFixed(2)}</b>`);
+    }
+
+    lines.push(`\n${istTimestamp()} IST`);
+    return lines.join('\n');
+  }
+
+  if (cmd === '/status') {
+    const uptime = Math.floor(process.uptime());
+    const hrs = Math.floor(uptime / 3600);
+    const mins = Math.floor((uptime % 3600) / 60);
+
+    const activeCount = Object.keys(ACTIVE_BOTS).length;
+    const activePairs = Object.values(ACTIVE_BOTS).map(b => `${b.pair} ${b.direction}`).join(', ') || 'none tracked';
+
+    const cbParked = Object.entries(CIRCUIT_BREAKER)
+      .filter(([, v]) => v.parkedUntil && new Date(v.parkedUntil) > new Date())
+      .map(([pair]) => pair);
+
+    let statusLines = [
+      '🔧 <b>System Status</b>\n',
+      `Version: v3.2.5`,
+      `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
+      `Uptime: ${hrs}h ${mins}m`,
+      `Strategy: ${STRATEGY_MODE}`,
+      `Active bots: ${activeCount} (${activePairs})`,
+      `Circuit breaker: ${cbParked.length > 0 ? '⚠️ Parked: ' + cbParked.join(', ') : '✅ Clear'}`,
+      `API: ${gainiumApi.isConfigured() ? '✅' : '❌'}`,
+      `\n${istTimestamp()} IST`,
+    ];
+    return statusLines.join('\n');
+  }
+
+  if (cmd === '/bots') {
+    let botLines = ['🤖 <b>Bot Overview</b>\n'];
+    for (const [uuid, botInfo] of Object.entries(BOT_MAP)) {
+      const active = ACTIVE_BOTS[uuid];
+      const icon = active ? '🟢' : '⚪';
+      const extra = active ? ` — ${active.direction} since ${active.startedAt?.substring(11, 16) || '?'} UTC` : '';
+      botLines.push(`${icon} ${botInfo.name}${extra}`);
+    }
+    botLines.push(`\n${istTimestamp()} IST`);
+    return botLines.join('\n');
+  }
+
+  // Unknown command — show help
+  return '🤖 <b>Sentinel Commands</b>\n\n' +
+    '/positions — Current open deals with P&L\n' +
+    '/status — System health & uptime\n' +
+    '/bots — Bot overview (active/stopped)';
+}
+
+function buildProgressBar(currentPct, targetPct) {
+  const blocks = 10;
+  const filled = Math.min(blocks, Math.max(0, Math.round((currentPct / targetPct) * blocks)));
+  return '▓'.repeat(filled) + '░'.repeat(blocks - filled) + ` ${currentPct}%`;
+}
+
+app.post('/telegram', async (req, res) => {
+  try {
+    const update = req.body;
+    const message = update?.message;
+    if (!message || !message.text || !message.chat?.id) {
+      return res.sendStatus(200); // Ignore non-text updates
+    }
+
+    // Security: only respond to the configured chat ID
+    const incomingChatId = String(message.chat.id);
+    if (incomingChatId !== TELEGRAM_CHAT_ID) {
+      log(`⚠ Telegram command from unauthorized chat: ${incomingChatId}`);
+      return res.sendStatus(200);
+    }
+
+    const reply = await handleTelegramCommand(message.text, incomingChatId);
+
+    // Send reply
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: incomingChatId,
+        text: reply,
+        parse_mode: 'HTML',
+      }),
+    });
+  } catch (err) {
+    log(`Telegram command handler error: ${err.message}`);
+  }
+  res.sendStatus(200);
+});
+
+// ── Register Telegram Webhook on startup ─────────────────────────────────
+async function registerTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://signal-bot-router.onrender.com';
+  const webhookUrl = `${renderUrl}/telegram`;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: webhookUrl }),
+    });
+    const json = await resp.json();
+    log(`Telegram webhook registered: ${webhookUrl} — ${json.ok ? '✅' : '❌ ' + json.description}`);
+  } catch (err) {
+    log(`Telegram webhook registration failed: ${err.message}`);
+  }
+}
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.2.4 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.2.5 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
+  log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
   log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
+  // Register Telegram webhook after server is listening
+  registerTelegramWebhook();
 });
