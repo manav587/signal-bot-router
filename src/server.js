@@ -698,7 +698,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.3.0',
+    version: '3.3.1',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1146,6 +1146,16 @@ async function runRevalidation() {
   for (const uuid of activeUUIDs) {
     const bot = ACTIVE_BOTS[uuid];
     if (!bot) continue;
+
+    // v3.3.0: Grace period — skip bots started less than 3 minutes ago.
+    // ASAP bots need time for Gainium to create the deal on Binance.
+    // Without this, reval sees deals.active=0 on a just-started bot and
+    // wrongly triggers "deal closed — re-entering" alerts.
+    const ageMs = Date.now() - new Date(bot.startedAt).getTime();
+    if (ageMs < 3 * 60 * 1000) {
+      log(`🔄 Reval: skipping ${bot.botName} — started ${Math.round(ageMs / 1000)}s ago (grace period)`);
+      continue;
+    }
 
     try {
       const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
@@ -1967,7 +1977,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.3.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.3.1 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
