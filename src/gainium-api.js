@@ -423,6 +423,44 @@ async function listAllOpenDeals() {
   }
 }
 
+/**
+ * Build an exchange position map from Gainium's open deals.
+ * Returns the SAME shape as binanceApi.getPositionMap() so callers
+ * don't need to change — but data comes via Gainium (which reads Binance).
+ *
+ * Data path: Binance → Gainium (via their API key) → Gainium REST API → relay
+ *
+ * @returns {Map<string, { symbol, side, size, entryPrice, markPrice, pnl, leverage, marginType, notional }>}
+ *          Key = base asset (e.g. 'SOL'), Value = position details. Only non-zero positions.
+ */
+async function getExchangePositionMap() {
+  const deals = await listAllOpenDeals();
+  const map = new Map();
+
+  for (const deal of deals) {
+    const base = deal.symbol?.baseAsset || deal.symbol?.symbol?.replace('USDT', '') || 'UNKNOWN';
+    const side = deal.strategy === 'SHORT' ? 'SHORT' : 'LONG';
+    const size = deal.size || 0;
+    if (size === 0) continue;
+
+    map.set(base, {
+      symbol: deal.symbol?.symbol || `${base}USDT`,
+      side,
+      size,
+      entryPrice: deal.avgPrice || 0,
+      markPrice: deal.lastPrice || deal.bestPrice || 0,
+      pnl: deal.stats?.unrealizedProfit || 0,
+      leverage: deal.settings?.leverage || 1,
+      marginType: deal.settings?.marginType || 'cross',
+      notional: deal.value || 0,
+      source: 'gainium',
+    });
+  }
+
+  log(`getExchangePositionMap: ${map.size} active position(s)${map.size > 0 ? ' — ' + [...map.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
+  return map;
+}
+
 function isConfigured() {
   return API_KEY.length > 0 && API_SECRET.length > 0;
 }
@@ -436,4 +474,5 @@ module.exports = {
   forceCloseDeals,
   closeDealsViaApi,
   verifyAndForceClose,
+  getExchangePositionMap,
 };
