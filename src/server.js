@@ -697,7 +697,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.8',
+    version: '3.2.9',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -950,6 +950,27 @@ app.post('/webhook', (req, res) => {
   // Log what we received
   const summary = actions.map(a => `${a.action}(${(a.uuid || '').substring(0, 8)})`).join(' → ');
   log(`[${requestId}] 📨 Received: ${summary}`);
+
+  // ── v3.2.9: Bare stopBot/closeAllDeals — clean up ACTIVE_BOTS without signal gate ──
+  // When a signal has stopBot but NO startBot, it's a manual close/stop command.
+  // Must clear ACTIVE_BOTS directly since the signal-gate path (which requires startBot) won't run.
+  const hasStartBot = actions.some(a => a.action === 'startBot');
+  const stopActions = actions.filter(a => a.action === 'stopBot');
+  if (!hasStartBot && stopActions.length > 0) {
+    for (const sa of stopActions) {
+      if (sa.uuid && ACTIVE_BOTS[sa.uuid]) {
+        const bot = ACTIVE_BOTS[sa.uuid];
+        log(`[${requestId}] 🛑 Bare stopBot — removing ${bot.botName} from ACTIVE_BOTS`);
+        delete ACTIVE_BOTS[sa.uuid];
+        delete LAST_DIRECTION[bot.pair];
+      }
+    }
+    // Forward actions to Gainium (closeAllDeals + stopBot) then return
+    processActions(actions, requestId, false, {}).catch(err => {
+      log(`[${requestId}] ❌ Bare stopBot error: ${err.message}`);
+    });
+    return;
+  }
 
   // ── Strategy mode check — ignore TradingView webhooks when in funding mode ──
   if (STRATEGY_MODE === 'funding') {
