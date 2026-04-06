@@ -1,6 +1,7 @@
 const express = require('express');
 const app = express();
 const gainiumApi = require('./gainium-api');
+const binanceApi = require('./binance-api');
 const signalGate = require('./signal-gate');
 const fundingStrategy = require('./funding-strategy');
 
@@ -697,7 +698,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.9',
+    version: '3.3.0',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -708,6 +709,7 @@ app.get('/', (req, res) => {
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
+    binanceConfigured: binanceApi.isConfigured(),
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
 });
@@ -1698,9 +1700,29 @@ async function handleTelegramCommand(text, chatId) {
     }
 
     if (foundDeals === 0) {
-      lines.push('No open deals.');
+      lines.push('No open deals on Gainium.');
     } else {
-      lines.push(`<b>Combined: ${totalProfit >= 0 ? '+' : ''}$${totalProfit.toFixed(2)}</b>`);
+      lines.push(`<b>Gainium total: ${totalProfit >= 0 ? '+' : ''}$${totalProfit.toFixed(2)}</b>`);
+    }
+
+    // Binance ground truth
+    if (binanceApi.isConfigured()) {
+      try {
+        const binanceMap = await binanceApi.getPositionMap();
+        if (binanceMap.size > 0) {
+          lines.push('\n📈 <b>Binance (exchange truth)</b>\n');
+          let binanceTotal = 0;
+          for (const [pair, pos] of binanceMap) {
+            binanceTotal += pos.pnl;
+            lines.push(`<b>${pair} ${pos.side}</b> — entry $${pos.entryPrice.toFixed(2)}, mark $${pos.markPrice.toFixed(2)}, P&L ${pos.pnl >= 0 ? '+' : ''}$${pos.pnl.toFixed(2)}`);
+          }
+          lines.push(`\n<b>Binance total: ${binanceTotal >= 0 ? '+' : ''}$${binanceTotal.toFixed(2)}</b>`);
+        } else if (foundDeals > 0) {
+          lines.push('\n⚠️ Gainium shows deals but Binance shows NO open positions.');
+        }
+      } catch (err) {
+        log(`Telegram /positions Binance error: ${err.message}`);
+      }
     }
 
     lines.push(`\n${istTimestamp()} IST`);
@@ -1819,19 +1841,31 @@ async function registerTelegramWebhook() {
 
 async function recoverActiveState() {
   if (!gainiumApi.isConfigured()) {
-    log(`🔄 Startup recovery: skipped — API not configured`);
+    log(`🔄 Startup recovery: skipped — Gainium API not configured`);
     return;
   }
 
   try {
+    // Step 1: Query Binance for ground truth (actual exchange positions)
+    let binancePositions = new Map();
+    if (binanceApi.isConfigured()) {
+      log(`🔄 Startup recovery: querying Binance for actual positions...`);
+      binancePositions = await binanceApi.getPositionMap();
+      log(`🔄 Startup recovery: Binance reports ${binancePositions.size} open position(s)`);
+    } else {
+      log(`🔄 Startup recovery: Binance API not configured — using Gainium only`);
+    }
+
+    // Step 2: Query Gainium for bot states
     log(`🔄 Startup recovery: querying Gainium for active bots...`);
     const botStatuses = await gainiumApi.getAllBotStatuses();
     if (!botStatuses) {
-      log(`🔄 Startup recovery: API call failed — will rely on incoming signals`);
+      log(`🔄 Startup recovery: Gainium API call failed — will rely on incoming signals`);
       return;
     }
 
     const recovered = [];
+    const warnings = [];
 
     for (const [uuid, botInfo] of Object.entries(BOT_MAP)) {
       const status = botStatuses.get(uuid);
@@ -1847,15 +1881,27 @@ async function recoverActiveState() {
 
       const pair = botInfo.name.split(' ')[0].toUpperCase();
 
-      // Try to get entry price from open deals
+      // Cross-reference with Binance ground truth
+      const binancePos = binancePositions.get(pair);
       let entryPrice = null;
-      try {
-        const deals = await gainiumApi.listOpenDeals(botInfo.mongoId);
-        if (deals && deals.length > 0 && deals[0].avgPrice) {
-          entryPrice = deals[0].avgPrice;
+      let pnl = null;
+
+      if (binancePos) {
+        entryPrice = binancePos.entryPrice;
+        pnl = binancePos.pnl;
+
+        // Warn if Gainium and Binance disagree on direction
+        if (binancePos.side !== direction) {
+          const msg = `⚠️ ${pair}: Gainium says ${direction} but Binance has ${binancePos.side} position`;
+          log(`🔄 Startup recovery: ${msg}`);
+          warnings.push(msg);
         }
-      } catch (e) {
-        log(`🔄 Startup recovery: couldn't fetch deals for ${botInfo.name}: ${e.message}`);
+      } else if (binancePositions.size > 0) {
+        // Binance was queried but has no position for this pair — Gainium is stale
+        const msg = `⚠️ ${pair}: Gainium says ${botInfo.name} is active but Binance has NO position`;
+        log(`🔄 Startup recovery: ${msg}`);
+        warnings.push(msg);
+        // Still recover so revalidation can clean it up
       }
 
       // Populate trackers
@@ -1870,20 +1916,48 @@ async function recoverActiveState() {
       LAST_ACTIVE[pair] = Date.now();
       LAST_DIRECTION[pair] = direction;
 
-      recovered.push(`${botInfo.name} (${direction}, entry $${entryPrice?.toFixed(2) || '?'})`);
+      const priceStr = entryPrice ? `$${entryPrice.toFixed(2)}` : '?';
+      const pnlStr = pnl !== null ? ` PnL $${pnl.toFixed(2)}` : '';
+      recovered.push(`${botInfo.name} (${direction}, entry ${priceStr}${pnlStr})`);
     }
 
-    if (recovered.length > 0) {
-      log(`🔄 Startup recovery: ✅ recovered ${recovered.length} active bot(s): ${recovered.join(', ')}`);
+    // Step 3: Detect orphaned Binance positions (position exists but no Gainium bot)
+    for (const [pair, pos] of binancePositions) {
+      const hasBot = Object.values(ACTIVE_BOTS).some(b => b.pair === pair);
+      if (!hasBot) {
+        const msg = `🚨 ${pair}: Binance has a ${pos.side} position ($${pos.pnl.toFixed(2)} PnL) but NO Gainium bot is running`;
+        log(`🔄 Startup recovery: ${msg}`);
+        warnings.push(msg);
+      }
+    }
+
+    // Step 4: Send Telegram summary
+    if (recovered.length > 0 || warnings.length > 0) {
+      const parts = [`🔄 Startup recovery\n\nServer restarted.`];
+
+      if (recovered.length > 0) {
+        parts.push(`Recovered ${recovered.length} active position(s):\n`);
+        parts.push(recovered.map(r => `• ${r}`).join('\n'));
+        parts.push(`\nRevalidation is now protecting these positions.`);
+      }
+
+      if (warnings.length > 0) {
+        parts.push(`\n⚠️ Discrepancies detected:\n`);
+        parts.push(warnings.join('\n'));
+      }
+
+      parts.push(`\n${istTimestamp()}`);
+      const msg = parts.join('\n');
+
+      log(`🔄 Startup recovery: ✅ recovered ${recovered.length} bot(s), ${warnings.length} warning(s)`);
+      sendTelegramAlert(msg).catch(() => {});
+    } else {
+      log(`🔄 Startup recovery: no active bots found — system is flat`);
       sendTelegramAlert(
         `🔄 Startup recovery\n\n` +
-        `Server restarted. Recovered ${recovered.length} active position(s) from Gainium:\n\n` +
-        recovered.map(r => `• ${r}`).join('\n') + `\n\n` +
-        `Revalidation is now protecting these positions.\n\n` +
+        `Server restarted. No active positions found on ${binanceApi.isConfigured() ? 'Binance or ' : ''}Gainium — system is flat.\n\n` +
         `${istTimestamp()}`
       ).catch(() => {});
-    } else {
-      log(`🔄 Startup recovery: no active bots found on Gainium`);
     }
   } catch (err) {
     log(`🔄 Startup recovery: error: ${err.message}`);
@@ -1893,7 +1967,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.2.8 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.3.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
