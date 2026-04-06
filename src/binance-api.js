@@ -227,6 +227,41 @@ async function testConnection() {
   }
 }
 
+// ── Spot Price (public endpoint — no auth needed) ─────────────────────────
+
+/**
+ * Get the current mark price for a futures symbol.
+ * Uses the public /fapi/v1/ticker/price endpoint (no API key required).
+ * This is the LIVE price — not a candle close — and is what Gate decisions
+ * should compare against.
+ *
+ * @param {string} symbol — e.g. 'SOLUSDT'
+ * @returns {number|null} — current price or null on error
+ */
+async function getSpotPrice(symbol) {
+  const url = `${BASE_URL}/fapi/v1/ticker/price?symbol=${symbol}`;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      log(`getSpotPrice error (${res.status}) for ${symbol}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const price = parseFloat(data.price);
+    if (isNaN(price)) return null;
+    return price;
+  } catch (err) {
+    log(`getSpotPrice error for ${symbol}: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 function isConfigured() {
@@ -238,5 +273,6 @@ module.exports = {
   getOpenPositions,
   getAccountInfo,
   getPositionMap,
+  getSpotPrice,
   testConnection,
 };

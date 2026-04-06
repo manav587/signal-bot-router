@@ -698,11 +698,11 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.3.1',
+    version: '3.5.0',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 2 (4H EMA 9/21) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -1089,22 +1089,34 @@ app.post('/webhook', (req, res) => {
         LAST_ACTIVE[signal.pair] = Date.now();
         log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
       }
-      // Clear any stopped bots from tracking
+      // v3.5.0: Don't delete old bot from tracking until processActions confirms
+      // the close succeeded. Previously deleted immediately (optimistic) — if
+      // closeAllDeals failed, the old position became invisible to revalidation.
       const stopAction = actions.find(a => a.action === 'stopBot');
-      if (stopAction && stopAction.uuid) {
-        delete ACTIVE_BOTS[stopAction.uuid];
-      }
+      const oldBotUuid = stopAction?.uuid;
 
       const tradeContext = { pair, direction, price: gateResult.data.currentPrice?.toFixed(2), isNoOp };
-      processActions(actions, requestId, false, tradeContext).catch(err => {
+      processActions(actions, requestId, false, tradeContext).then(result => {
+        if (result?.completed && oldBotUuid) {
+          delete ACTIVE_BOTS[oldBotUuid];
+          log(`[${requestId}] 📋 Removed old bot ${oldBotUuid.substring(0, 8)} from tracking (close verified)`);
+        } else if (oldBotUuid && ACTIVE_BOTS[oldBotUuid]) {
+          log(`[${requestId}] ⚠ Close may have failed — keeping ${ACTIVE_BOTS[oldBotUuid]?.botName} in ACTIVE_BOTS for safety`);
+        }
+      }).catch(err => {
         log(`[${requestId}] ❌ Unexpected error: ${err.message}`);
       });
     }).catch(err => {
-      // Gate failed to run — let signal through (fail-open)
-      log(`[${requestId}] ⚠ Gate error (passing through): ${err.message}`);
-      processActions(actions, requestId).catch(err2 => {
-        log(`[${requestId}] ❌ Unexpected error: ${err2.message}`);
-      });
+      // v3.5.0: FAIL-CLOSED — gate error blocks signal (was fail-open).
+      // A Binance API hiccup is not a reason to bypass all 5 safety gates.
+      delete LAST_DIRECTION[pair];
+      log(`[${requestId}] 🚫 Gate error (BLOCKED — fail-closed): ${err.message}`);
+      sendTelegramAlert(
+        `🚫 Signal blocked — gate error\n\n` +
+        `TradingView sent ${direction} on ${pair}, but the safety gate couldn't run: ${err.message}\n\n` +
+        `Signal was NOT executed. Will wait for next signal when data is available.\n\n` +
+        `${istTimestamp()}`
+      ).catch(() => {});
     });
     return;
   }
@@ -1160,28 +1172,33 @@ async function runRevalidation() {
     try {
       const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
 
+      // v3.5.0: Single API call to get DCA-averaged entry price — used by both
+      // profit shield and drawdown check (was two separate calls before).
+      let effectiveEntry = bot.entryPrice;
+      if (gainiumApi.isConfigured() && result.data.currentPrice) {
+        try {
+          const posMap = await gainiumApi.getExchangePositionMap();
+          const base = bot.pair.replace('USDT', '').replace('/USDT', '');
+          const pos = posMap.get(base);
+          if (pos && pos.entryPrice > 0) {
+            effectiveEntry = pos.entryPrice;
+            if (effectiveEntry !== bot.entryPrice) {
+              log(`🔄 Reval: ${bot.botName} using DCA avgPrice $${effectiveEntry.toFixed(2)} (signal entry was $${bot.entryPrice?.toFixed(2) || '?'})`);
+            }
+          }
+        } catch (e) {
+          log(`🔄 Reval: ${bot.botName} failed to get DCA avgPrice, using signal entry: ${e.message}`);
+        }
+      }
+
       // v3.2.3: Profit shield — if the deal is significantly in profit,
-      // don't flip on a marginal EMA cross. The micro-cross filter in
-      // signal-gate.js handles the spread threshold; this is the second
-      // line of defense checking actual deal P&L.
-      // v3.4.0: Uses DCA-averaged entry from Gainium when available.
-      if (!result.allowed && bot.entryPrice && result.data.currentPrice) {
+      // don't flip on a marginal EMA cross.
+      if (!result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
 
-        // Try to get DCA-averaged entry price for accurate profit calc
-        let shieldEntry = bot.entryPrice;
-        if (gainiumApi.isConfigured()) {
-          try {
-            const posMap = await gainiumApi.getExchangePositionMap();
-            const base = bot.pair.replace('USDT', '').replace('/USDT', '');
-            const pos = posMap.get(base);
-            if (pos && pos.entryPrice > 0) shieldEntry = pos.entryPrice;
-          } catch (_e) { /* fall back to signal entry */ }
-        }
-
         const pctProfit = bot.direction === 'LONG'
-          ? ((currentPrice - shieldEntry) / shieldEntry) * 100
-          : ((shieldEntry - currentPrice) / shieldEntry) * 100;
+          ? ((currentPrice - effectiveEntry) / effectiveEntry) * 100
+          : ((effectiveEntry - currentPrice) / effectiveEntry) * 100;
 
         if (pctProfit >= REVAL_PROFIT_SHIELD_PCT) {
           log(`🛡️ Profit shield: ${bot.botName} is ${pctProfit.toFixed(2)}% in profit (≥ ${REVAL_PROFIT_SHIELD_PCT}%) — overriding reval failure. Original reason: ${result.reason}`);
@@ -1193,27 +1210,8 @@ async function runRevalidation() {
       }
 
       // v3.4.0: Price drawdown check — catch fast moves that 4H EMAs miss
-      // Uses DCA-averaged entry price from Gainium when available (accounts for safety order fills)
-      if (result.allowed && bot.entryPrice && result.data.currentPrice) {
+      if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
-
-        // Try to get DCA-averaged entry price from Gainium open deals
-        let effectiveEntry = bot.entryPrice;
-        if (gainiumApi.isConfigured()) {
-          try {
-            const posMap = await gainiumApi.getExchangePositionMap();
-            const base = bot.pair.replace('USDT', '').replace('/USDT', '');
-            const pos = posMap.get(base);
-            if (pos && pos.entryPrice > 0) {
-              effectiveEntry = pos.entryPrice;
-              if (effectiveEntry !== bot.entryPrice) {
-                log(`🔄 Reval: ${bot.botName} using DCA avgPrice $${effectiveEntry.toFixed(2)} (signal entry was $${bot.entryPrice.toFixed(2)})`);
-              }
-            }
-          } catch (e) {
-            log(`🔄 Reval: ${bot.botName} failed to get DCA avgPrice, using signal entry: ${e.message}`);
-          }
-        }
 
         const pctMove = ((currentPrice - effectiveEntry) / effectiveEntry) * 100;
         const drawdown = bot.direction === 'LONG' ? -pctMove : pctMove; // positive = bad
@@ -1461,7 +1459,7 @@ async function runRevalidation() {
         let alertMsg;
         if (isDrawdown) {
           alertMsg = `🛑 ${bot.botName} closed — price moved against us\n\n` +
-            `The ${bot.direction} position was losing too much (past the 1.5% safety limit), so the deal was closed to cut losses.\n\n` +
+            `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit), so the deal was closed to cut losses.\n\n` +
             `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else {
           alertMsg = `🛑 ${bot.botName} closed — market structure changed\n\n` +
@@ -1591,9 +1589,38 @@ async function runSelfHeal() {
         const shortIdle = (shortStatus.status === 'closed' && shortStatus.deals.active === 0);
 
         if (!longIdle || !shortIdle) {
-          // At least one bot is running or has an active deal — not orphaned
+          // At least one bot has an active deal
           if (longStatus.deals.active > 0 || shortStatus.deals.active > 0) {
-            log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active}) — waiting`);
+            log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active})`);
+
+            // v3.5.0: Re-track orphaned deals in ACTIVE_BOTS for revalidation protection.
+            // If a bot is "closed" but has active deals, the relay stopped the bot but
+            // the deal stayed open on Binance. Without tracking, these deals get zero
+            // revalidation/drawdown protection. This was the root cause of overnight bleeding.
+            for (const [bot, bStatus, dir] of [
+              [longBot, longStatus, 'LONG'],
+              [shortBot, shortStatus, 'SHORT'],
+            ]) {
+              if (bStatus.deals.active > 0 && !ACTIVE_BOTS[bot.uuid]) {
+                ACTIVE_BOTS[bot.uuid] = {
+                  pair,
+                  direction: dir,
+                  botName: bot.name,
+                  startedAt: new Date().toISOString(),
+                  entryPrice: null, // will be fetched by reval's getExchangePositionMap
+                  origin: 'self-heal-retrack',
+                };
+                LAST_ACTIVE[pair] = Date.now();
+                LAST_DIRECTION[pair] = dir;
+                log(`🩺 Self-heal: RE-TRACKED ${bot.name} (${dir}) — closed bot with active deal now monitored by revalidation`);
+                sendTelegramAlert(
+                  `🩺 Orphaned deal re-tracked: ${bot.name}\n\n` +
+                  `Found a ${dir} deal still open on Binance but the bot was stopped and untracked. ` +
+                  `The relay is now monitoring this position with full revalidation + drawdown protection.\n\n` +
+                  `${istTimestamp()}`
+                ).catch(() => {});
+              }
+            }
           }
           continue;
         }
@@ -1601,17 +1628,21 @@ async function runSelfHeal() {
         // Both bots are closed with 0 deals — pair is orphaned
         log(`🩺 Self-heal: ${pair} ORPHANED — both bots closed, 0 deals. Running signal gate...`);
 
-        // Run signal gate for both directions to find the correct one
+        // v3.5.0: Prefer the last known direction (if available) — avoids
+        // always defaulting to LONG when both directions pass gates.
+        const lastDir = LAST_DIRECTION[pair];
+        const dirOrder = lastDir === 'SHORT' ? ['SHORT', 'LONG'] : ['LONG', 'SHORT'];
+
         let bestDirection = null;
         let bestGateResult = null;
 
-        for (const dir of ['LONG', 'SHORT']) {
+        for (const dir of dirOrder) {
           try {
             const gateResult = await signalGate.validateSignal(pair, dir);
             if (gateResult.allowed) {
               bestDirection = dir;
               bestGateResult = gateResult;
-              break; // First allowed direction wins
+              break;
             }
           } catch (gateErr) {
             log(`🩺 Self-heal: ${pair} ${dir} gate error: ${gateErr.message}`);
@@ -1784,7 +1815,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.4.0`,
+      `Version: v3.5.0`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -1955,8 +1986,11 @@ async function recoverActiveState() {
       const status = botStatuses.get(uuid);
       if (!status) continue;
 
-      // Only recover bots that are "open" with active deals
-      if (status.status !== 'open' || !status.deals || status.deals.active === 0) continue;
+      // v3.5.0: Recover any bot with active deals, regardless of bot status.
+      // Previously only recovered status='open' — missed 'closed' bots with
+      // orphaned deals still running on Binance. Those positions ran blind
+      // (no revalidation, no drawdown protection) until TP/SL hit.
+      if (!status.deals || status.deals.active === 0) continue;
 
       // Parse direction and pair from bot name
       const direction = botInfo.name.toLowerCase().includes('long') ? 'LONG' :
@@ -2045,7 +2079,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.4.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.5.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);

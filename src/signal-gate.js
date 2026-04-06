@@ -17,6 +17,7 @@
  */
 
 const { EMA, RSI } = require('trading-signals');
+const binanceApi = require('./binance-api');
 
 // ── Configuration ─────────────────────────────────────────────────────────
 // These thresholds can be tuned without touching TradingView.
@@ -502,8 +503,14 @@ async function validateSignal(pair, direction) {
 
     // Calculate daily 50 EMA
     const dailyCloses = dailyCandles.map(c => c.close);
-    const currentPrice = dailyCloses[dailyCloses.length - 1];
+    const candleClose = dailyCloses[dailyCloses.length - 1];
     const ema50 = calculateEMA(dailyCloses, CONFIG.trendEma.period);
+
+    // v3.5.0: Use LIVE spot price for gate decisions, not stale candle close.
+    // Daily candle close can be up to 24 hours old — useless for real-time gating.
+    // Falls back to candle close if spot fetch fails.
+    const spotPrice = await binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null);
+    const currentPrice = spotPrice || candleClose;
 
     // Calculate 4h EMA 9 and EMA 21 (short-term trend)
     const fourHourCloses = fourHourCandles.map(c => c.close);
@@ -732,12 +739,13 @@ async function validateSignal(pair, direction) {
     };
 
   } catch (err) {
-    // If Binance is down or candle fetch fails, let the signal through.
-    // Better to trade on a potentially bad signal than to block all trading
-    // because of an API outage.
+    // v3.5.0: FAIL-CLOSED — if we can't validate, don't trade.
+    // A Binance API outage is not a reason to skip all safety checks.
+    // The signal will either arrive again (TradingView resends) or
+    // self-heal will pick up the pair when data returns.
     return {
-      allowed: true,
-      reason: `GATE ERROR (passing through): ${err.message}`,
+      allowed: false,
+      reason: `GATE ERROR (blocked — fail-closed): ${err.message}`,
       data,
     };
   }
@@ -766,15 +774,29 @@ async function revalidateSignal(pair, direction) {
   const data = {};
 
   try {
-    // Single API call — only 4H candles needed for both checks
-    const fourHourCandles = await fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded);
+    // v3.5.0: Fetch daily candles (for Gate 1) and 4H candles (for Gate 2+3) in parallel
+    // Plus live spot price so we're not using stale candle closes
+    const [dailyCandles, fourHourCandles, spotPrice] = await Promise.all([
+      fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
+      fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded),
+      binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null),
+    ]);
+
     const fourHourCloses = fourHourCandles.map(c => c.close);
+    const dailyCloses = dailyCandles.map(c => c.close);
+
+    // v3.5.0: Use live spot price, fall back to 4H candle close
+    const candlePrice = fourHourCloses[fourHourCloses.length - 1];
+    const currentPrice = spotPrice || candlePrice;
+
+    // Gate 1: Daily EMA50 (v3.5.0 — now checked during revalidation too)
+    const ema50 = calculateEMA(dailyCloses, CONFIG.trendEma.period);
 
     // Gate 2: 4H EMA 9/21 short-term trend
     const ema9 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.fast);
     const ema21 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.slow);
 
-    // Gate 4: RSI direction
+    // Gate 3+4: RSI
     const rsi14 = calculateRSI(fourHourCloses, CONFIG.rsi.period);
     let rsiDirection = 'FLAT';
     const slopeN = CONFIG.rsi.slopeCandles;
@@ -789,17 +811,38 @@ async function revalidateSignal(pair, direction) {
       }
     }
 
-    data.currentPrice = fourHourCloses[fourHourCloses.length - 1];
+    data.currentPrice = currentPrice;
+    data.spotPrice = spotPrice;
+    data.ema50 = ema50;
     data.ema9_4h = ema9;
     data.ema21_4h = ema21;
     data.shortTermTrend = (ema9 && ema21) ? (ema9 > ema21 ? 'BULLISH' : 'BEARISH') : 'UNKNOWN';
     data.rsi14 = rsi14;
     data.rsiDirection = rsiDirection;
+    data.priceVsEma = ema50 ? (currentPrice > ema50 ? 'ABOVE' : 'BELOW') : 'UNKNOWN';
 
-    // Check Gate 2: 4H EMA 9/21
+    // ── Gate 1 (reval): Daily EMA50 — v3.5.0 ──
+    // If price has moved to the wrong side of EMA50 since entry, this position
+    // is fighting the daily trend. Close it.
+    if (ema50 !== null) {
+      const g1Failed =
+        (direction === 'LONG' && currentPrice < ema50) ||
+        (direction === 'SHORT' && currentPrice > ema50);
+      data.gate1Reval = {
+        failed: g1Failed,
+        detail: `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — ${g1Failed ? 'WRONG SIDE' : 'aligned'}`,
+      };
+      if (g1Failed) {
+        return {
+          allowed: false,
+          reason: `REVALIDATION — DAILY TREND: Price $${currentPrice.toFixed(2)} ${direction === 'LONG' ? 'below' : 'above'} daily EMA50 $${ema50.toFixed(2)} — ${direction} fighting the trend`,
+          data,
+        };
+      }
+    }
+
+    // ── Gate 2 (reval): 4H EMA 9/21 ──
     // v3.2.3: Require minimum spread before flipping — prevents micro-crosses
-    // from closing profitable positions. E.g. EMA9 $80.53 vs EMA21 $80.52
-    // is 0.01% spread — noise, not a trend change.
     if (ema9 !== null && ema21 !== null) {
       const emaSpreadPct = Math.abs(ema9 - ema21) / ema21 * 100;
       const minSpread = CONFIG.shortTermEma.minRevalSpreadPct || 0;
@@ -820,14 +863,33 @@ async function revalidateSignal(pair, direction) {
           data,
         };
       }
-      // v3.2.3: If cross exists but spread is below threshold, log but allow
       if ((direction === 'LONG' && ema9 < ema21) || (direction === 'SHORT' && ema9 > ema21)) {
         data.microCrossIgnored = true;
         data.microCrossDetail = `EMA cross detected but spread ${emaSpreadPct.toFixed(3)}% < ${minSpread}% threshold — treating as noise`;
       }
     }
 
-    // Gate 4 (RSI direction) is now advisory — log but don't block on revalidation either
+    // ── Gate 3 (reval): RSI level — v3.5.0 ──
+    // If RSI has moved to extreme territory, close the position.
+    // Same thresholds as entry: LONG requires RSI > 30, SHORT requires RSI < 70.
+    if (rsi14 !== null) {
+      const g3Failed =
+        (direction === 'LONG' && rsi14 < CONFIG.rsi.longMinimum) ||
+        (direction === 'SHORT' && rsi14 > CONFIG.rsi.shortMaximum);
+      data.gate3Reval = {
+        failed: g3Failed,
+        detail: `RSI(14) = ${rsi14.toFixed(1)} — ${g3Failed ? 'EXTREME' : 'in range'}`,
+      };
+      if (g3Failed) {
+        return {
+          allowed: false,
+          reason: `REVALIDATION — RSI EXTREME: RSI(14) = ${rsi14.toFixed(1)} — ${direction === 'LONG' ? `below ${CONFIG.rsi.longMinimum} (oversold)` : `above ${CONFIG.rsi.shortMaximum} (overbought)`}`,
+          data,
+        };
+      }
+    }
+
+    // Gate 4 (RSI direction) remains advisory
     if (rsiDirection !== 'FLAT') {
       const g4WouldBlock =
         (direction === 'SHORT' && rsiDirection === 'RISING') ||
@@ -841,10 +903,10 @@ async function revalidateSignal(pair, direction) {
       };
     }
 
-    // Still valid — only Gate 2 (EMA 9/21) is blocking on revalidation
+    // All reval gates passed
     return {
       allowed: true,
-      reason: `REVALIDATION PASSED: 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
+      reason: `REVALIDATION PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
       data,
     };
 
@@ -863,7 +925,7 @@ async function revalidateSignal(pair, direction) {
  */
 function getConfig() {
   return {
-    trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (ADVISORY — logged only)`,
+    trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (BLOCKING — entry + reval, v3.4.0+)`,
     shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — must agree with trade direction)`,
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,
