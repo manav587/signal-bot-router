@@ -169,6 +169,64 @@ async function getPositionMap() {
   return map;
 }
 
+/**
+ * Diagnostic: raw API test to see exactly what Binance returns.
+ * Returns { ok, status, body, keyPrefix } for debugging.
+ */
+async function testConnection() {
+  if (!isConfigured()) {
+    return { ok: false, status: 0, body: 'API key/secret not configured in env vars', keyPrefix: 'N/A' };
+  }
+
+  const keyPrefix = API_KEY.substring(0, 8) + '...';
+  const qs = signedQuery();
+  const url = `${BASE_URL}/fapi/v2/positionRisk?${qs}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { 'X-MBX-APIKEY': API_KEY },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    const text = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = text; }
+
+    if (!res.ok) {
+      log(`testConnection: HTTP ${res.status} — ${text.substring(0, 300)}`);
+      return { ok: false, status: res.status, body: parsed, keyPrefix };
+    }
+
+    // Success — count positions
+    const positions = Array.isArray(parsed) ? parsed : [];
+    const nonZero = positions.filter(p => parseFloat(p.positionAmt) !== 0);
+    log(`testConnection: OK — ${positions.length} symbols, ${nonZero.length} with open positions`);
+    return {
+      ok: true,
+      status: 200,
+      totalSymbols: positions.length,
+      openPositions: nonZero.length,
+      positions: nonZero.map(p => ({
+        symbol: p.symbol,
+        side: parseFloat(p.positionAmt) > 0 ? 'LONG' : 'SHORT',
+        size: p.positionAmt,
+        entryPrice: p.entryPrice,
+        markPrice: p.markPrice,
+        pnl: p.unRealizedProfit,
+      })),
+      keyPrefix,
+    };
+  } catch (err) {
+    log(`testConnection error: ${err.message}`);
+    return { ok: false, status: 0, body: err.message, keyPrefix };
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 function isConfigured() {
@@ -180,4 +238,5 @@ module.exports = {
   getOpenPositions,
   getAccountInfo,
   getPositionMap,
+  testConnection,
 };

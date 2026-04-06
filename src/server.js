@@ -1777,11 +1777,54 @@ async function handleTelegramCommand(text, chatId) {
     return botLines.join('\n');
   }
 
+  if (cmd === '/binance') {
+    if (!binanceApi.isConfigured()) {
+      return '❌ Binance API not configured (missing env vars).';
+    }
+    try {
+      const result = await binanceApi.testConnection();
+      let lines = ['🔍 <b>Binance API Diagnostic</b>\n'];
+      lines.push(`Key: ${result.keyPrefix}`);
+      lines.push(`HTTP: ${result.status}`);
+      lines.push(`OK: ${result.ok}`);
+
+      if (!result.ok) {
+        // Show the error — this is what we need to debug
+        const bodyStr = typeof result.body === 'object' ? JSON.stringify(result.body) : String(result.body);
+        lines.push(`\n<b>Error:</b> ${bodyStr.substring(0, 500)}`);
+
+        // Provide guidance based on common Binance errors
+        if (result.status === 401 || (result.body?.code === -2015)) {
+          lines.push('\n💡 API key invalid or missing Futures permission.');
+          lines.push('Fix: Binance → API Management → Edit key → Enable Futures.');
+        } else if (result.body?.code === -1021) {
+          lines.push('\n💡 Timestamp outside recvWindow. Server clock may be off.');
+        } else if (result.body?.code === -2014) {
+          lines.push('\n💡 Bad API key format.');
+        }
+      } else {
+        lines.push(`Symbols tracked: ${result.totalSymbols}`);
+        lines.push(`Open positions: ${result.openPositions}`);
+        if (result.positions?.length > 0) {
+          lines.push('');
+          for (const p of result.positions) {
+            lines.push(`${p.symbol} ${p.side} — entry $${parseFloat(p.entryPrice).toFixed(2)}, P&L $${parseFloat(p.pnl).toFixed(2)}`);
+          }
+        }
+      }
+      lines.push(`\n${istTimestamp()} IST`);
+      return lines.join('\n');
+    } catch (err) {
+      return `❌ Binance test error: ${err.message}`;
+    }
+  }
+
   // Unknown command — show help
   return '🤖 <b>Sentinel Commands</b>\n\n' +
     '/positions — Current open deals with P&L\n' +
     '/status — System health & uptime\n' +
-    '/bots — Bot overview (active/stopped)';
+    '/bots — Bot overview (active/stopped)\n' +
+    '/binance — Binance API diagnostic';
 }
 
 function buildProgressBar(currentPct, targetPct) {
