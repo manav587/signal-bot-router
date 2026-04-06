@@ -70,18 +70,18 @@ const FUNDING_POLL_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 
 // ── Active Bot Tracker (v1.7.1) ────────────────────────────────────────
 // Tracks which bots the relay has started, so we can re-validate them.
-// Key = UUID, Value = { pair, direction, botName, startedAt }
+// Key = UUID, Value = { pair, direction, botName, startedAt, origin }
 // Only populated when the relay dispatches a startBot action.
 // origin: 'signal' (TradingView), 'auto-flip' (reval), 'funding', 'self-heal'
 const ACTIVE_BOTS = {};
 
-// ── Pair Activity Tracker (v3.2.7) ─────────────────────────────────────
+// ── Pair Activity Tracker (v3.2.8) ─────────────────────────────────────
 // Records when each pair last had an active bot (any origin).
 // Used by self-heal to distinguish orphaned pairs from intentionally flat ones.
 // Key = pair name (e.g. 'SOL'), Value = timestamp (ms)
 const LAST_ACTIVE = {};
 
-// ── Self-Heal Cooldown (v3.2.7) ────────────────────────────────────────
+// ── Self-Heal Cooldown (v3.2.8) ────────────────────────────────────────
 // Max one self-heal restart per pair per 30 minutes.
 // Prevents silent churn if gate keeps flip-flopping on an orphaned pair.
 // Key = pair name, Value = timestamp (ms) of last self-heal restart
@@ -697,7 +697,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.2.7',
+    version: '3.2.8',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -1174,6 +1174,39 @@ async function runRevalidation() {
           if (botInfo) {
             try {
               const deals = await gainiumApi.getBotDeals(uuid);
+              // v3.2.8: Stale deal detection — if Gainium says deal is active but
+              // the loss exceeds the -8% SL, Binance likely already closed it.
+              // Force-close on Gainium to sync state.
+              if (deals && deals.active > 0 && bot.entryPrice && result.data.currentPrice) {
+                const curPrice = result.data.currentPrice;
+                const lossPct = bot.direction === 'LONG'
+                  ? ((curPrice - bot.entryPrice) / bot.entryPrice) * 100
+                  : ((bot.entryPrice - curPrice) / bot.entryPrice) * 100;
+
+                if (lossPct < -8.5) {
+                  // Loss exceeds SL — deal should have been closed by Binance
+                  log(`🚨 STALE DEAL: ${bot.botName} showing ${deals.active} active deal(s) but loss is ${lossPct.toFixed(2)}% (beyond -8% SL)`);
+                  if (canSendTelegramAlert(uuid, 'stale-deal')) {
+                    markTelegramAlertSent(uuid, 'stale-deal');
+                    sendTelegramAlert(
+                      `🚨 STALE DEAL: ${bot.botName}\n\n` +
+                      `Gainium shows an active deal but the loss (${lossPct.toFixed(2)}%) exceeds the -8% stop loss. ` +
+                      `Binance likely already closed this position.\n\n` +
+                      `Entry: $${bot.entryPrice.toFixed(2)} | Now: $${curPrice.toFixed(2)}\n\n` +
+                      `Attempting to force-close the stale Gainium deal...\n\n` +
+                      `${istTimestamp()}`
+                    ).catch(() => {});
+                  }
+                  // Try REST API close to sync Gainium state
+                  try {
+                    const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
+                    log(`🚨 Stale deal REST close: ${restResult.closed} closed, ${restResult.failed} failed`);
+                  } catch (staleErr) {
+                    log(`🚨 Stale deal REST close error: ${staleErr.message}`);
+                  }
+                }
+              }
+
               if (deals && deals.active === 0) {
                 // Deal closed (TP/SL). ASAP will auto-open next deal after cooldown.
                 // Relay's external gates provide safety — stop bot if gates fail.
@@ -1221,17 +1254,18 @@ async function runRevalidation() {
           }
         }
       } else {
-        // Conditions changed — stop the bot
+        // Conditions changed — attempt to close and flip
         log(`🔄 Reval FAILED: ${bot.botName} — ${result.reason}`);
 
-        // ── v3.2.4: Route close + auto-flip through processActions ──────
-        // Previously this sent raw webhook calls without verification.
-        // Now uses the same verified pipeline as TradingView crossovers:
-        //   closeAllDeals → double-tap → verify flat → stopBot → startBot
-        // If verification fails, startBot is aborted (no position conflict).
+        // ── v3.2.8: Don't orphan positions on failed close ──────────────
+        // Previously we deleted ACTIVE_BOTS[uuid] immediately, before
+        // knowing if the close would succeed. If close failed, the position
+        // was orphaned — no revalidation, no protection, no monitoring.
+        //
+        // New approach: attempt the close first. Only remove from ACTIVE_BOTS
+        // if the close succeeds. If it fails, keep monitoring the position.
+        // A monitored losing position is better than an unmonitored one.
 
-        // Remove from active tracking (regardless of flip outcome)
-        delete ACTIVE_BOTS[uuid];
         // Clear rising-edge so next signal for this pair is treated as fresh
         delete LAST_DIRECTION[bot.pair];
 
@@ -1303,40 +1337,57 @@ async function runRevalidation() {
         try {
           const processResult = await processActions(revalActions, revalRequestId, false, revalContext);
 
-          // Update tracking based on outcome
-          if (processResult && processResult.completed && flipResult && flipResult.reason === 'pending' && oppositeBot) {
-            // Flip succeeded — update tracking
-            const gateResult = await signalGate.validateSignal(bot.pair, oppositeDir).catch(() => ({ data: {} }));
-            ACTIVE_BOTS[oppositeBot.uuid] = {
-              pair: bot.pair,
-              direction: oppositeDir,
-              botName: oppositeBot.name,
-              startedAt: new Date().toISOString(),
-              entryPrice: gateResult.data?.currentPrice || result.data.currentPrice || null,
-              origin: 'auto-flip',
-            };
-            LAST_ACTIVE[bot.pair] = Date.now();
-            LAST_DIRECTION[bot.pair] = oppositeDir;
-            FLIP_COOLDOWN[bot.pair] = new Date().toISOString();
-            recordFlip(bot.pair);
-            flipResult = { flipped: true, botName: oppositeBot.name, gateData: gateResult.data || {} };
-            log(`🔄 Auto-flip: ${oppositeBot.name} started via verified pipeline (cooldown set)`);
-          } else if (flipResult && flipResult.reason === 'pending') {
-            // processActions aborted the startBot (verification failed)
-            flipResult = { flipped: false, reason: 'Flip aborted — old position not confirmed closed (safety abort)' };
-            log(`🔄 Auto-flip: aborted — processActions could not verify position closed`);
+          if (processResult && processResult.completed) {
+            // Close succeeded — safe to remove old bot from tracking
+            delete ACTIVE_BOTS[uuid];
+
+            // Update tracking based on outcome
+            if (flipResult && flipResult.reason === 'pending' && oppositeBot) {
+              // Flip succeeded — track the new bot
+              const gateResult = await signalGate.validateSignal(bot.pair, oppositeDir).catch(() => ({ data: {} }));
+              ACTIVE_BOTS[oppositeBot.uuid] = {
+                pair: bot.pair,
+                direction: oppositeDir,
+                botName: oppositeBot.name,
+                startedAt: new Date().toISOString(),
+                entryPrice: gateResult.data?.currentPrice || result.data.currentPrice || null,
+                origin: 'auto-flip',
+              };
+              LAST_ACTIVE[bot.pair] = Date.now();
+              LAST_DIRECTION[bot.pair] = oppositeDir;
+              FLIP_COOLDOWN[bot.pair] = new Date().toISOString();
+              recordFlip(bot.pair);
+              flipResult = { flipped: true, botName: oppositeBot.name, gateData: gateResult.data || {} };
+              log(`🔄 Auto-flip: ${oppositeBot.name} started via verified pipeline (cooldown set)`);
+            } else {
+              // Close-only succeeded (no flip attempted or gates blocked)
+              log(`🔄 Reval: ${bot.botName} closed and stopped successfully`);
+            }
+          } else {
+            // v3.2.8: Close FAILED — keep bot in ACTIVE_BOTS for continued monitoring
+            // Don't orphan the position. Revalidation will retry next cycle.
+            log(`🔄 Reval: close failed for ${bot.botName} — keeping in ACTIVE_BOTS for continued monitoring`);
+            // Restore LAST_DIRECTION since we're not actually changing state
+            LAST_DIRECTION[bot.pair] = bot.direction;
+
+            if (flipResult && flipResult.reason === 'pending') {
+              flipResult = { flipped: false, reason: 'Close failed — position still monitored, will retry' };
+            }
+
+            sendTelegramAlert(
+              `⚠️ ${bot.botName}: close attempt failed\n\n` +
+              `Revalidation tried to close this position but couldn't verify the deal closed on Binance. ` +
+              `The bot is still tracked and protected by revalidation — will retry next cycle.\n\n` +
+              `${istTimestamp()}`
+            ).catch(() => {});
           }
         } catch (processErr) {
           log(`🔄 Auto-flip: processActions failed for ${bot.botName}: ${processErr.message}`);
+          // Keep in ACTIVE_BOTS on error too
+          LAST_DIRECTION[bot.pair] = bot.direction;
           if (flipResult && flipResult.reason === 'pending') {
             flipResult = { flipped: false, reason: `processActions error: ${processErr.message}` };
           }
-        }
-
-        // Build close-only action sequence if no flip was attempted (circuit breaker, cooldown, etc.)
-        if (!revalActions.some(a => a.action === 'startBot') && !flipResult?.flipped) {
-          // Close+stop already sent through processActions above — just log
-          log(`🔄 Reval: ${bot.botName} closed and stopped (no flip attempted)`);
         }
 
         // Alert to Telegram (includes flip result)
@@ -1375,7 +1426,7 @@ async function runRevalidation() {
 // Start the re-validation interval
 setInterval(runRevalidation, REVAL_INTERVAL);
 
-// ── Bot Self-Heal Monitor (v3.2.7) ─────────────────────────────────────
+// ── Bot Self-Heal Monitor (v3.2.8) ─────────────────────────────────────
 // Catches orphaned pairs — where both Long and Short bots are "closed"
 // with 0 active deals and no bot is tracked in ACTIVE_BOTS.
 //
@@ -1421,7 +1472,142 @@ async function runSelfHeal() {
     }
 
     for (const pair of orphanedPairs) {
-      await selfHealPair(pair, botStatuses);
+      try {
+        // v3.2.8 Guardrail 1: Recent-activity requirement
+        // Only recover pairs that were active within the last 6 hours.
+        // A pair that's been intentionally flat won't get auto-restarted.
+        const lastActive = LAST_ACTIVE[pair];
+        if (!lastActive) {
+          log(`🩺 Self-heal: ${pair} — no activity record (never started by this relay instance) — skipping`);
+          continue;
+        }
+        const ageMs = Date.now() - lastActive;
+        if (ageMs > SELF_HEAL_MAX_AGE_MS) {
+          log(`🩺 Self-heal: ${pair} — last active ${Math.round(ageMs / 60000)}min ago (>${SELF_HEAL_MAX_AGE_MS / 3600000}h) — too old, skipping`);
+          continue;
+        }
+
+        // v3.2.8 Guardrail 2: Per-pair self-heal cooldown
+        // Max one restart per pair per 30 minutes to prevent silent churn.
+        const lastHeal = SELF_HEAL_COOLDOWNS[pair];
+        if (lastHeal && (Date.now() - lastHeal) < SELF_HEAL_COOLDOWN_MS) {
+          const remainMin = Math.ceil((SELF_HEAL_COOLDOWN_MS - (Date.now() - lastHeal)) / 60000);
+          log(`🩺 Self-heal: ${pair} — cooldown active (${remainMin}min remaining) — skipping`);
+          continue;
+        }
+
+        // Check circuit breaker
+        const cbCheck = checkCircuitBreaker(pair + 'USDT');
+        if (cbCheck.parked) {
+          log(`🩺 Self-heal: ${pair} parked by circuit breaker — skipping`);
+          continue;
+        }
+
+        // Find both bots for this pair
+        const longBot = findBot(pair, 'LONG');
+        const shortBot = findBot(pair, 'SHORT');
+        if (!longBot || !shortBot) {
+          log(`🩺 Self-heal: ${pair} missing Long or Short bot in BOT_MAP — skipping`);
+          continue;
+        }
+
+        // Check their status on Gainium
+        const longStatus = botStatuses.get(longBot.uuid);
+        const shortStatus = botStatuses.get(shortBot.uuid);
+
+        if (!longStatus || !shortStatus) {
+          log(`🩺 Self-heal: ${pair} — couldn't find bot status on Gainium — skipping`);
+          continue;
+        }
+
+        // Only self-heal if BOTH bots are closed/stopped with 0 active deals
+        const longIdle = (longStatus.status === 'closed' && longStatus.deals.active === 0);
+        const shortIdle = (shortStatus.status === 'closed' && shortStatus.deals.active === 0);
+
+        if (!longIdle || !shortIdle) {
+          // At least one bot is running or has an active deal — not orphaned
+          if (longStatus.deals.active > 0 || shortStatus.deals.active > 0) {
+            log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active}) — waiting`);
+          }
+          continue;
+        }
+
+        // Both bots are closed with 0 deals — pair is orphaned
+        log(`🩺 Self-heal: ${pair} ORPHANED — both bots closed, 0 deals. Running signal gate...`);
+
+        // Run signal gate for both directions to find the correct one
+        let bestDirection = null;
+        let bestGateResult = null;
+
+        for (const dir of ['LONG', 'SHORT']) {
+          try {
+            const gateResult = await signalGate.validateSignal(pair, dir);
+            if (gateResult.allowed) {
+              bestDirection = dir;
+              bestGateResult = gateResult;
+              break; // First allowed direction wins
+            }
+          } catch (gateErr) {
+            log(`🩺 Self-heal: ${pair} ${dir} gate error: ${gateErr.message}`);
+          }
+        }
+
+        if (!bestDirection) {
+          log(`🩺 Self-heal: ${pair} — neither direction passes signal gate. Will retry next cycle.`);
+          if (canSendTelegramAlert(pair, 'self-heal-blocked')) {
+            markTelegramAlertSent(pair, 'self-heal-blocked');
+            sendTelegramAlert(
+              `🩺 Self-heal: ${pair} idle but no clear direction\n\n` +
+              `Both ${pair} bots are stopped with no deals. The system checked if it should re-enter, but neither LONG nor SHORT passed the 4H signal gate checks.\n\n` +
+              `Will keep checking every 5 minutes until a clear direction emerges, or the next TradingView signal arrives.\n\n` +
+              `${istTimestamp()}`
+            ).catch(() => {});
+          }
+          continue;
+        }
+
+        // Found a valid direction — restart the bot
+        const targetBot = bestDirection === 'LONG' ? longBot : shortBot;
+        log(`🩺 Self-heal: ${pair} → starting ${targetBot.name} (${bestDirection})`);
+
+        try {
+          await sendAction({ action: 'startBot', uuid: targetBot.uuid });
+
+          // Track in ACTIVE_BOTS
+          ACTIVE_BOTS[targetBot.uuid] = {
+            pair,
+            direction: bestDirection,
+            botName: targetBot.name,
+            startedAt: new Date().toISOString(),
+            entryPrice: bestGateResult.data?.currentPrice || null,
+            origin: 'self-heal',
+          };
+          LAST_ACTIVE[pair] = Date.now();
+          SELF_HEAL_COOLDOWNS[pair] = Date.now();
+          LAST_DIRECTION[pair] = bestDirection;
+
+          log(`🩺 Self-heal: ✅ ${targetBot.name} restarted successfully`);
+          sendTelegramAlert(
+            `🩺 Self-heal: ${targetBot.name} restarted\n\n` +
+            `Both ${pair} bots were stopped with no active deals (orphaned pair). The system detected this and confirmed ${bestDirection} is the correct direction:\n\n` +
+            `• 4H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
+            `• RSI(14): ${bestGateResult.data?.rsi14 || '?'} ${bestGateResult.data?.rsiDirection || ''}\n` +
+            `• Price: $${bestGateResult.data?.currentPrice?.toFixed(2) || '?'}\n\n` +
+            `A new deal will open automatically via ASAP start.\n\n` +
+            `${istTimestamp()}`
+          ).catch(() => {});
+        } catch (startErr) {
+          log(`🩺 Self-heal: ❌ startBot failed for ${targetBot.name}: ${startErr.message}`);
+          sendTelegramAlert(
+            `🩺 Self-heal FAILED: ${targetBot.name}\n\n` +
+            `Tried to restart ${targetBot.name} but the webhook failed: ${startErr.message}\n\n` +
+            `Will retry next cycle.\n\n` +
+            `${istTimestamp()}`
+          ).catch(() => {});
+        }
+      } catch (pairErr) {
+        log(`🩺 Self-heal: error processing ${pair}: ${pairErr.message}`);
+      }
     }
   } catch (err) {
     log(`🩺 Self-heal: unexpected error: ${err.message}`);
@@ -1430,145 +1616,12 @@ async function runSelfHeal() {
   selfHealRunning = false;
 }
 
-async function selfHealPair(pair, botStatuses) {
-  try {
-    // v3.2.7 Guardrail 1: Recent-activity requirement
-    // Only recover pairs that were active within the last 6 hours.
-    // A pair that's been intentionally flat won't get auto-restarted.
-    const lastActive = LAST_ACTIVE[pair];
-    if (!lastActive) {
-      log(`🩺 Self-heal: ${pair} — no activity record (never started by this relay instance) — skipping`);
-      return;
-    }
-    const ageMs = Date.now() - lastActive;
-    if (ageMs > SELF_HEAL_MAX_AGE_MS) {
-      log(`🩺 Self-heal: ${pair} — last active ${Math.round(ageMs / 60000)}min ago (>${SELF_HEAL_MAX_AGE_MS / 3600000}h) — too old, skipping`);
-      return;
-    }
-
-    // v3.2.7 Guardrail 2: Per-pair self-heal cooldown
-    // Max one restart per pair per 30 minutes to prevent silent churn.
-    const lastHeal = SELF_HEAL_COOLDOWNS[pair];
-    if (lastHeal && (Date.now() - lastHeal) < SELF_HEAL_COOLDOWN_MS) {
-      const remainMin = Math.ceil((SELF_HEAL_COOLDOWN_MS - (Date.now() - lastHeal)) / 60000);
-      log(`🩺 Self-heal: ${pair} — cooldown active (${remainMin}min remaining) — skipping`);
-      return;
-    }
-
-    // Check circuit breaker
-    const cbCheck = checkCircuitBreaker(pair + 'USDT');
-    if (cbCheck.parked) {
-      log(`🩺 Self-heal: ${pair} parked by circuit breaker — skipping`);
-      return;
-    }
-
-    // Find both bots for this pair
-    const longBot = findBot(pair, 'LONG');
-    const shortBot = findBot(pair, 'SHORT');
-    if (!longBot || !shortBot) {
-      log(`🩺 Self-heal: ${pair} missing Long or Short bot in BOT_MAP — skipping`);
-      return;
-    }
-
-    // Check their status on Gainium
-    const longStatus = botStatuses.get(longBot.uuid);
-    const shortStatus = botStatuses.get(shortBot.uuid);
-
-    if (!longStatus || !shortStatus) {
-      log(`🩺 Self-heal: ${pair} — couldn't find bot status on Gainium — skipping`);
-      return;
-    }
-
-    // Only self-heal if BOTH bots are closed/stopped with 0 active deals
-    const longIdle = (longStatus.status === 'closed' && longStatus.deals.active === 0);
-    const shortIdle = (shortStatus.status === 'closed' && shortStatus.deals.active === 0);
-
-    if (!longIdle || !shortIdle) {
-      if (longStatus.deals.active > 0 || shortStatus.deals.active > 0) {
-        log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active}) — waiting`);
-      }
-      return;
-    }
-
-    // Both bots are closed with 0 deals — pair is orphaned
-    log(`🩺 Self-heal: ${pair} ORPHANED — both bots closed, 0 deals. Running signal gate...`);
-
-    // Run signal gate for both directions to find the correct one
-    let bestDirection = null;
-    let bestGateResult = null;
-
-    for (const dir of ['LONG', 'SHORT']) {
-      try {
-        const gateResult = await signalGate.validateSignal(pair, dir);
-        if (gateResult.allowed) {
-          bestDirection = dir;
-          bestGateResult = gateResult;
-          break;
-        }
-      } catch (gateErr) {
-        log(`🩺 Self-heal: ${pair} ${dir} gate error: ${gateErr.message}`);
-      }
-    }
-
-    if (!bestDirection) {
-      log(`🩺 Self-heal: ${pair} — neither direction passes signal gate. Will retry next cycle.`);
-      if (canSendTelegramAlert(pair, 'self-heal-blocked')) {
-        markTelegramAlertSent(pair, 'self-heal-blocked');
-        sendTelegramAlert(
-          `🩺 Self-heal: ${pair} idle but no clear direction\n\n` +
-          `Both ${pair} bots are stopped with no deals. Neither LONG nor SHORT passed the 4H signal gate.\n\n` +
-          `Will keep checking every 5 minutes.\n\n` +
-          `${istTimestamp()}`
-        ).catch(() => {});
-      }
-      return;
-    }
-
-    // Found a valid direction — restart the bot
-    const targetBot = bestDirection === 'LONG' ? longBot : shortBot;
-    log(`🩺 Self-heal: ${pair} → starting ${targetBot.name} (${bestDirection})`);
-
-    await sendAction({ action: 'startBot', uuid: targetBot.uuid });
-
-    // Track in ACTIVE_BOTS
-    ACTIVE_BOTS[targetBot.uuid] = {
-      pair,
-      direction: bestDirection,
-      botName: targetBot.name,
-      startedAt: new Date().toISOString(),
-      entryPrice: bestGateResult.data?.currentPrice || null,
-      origin: 'self-heal',
-    };
-    LAST_ACTIVE[pair] = Date.now();
-    SELF_HEAL_COOLDOWNS[pair] = Date.now();
-    LAST_DIRECTION[pair] = bestDirection;
-
-    log(`🩺 Self-heal: ✅ ${targetBot.name} restarted successfully`);
-    sendTelegramAlert(
-      `🩺 Self-heal: ${targetBot.name} restarted\n\n` +
-      `Both ${pair} bots were stopped with no active deals (orphaned pair). Confirmed ${bestDirection} is correct:\n\n` +
-      `• 4H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
-      `• RSI(14): ${bestGateResult.data?.rsi14 || '?'} ${bestGateResult.data?.rsiDirection || ''}\n` +
-      `• Price: $${bestGateResult.data?.currentPrice?.toFixed(2) || '?'}\n\n` +
-      `New deal will open via ASAP start.\n\n` +
-      `${istTimestamp()}`
-    ).catch(() => {});
-  } catch (pairErr) {
-    log(`🩺 Self-heal: error processing ${pair}: ${pairErr.message}`);
-    if (pairErr.message && pairErr.message.includes('startBot')) {
-      sendTelegramAlert(
-        `🩺 Self-heal FAILED: ${pair}\n\nWebhook error: ${pairErr.message}\nWill retry next cycle.\n\n${istTimestamp()}`
-      ).catch(() => {});
-    }
-  }
-}
-
 // Start the self-heal interval
 setInterval(runSelfHeal, SELF_HEAL_INTERVAL);
 // Run once on startup after a short delay (catches orphans from redeploys)
 setTimeout(runSelfHeal, 30 * 1000);
 
-// ── Telegram Bot Commands (v3.2.7) ──────────────────────────────────────
+// ── Telegram Bot Commands (v3.2.8) ──────────────────────────────────────
 // Lets Manav query the system from Telegram on his phone.
 // POST /telegram — receives updates from Telegram webhook.
 // Supported commands: /positions, /status, /bots
@@ -1605,6 +1658,8 @@ async function handleTelegramCommand(text, chatId) {
         totalProfit += pnl;
 
         const dir = botInfo.name.includes('Short') ? 'SHORT' : 'LONG';
+        const bar = buildProgressBar(parseFloat(pctPrice), 5);
+
         const pctFloat = parseFloat(pctPrice);
         const shieldStatus = pctFloat >= 2.0 ? '✅' : `${(2.0 - pctFloat).toFixed(1)}% away`;
         const movingSLStatus = pctFloat >= 2.5 ? '✅ Active' : `${(2.5 - pctFloat).toFixed(1)}% away`;
@@ -1645,7 +1700,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.2.7`,
+      `Version: v3.2.8`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -1661,9 +1716,9 @@ async function handleTelegramCommand(text, chatId) {
     let botLines = ['🤖 <b>Bot Overview</b>\n'];
     for (const [uuid, botInfo] of Object.entries(BOT_MAP)) {
       const active = ACTIVE_BOTS[uuid];
-      const icon = active ? '🟢' : '⚫';
-      const status = active ? `${active.direction} since ${active.startedAt?.substring(11, 16) || '?'} UTC` : 'Stopped';
-      botLines.push(`${icon} ${botInfo.name} — ${status}`);
+      const icon = active ? '🟢' : '⚪';
+      const extra = active ? ` — ${active.direction} since ${active.startedAt?.substring(11, 16) || '?'} UTC` : '';
+      botLines.push(`${icon} ${botInfo.name}${extra}`);
     }
     botLines.push(`\n${istTimestamp()} IST`);
     return botLines.join('\n');
@@ -1735,10 +1790,89 @@ async function registerTelegramWebhook() {
   }
 }
 
+// ── Startup State Recovery (v3.2.8) ─────────────────────────────────────
+// After a deploy or Render restart, ACTIVE_BOTS is empty — all running
+// positions lose revalidation protection. This function queries Gainium
+// for open bots with active deals and rebuilds in-memory state so
+// revalidation starts protecting them immediately.
+
+async function recoverActiveState() {
+  if (!gainiumApi.isConfigured()) {
+    log(`🔄 Startup recovery: skipped — API not configured`);
+    return;
+  }
+
+  try {
+    log(`🔄 Startup recovery: querying Gainium for active bots...`);
+    const botStatuses = await gainiumApi.getAllBotStatuses();
+    if (!botStatuses) {
+      log(`🔄 Startup recovery: API call failed — will rely on incoming signals`);
+      return;
+    }
+
+    const recovered = [];
+
+    for (const [uuid, botInfo] of Object.entries(BOT_MAP)) {
+      const status = botStatuses.get(uuid);
+      if (!status) continue;
+
+      // Only recover bots that are "open" with active deals
+      if (status.status !== 'open' || !status.deals || status.deals.active === 0) continue;
+
+      // Parse direction and pair from bot name
+      const direction = botInfo.name.toLowerCase().includes('long') ? 'LONG' :
+                        botInfo.name.toLowerCase().includes('short') ? 'SHORT' : null;
+      if (!direction) continue;
+
+      const pair = botInfo.name.split(' ')[0].toUpperCase();
+
+      // Try to get entry price from open deals
+      let entryPrice = null;
+      try {
+        const deals = await gainiumApi.listOpenDeals(botInfo.mongoId);
+        if (deals && deals.length > 0 && deals[0].avgPrice) {
+          entryPrice = deals[0].avgPrice;
+        }
+      } catch (e) {
+        log(`🔄 Startup recovery: couldn't fetch deals for ${botInfo.name}: ${e.message}`);
+      }
+
+      // Populate trackers
+      ACTIVE_BOTS[uuid] = {
+        pair,
+        direction,
+        botName: botInfo.name,
+        startedAt: new Date().toISOString(),
+        entryPrice,
+        origin: 'recovery',
+      };
+      LAST_ACTIVE[pair] = Date.now();
+      LAST_DIRECTION[pair] = direction;
+
+      recovered.push(`${botInfo.name} (${direction}, entry $${entryPrice?.toFixed(2) || '?'})`);
+    }
+
+    if (recovered.length > 0) {
+      log(`🔄 Startup recovery: ✅ recovered ${recovered.length} active bot(s): ${recovered.join(', ')}`);
+      sendTelegramAlert(
+        `🔄 Startup recovery\n\n` +
+        `Server restarted. Recovered ${recovered.length} active position(s) from Gainium:\n\n` +
+        recovered.map(r => `• ${r}`).join('\n') + `\n\n` +
+        `Revalidation is now protecting these positions.\n\n` +
+        `${istTimestamp()}`
+      ).catch(() => {});
+    } else {
+      log(`🔄 Startup recovery: no active bots found on Gainium`);
+    }
+  } catch (err) {
+    log(`🔄 Startup recovery: error: ${err.message}`);
+  }
+}
+
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  log(`🚀 Signal Bot Router v3.2.7 listening on port ${PORT}`);
+app.listen(PORT, async () => {
+  log(`🚀 Signal Bot Router v3.2.8 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
@@ -1747,6 +1881,10 @@ app.listen(PORT, () => {
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
   log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
+
+  // v3.2.8: Recover active state BEFORE revalidation or self-heal run
+  await recoverActiveState();
+
   // Register Telegram webhook after server is listening
   registerTelegramWebhook();
 });

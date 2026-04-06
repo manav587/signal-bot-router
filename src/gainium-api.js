@@ -244,13 +244,28 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
   }
 
   // Final check after all retries (also with backoff)
-  const finalDeals = await getBotDealsWithBackoff(botUuid, botName);
+  let finalDeals = await getBotDealsWithBackoff(botUuid, botName);
   if (finalDeals && finalDeals.active === 0) {
     log(`[${botName}] ✅ Confirmed flat after force-close — deals.active = 0`);
     return { flat: true, forceClosed: totalForceClosed, error: null };
   }
 
-  const msg = `CRITICAL: ${botName} still has ${finalDeals ? finalDeals.active : '?'} active deal(s) after ${maxRetries} force-close attempts`;
+  // v3.2.8: REST API fallback — webhook closeAllDeals stalled, try individual deal close
+  log(`[${botName}] ⚠ Webhook closeAllDeals stalled — attempting REST API close...`);
+  const restResult = await closeDealsViaApi(botMongoId, botName);
+  if (restResult.closed > 0) {
+    totalForceClosed += restResult.closed;
+    log(`[${botName}] REST fallback closed ${restResult.closed} deal(s) — waiting 5s for Binance...`);
+    await new Promise(r => setTimeout(r, 5000));
+
+    finalDeals = await getBotDealsWithBackoff(botUuid, botName);
+    if (finalDeals && finalDeals.active === 0) {
+      log(`[${botName}] ✅ Confirmed flat after REST fallback — deals.active = 0`);
+      return { flat: true, forceClosed: totalForceClosed, error: null };
+    }
+  }
+
+  const msg = `CRITICAL: ${botName} still has ${finalDeals ? finalDeals.active : '?'} active deal(s) after ${maxRetries} webhook + REST API attempts`;
   log(`[${botName}] ❌ ${msg}`);
   return { flat: false, forceClosed: totalForceClosed, error: msg };
 }
@@ -299,6 +314,73 @@ async function getAllBotStatuses() {
   } catch (err) {
     log(`getAllBotStatuses error: ${err.message}`);
     return null;
+  }
+}
+
+// ── REST API Deal Close (v3.2.8 — fallback when webhook closeAllDeals stalls) ──
+
+/**
+ * Close individual deals via the REST API instead of the webhook.
+ * Proven to work (Gainium MCP manage_deal uses the same path).
+ * Called as a fallback when webhook closeAllDeals fails to achieve flat.
+ *
+ * @param {string} botMongoId — MongoDB ObjectId of the bot
+ * @param {string} botName    — Human-readable name (for logging)
+ * @returns {{ closed: number, failed: number }}
+ */
+async function closeDealsViaApi(botMongoId, botName) {
+  try {
+    const deals = await listOpenDeals(botMongoId);
+    if (!deals || deals.length === 0) {
+      log(`[${botName}] REST close: no open deals found`);
+      return { closed: 0, failed: 0 };
+    }
+
+    let closed = 0, failed = 0;
+    for (const deal of deals) {
+      const dealId = deal._id;
+      // POST to /api/deals/{dealId}/manage with close action
+      const endpoint = `/api/deals/${dealId}/manage`;
+      const body = JSON.stringify({ action: 'close', closeType: 'cancel', dealType: 'dca' });
+      const method = 'POST';
+      const url = `${BASE_URL}${endpoint}`;
+      const headers = authHeaders(method, endpoint, body);
+
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+
+        const res = await fetch(url, { method, headers, body, signal: controller.signal });
+        clearTimeout(timeout);
+
+        const contentType = res.headers.get('content-type') || '';
+        let responseBody = '';
+        if (contentType.includes('application/json')) {
+          const json = await res.json();
+          responseBody = JSON.stringify(json).substring(0, 200);
+        }
+
+        if (res.ok) {
+          log(`[${botName}] REST close succeeded for deal ${dealId} (${res.status})`);
+          closed++;
+        } else {
+          log(`[${botName}] REST close returned ${res.status} for deal ${dealId}: ${responseBody}`);
+          failed++;
+        }
+      } catch (dealErr) {
+        log(`[${botName}] REST close error for deal ${dealId}: ${dealErr.message}`);
+        failed++;
+      }
+
+      // Brief pause between deals
+      if (deals.length > 1) await new Promise(r => setTimeout(r, 1000));
+    }
+
+    log(`[${botName}] REST API close: ${closed} succeeded, ${failed} failed out of ${deals.length} deal(s)`);
+    return { closed, failed };
+  } catch (err) {
+    log(`[${botName}] closeDealsViaApi error: ${err.message}`);
+    return { closed: 0, failed: 0 };
   }
 }
 
@@ -352,5 +434,6 @@ module.exports = {
   listOpenDeals,
   listAllOpenDeals,
   forceCloseDeals,
+  closeDealsViaApi,
   verifyAndForceClose,
 };
