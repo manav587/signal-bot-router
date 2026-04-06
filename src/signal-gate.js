@@ -536,19 +536,28 @@ async function validateSignal(pair, direction) {
     data.rsiDirection = rsiDirection;
     data.priceVsEma = ema50 ? (currentPrice > ema50 ? 'ABOVE' : 'BELOW') : 'UNKNOWN';
 
-    // ── Gate 1: Daily 50 EMA trend filter (ADVISORY ONLY) ──────────────
-    // Logged but not blocking. Collecting data during prove-it period.
+    // ── Gate 1: Daily 50 EMA trend filter (BLOCKING — promoted v3.4.0) ──
+    // Price must be above daily EMA50 for LONG, below for SHORT.
+    // Previously advisory-only; promoted to blocking after confirmed bad entries
+    // on SOL & XRP where price was well below EMA50 during clear downtrends.
     if (ema50 !== null) {
-      const g1WouldBlock =
+      const g1Blocked =
         (direction === 'LONG' && currentPrice < ema50) ||
         (direction === 'SHORT' && currentPrice > ema50);
-      data.gate1Advisory = {
-        wouldBlock: g1WouldBlock,
-        mode: 'advisory',
-        detail: g1WouldBlock
-          ? `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — would have blocked ${direction}`
+      data.gate1 = {
+        blocked: g1Blocked,
+        mode: 'blocking',
+        detail: g1Blocked
+          ? `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — BLOCKED ${direction}`
           : `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — aligned with ${direction}`,
       };
+      if (g1Blocked) {
+        return {
+          allowed: false,
+          reason: `DAILY TREND: Price $${currentPrice.toFixed(2)} ${direction === 'LONG' ? 'below' : 'above'} daily EMA50 $${ema50.toFixed(2)} — ${direction} rejected`,
+          data,
+        };
+      }
     }
 
     // ── Gate 2: 4H EMA 9/21 short-term trend filter ──────────────────

@@ -1126,7 +1126,7 @@ app.post('/webhook', (req, res) => {
 // and Gate 4 (RSI direction). If conditions have changed, stop the bot.
 // FAIL-CLOSED: If data fetch fails, stop the bot.
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
-const REVAL_MAX_DRAWDOWN_PCT = 1.5;    // v2.3.0: kill bot if price moves 1.5% against direction
+const REVAL_MAX_DRAWDOWN_PCT = 4.0;    // v3.4.0: kill bot if price moves 4% against direction (was 1.5% — too tight for DCA with 2 safety orders at 0.3% step)
 // v3.2.3: Profit protection — don't flip a deal that's significantly in profit
 // unless the EMA spread is convincingly wide. If a deal is up > this threshold,
 // the revalidation result is overridden to "allowed" with a log note.
@@ -1164,11 +1164,24 @@ async function runRevalidation() {
       // don't flip on a marginal EMA cross. The micro-cross filter in
       // signal-gate.js handles the spread threshold; this is the second
       // line of defense checking actual deal P&L.
+      // v3.4.0: Uses DCA-averaged entry from Gainium when available.
       if (!result.allowed && bot.entryPrice && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
+
+        // Try to get DCA-averaged entry price for accurate profit calc
+        let shieldEntry = bot.entryPrice;
+        if (gainiumApi.isConfigured()) {
+          try {
+            const posMap = await gainiumApi.getExchangePositionMap();
+            const base = bot.pair.replace('USDT', '').replace('/USDT', '');
+            const pos = posMap.get(base);
+            if (pos && pos.entryPrice > 0) shieldEntry = pos.entryPrice;
+          } catch (_e) { /* fall back to signal entry */ }
+        }
+
         const pctProfit = bot.direction === 'LONG'
-          ? ((currentPrice - bot.entryPrice) / bot.entryPrice) * 100
-          : ((bot.entryPrice - currentPrice) / bot.entryPrice) * 100;
+          ? ((currentPrice - shieldEntry) / shieldEntry) * 100
+          : ((shieldEntry - currentPrice) / shieldEntry) * 100;
 
         if (pctProfit >= REVAL_PROFIT_SHIELD_PCT) {
           log(`🛡️ Profit shield: ${bot.botName} is ${pctProfit.toFixed(2)}% in profit (≥ ${REVAL_PROFIT_SHIELD_PCT}%) — overriding reval failure. Original reason: ${result.reason}`);
@@ -1179,19 +1192,39 @@ async function runRevalidation() {
         }
       }
 
-      // v2.3.0: Price drawdown check — catch fast moves that 4H EMAs miss
+      // v3.4.0: Price drawdown check — catch fast moves that 4H EMAs miss
+      // Uses DCA-averaged entry price from Gainium when available (accounts for safety order fills)
       if (result.allowed && bot.entryPrice && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
-        const pctMove = ((currentPrice - bot.entryPrice) / bot.entryPrice) * 100;
+
+        // Try to get DCA-averaged entry price from Gainium open deals
+        let effectiveEntry = bot.entryPrice;
+        if (gainiumApi.isConfigured()) {
+          try {
+            const posMap = await gainiumApi.getExchangePositionMap();
+            const base = bot.pair.replace('USDT', '').replace('/USDT', '');
+            const pos = posMap.get(base);
+            if (pos && pos.entryPrice > 0) {
+              effectiveEntry = pos.entryPrice;
+              if (effectiveEntry !== bot.entryPrice) {
+                log(`🔄 Reval: ${bot.botName} using DCA avgPrice $${effectiveEntry.toFixed(2)} (signal entry was $${bot.entryPrice.toFixed(2)})`);
+              }
+            }
+          } catch (e) {
+            log(`🔄 Reval: ${bot.botName} failed to get DCA avgPrice, using signal entry: ${e.message}`);
+          }
+        }
+
+        const pctMove = ((currentPrice - effectiveEntry) / effectiveEntry) * 100;
         const drawdown = bot.direction === 'LONG' ? -pctMove : pctMove; // positive = bad
 
         if (drawdown > REVAL_MAX_DRAWDOWN_PCT) {
-          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${bot.entryPrice.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max)`;
+          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max)`;
           log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
           result.allowed = false;
           result.reason = reason;
         } else {
-          log(`🔄 Reval price check: ${bot.botName} @ $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% from entry) — within ${REVAL_MAX_DRAWDOWN_PCT}% limit`);
+          log(`🔄 Reval price check: ${bot.botName} @ $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% from entry $${effectiveEntry.toFixed(2)}) — within ${REVAL_MAX_DRAWDOWN_PCT}% limit`);
         }
       }
 
@@ -1751,7 +1784,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.3.3`,
+      `Version: v3.4.0`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -2012,7 +2045,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.3.3 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.4.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);

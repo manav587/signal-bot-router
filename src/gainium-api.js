@@ -341,7 +341,7 @@ async function closeDealsViaApi(botMongoId, botName) {
       const dealId = deal._id;
       // POST to /api/deals/{dealId}/manage with close action
       const endpoint = `/api/deals/${dealId}/manage`;
-      const body = JSON.stringify({ action: 'close', closeType: 'cancel', dealType: 'dca' });
+      const body = JSON.stringify({ action: 'close', closeType: 'closeByMarket', dealType: 'dca' }); // v3.4.0: was 'cancel' — must use 'closeByMarket' to actually close the Binance position
       const method = 'POST';
       const url = `${BASE_URL}${endpoint}`;
       const headers = authHeaders(method, endpoint, body);
