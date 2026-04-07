@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.8.2';
+const VERSION = '3.8.3';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1732,7 +1732,60 @@ async function runSelfHeal() {
   selfHealRunning = true;
 
   try {
-    // Skip if all pairs have active bots (common case — fast exit)
+    // Single API call to get all bot statuses — needed by both phases
+    const botStatuses = await gainiumApi.getAllBotStatuses();
+    if (!botStatuses) {
+      log(`🩺 Self-heal: API call failed — skipping this cycle`);
+      selfHealRunning = false;
+      return;
+    }
+
+    // ── Phase 1: Orphaned Deal Scan (v3.8.3) ───────────────────────────
+    // Check ALL pairs for deals that exist on Gainium but aren't tracked
+    // in ACTIVE_BOTS. This catches the critical scenario where a flip
+    // started the new direction but the old deal didn't close — the pair
+    // has an active bot (new direction) so it's not "orphaned", but the
+    // old deal bleeds unmonitored.
+    // This phase runs EVERY cycle, regardless of whether pairs are orphaned.
+    for (const pair of SELF_HEAL_PAIRS) {
+      const longBot = findBot(pair, 'LONG');
+      const shortBot = findBot(pair, 'SHORT');
+      if (!longBot || !shortBot) continue;
+
+      const longStatus = botStatuses.get(longBot.uuid);
+      const shortStatus = botStatuses.get(shortBot.uuid);
+      if (!longStatus || !shortStatus) continue;
+
+      for (const [bot, bStatus, dir] of [
+        [longBot, longStatus, 'LONG'],
+        [shortBot, shortStatus, 'SHORT'],
+      ]) {
+        if (bStatus.deals.active > 0 && !ACTIVE_BOTS[bot.uuid]) {
+          ACTIVE_BOTS[bot.uuid] = {
+            pair,
+            direction: dir,
+            botName: bot.name,
+            // Backdate startedAt so reval's grace period doesn't delay monitoring
+            startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+            entryPrice: null, // will be fetched by reval's getExchangePositionMap
+            origin: 'self-heal-retrack',
+          };
+          LAST_ACTIVE[pair] = Date.now();
+          LAST_DIRECTION[pair] = dir;
+          log(`🩺 Self-heal: RE-TRACKED ${bot.name} (${dir}) — deal active but not monitored. Now under reval + drawdown protection.`);
+          sendTelegramAlert(
+            `🚨 Orphaned deal re-tracked: ${bot.name}\n\n` +
+            `Found a ${dir} deal still open on Gainium/Binance but NOT being monitored by the relay. ` +
+            `This can happen when a direction flip fails to close the old deal.\n\n` +
+            `The relay is now monitoring this position with full revalidation + drawdown protection.\n\n` +
+            `${istTimestamp()}`
+          ).catch(() => {});
+        }
+      }
+    }
+
+    // ── Phase 2: Orphaned Pair Recovery ─────────────────────────────────
+    // Check pairs with NO active bot — either re-enter or detect stale state.
     const activePairs = new Set(Object.values(ACTIVE_BOTS).map(b => b.pair));
     const orphanedPairs = SELF_HEAL_PAIRS.filter(p => !activePairs.has(p));
     if (orphanedPairs.length === 0) {
@@ -1741,14 +1794,6 @@ async function runSelfHeal() {
     }
 
     log(`🩺 Self-heal: checking ${orphanedPairs.length} pair(s) with no active bot: ${orphanedPairs.join(', ')}`);
-
-    // Single API call to get all bot statuses
-    const botStatuses = await gainiumApi.getAllBotStatuses();
-    if (!botStatuses) {
-      log(`🩺 Self-heal: API call failed — skipping this cycle`);
-      selfHealRunning = false;
-      return;
-    }
 
     for (const pair of orphanedPairs) {
       try {
@@ -1813,39 +1858,9 @@ async function runSelfHeal() {
         const shortIdle = (shortStatus.status === 'closed' && shortStatus.deals.active === 0);
 
         if (!longIdle || !shortIdle) {
-          // At least one bot has an active deal
+          // Phase 1 already handled re-tracking — just log and move on
           if (longStatus.deals.active > 0 || shortStatus.deals.active > 0) {
-            log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active})`);
-
-            // v3.5.0: Re-track orphaned deals in ACTIVE_BOTS for revalidation protection.
-            // If a bot is "closed" but has active deals, the relay stopped the bot but
-            // the deal stayed open on Binance. Without tracking, these deals get zero
-            // revalidation/drawdown protection. This was the root cause of overnight bleeding.
-            for (const [bot, bStatus, dir] of [
-              [longBot, longStatus, 'LONG'],
-              [shortBot, shortStatus, 'SHORT'],
-            ]) {
-              if (bStatus.deals.active > 0 && !ACTIVE_BOTS[bot.uuid]) {
-                ACTIVE_BOTS[bot.uuid] = {
-                  pair,
-                  direction: dir,
-                  botName: bot.name,
-                  // Backdate startedAt so reval's 3-min grace period doesn't delay monitoring
-                  startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
-                  entryPrice: null, // will be fetched by reval's getExchangePositionMap
-                  origin: 'self-heal-retrack',
-                };
-                LAST_ACTIVE[pair] = Date.now();
-                LAST_DIRECTION[pair] = dir;
-                log(`🩺 Self-heal: RE-TRACKED ${bot.name} (${dir}) — closed bot with active deal now monitored by revalidation`);
-                sendTelegramAlert(
-                  `🩺 Orphaned deal re-tracked: ${bot.name}\n\n` +
-                  `Found a ${dir} deal still open on Binance but the bot was stopped and untracked. ` +
-                  `The relay is now monitoring this position with full revalidation + drawdown protection.\n\n` +
-                  `${istTimestamp()}`
-                ).catch(() => {});
-              }
-            }
+            log(`🩺 Self-heal: ${pair} — deal still running (L:${longStatus.deals.active} S:${shortStatus.deals.active}) — Phase 1 handles monitoring`);
           }
           continue;
         }
