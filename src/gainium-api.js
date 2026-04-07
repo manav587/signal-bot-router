@@ -251,8 +251,8 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
   }
 
   // v3.2.8: REST API fallback — webhook closeAllDeals stalled, try individual deal close
-  log(`[${botName}] ⚠ Webhook closeAllDeals stalled — attempting REST API close...`);
-  const restResult = await closeDealsViaApi(botMongoId, botName);
+  log(`[${botName}] ⚠ Webhook closeAllDeals stalled — attempting REST API close (closeByMarket)...`);
+  const restResult = await closeDealsViaApi(botMongoId, botName, 'closeByMarket');
   if (restResult.closed > 0) {
     totalForceClosed += restResult.closed;
     log(`[${botName}] REST fallback closed ${restResult.closed} deal(s) — waiting 5s for Binance...`);
@@ -265,7 +265,25 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
     }
   }
 
-  const msg = `CRITICAL: ${botName} still has ${finalDeals ? finalDeals.active : '?'} active deal(s) after ${maxRetries} webhook + REST API attempts`;
+  // v3.5.2: Ghost deal fallback — if closeByMarket can't clear the deal, it's likely
+  // a stale Gainium record with no matching Binance position (e.g. user closed manually
+  // on Binance). Use 'cancel' to remove the deal record from Gainium without trying
+  // to execute on the exchange. This breaks the ghost deal recovery loop.
+  log(`[${botName}] ⚠ closeByMarket failed — trying 'cancel' to clear possible ghost deal...`);
+  const cancelResult = await closeDealsViaApi(botMongoId, botName, 'cancel');
+  if (cancelResult.closed > 0) {
+    totalForceClosed += cancelResult.closed;
+    log(`[${botName}] Cancel fallback cleared ${cancelResult.closed} deal(s) — waiting 3s...`);
+    await new Promise(r => setTimeout(r, 3000));
+
+    finalDeals = await getBotDealsWithBackoff(botUuid, botName);
+    if (finalDeals && finalDeals.active === 0) {
+      log(`[${botName}] ✅ Confirmed flat after cancel fallback (ghost deal cleared) — deals.active = 0`);
+      return { flat: true, forceClosed: totalForceClosed, error: null };
+    }
+  }
+
+  const msg = `CRITICAL: ${botName} still has ${finalDeals ? finalDeals.active : '?'} active deal(s) after ${maxRetries} webhook + REST API + cancel attempts`;
   log(`[${botName}] ❌ ${msg}`);
   return { flat: false, forceClosed: totalForceClosed, error: msg };
 }
@@ -328,11 +346,11 @@ async function getAllBotStatuses() {
  * @param {string} botName    — Human-readable name (for logging)
  * @returns {{ closed: number, failed: number }}
  */
-async function closeDealsViaApi(botMongoId, botName) {
+async function closeDealsViaApi(botMongoId, botName, closeType = 'closeByMarket') {
   try {
     const deals = await listOpenDeals(botMongoId);
     if (!deals || deals.length === 0) {
-      log(`[${botName}] REST close: no open deals found`);
+      log(`[${botName}] REST close (${closeType}): no open deals found`);
       return { closed: 0, failed: 0 };
     }
 
@@ -340,8 +358,10 @@ async function closeDealsViaApi(botMongoId, botName) {
     for (const deal of deals) {
       const dealId = deal._id;
       // POST to /api/deals/{dealId}/manage with close action
+      // v3.4.0: 'closeByMarket' for real positions (closes on Binance)
+      // v3.5.2: 'cancel' fallback for ghost deals (clears stale Gainium record)
       const endpoint = `/api/deals/${dealId}/manage`;
-      const body = JSON.stringify({ action: 'close', closeType: 'closeByMarket', dealType: 'dca' }); // v3.4.0: was 'cancel' — must use 'closeByMarket' to actually close the Binance position
+      const body = JSON.stringify({ action: 'close', closeType, dealType: 'dca' });
       const method = 'POST';
       const url = `${BASE_URL}${endpoint}`;
       const headers = authHeaders(method, endpoint, body);
