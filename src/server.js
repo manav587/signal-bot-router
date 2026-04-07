@@ -4,6 +4,7 @@ const gainiumApi = require('./gainium-api');
 const binanceApi = require('./binance-api');
 const signalGate = require('./signal-gate');
 const fundingStrategy = require('./funding-strategy');
+const tradeJournal = require('./trade-journal');
 
 // Parse both JSON and plain text bodies (TradingView sends text/plain when message has emoji prefix)
 app.use(express.json());
@@ -115,7 +116,7 @@ function markTelegramAlertSent(uuid, alertType) {
 // Key = pair name (e.g. 'SOLUSDT'), Value = 'LONG' | 'SHORT' | null
 const LAST_DIRECTION = {};
 
-// ── Gate Pending Lock (v3.5.5) ─────────────────────────────────────────
+// ── Gate Pending Lock (v3.6.0) ─────────────────────────────────────────
 // Prevents duplicate concurrent gate checks on the same pair.
 // Set when a gate check starts, cleared when it completes (pass or fail).
 // Key = pair name, Value = { direction, timestamp }
@@ -323,7 +324,7 @@ async function runFundingCheck() {
       // Start the target bot
       actions.push({ action: 'startBot', uuid: targetBot.uuid });
 
-      // v3.5.5: Set LAST_DIRECTION after dispatch confirmation (consistent with
+      // v3.6.0: Set LAST_DIRECTION after dispatch confirmation (consistent with
       // webhook handler). Previously set before processActions — if processActions
       // aborted, LAST_DIRECTION was stale until the next signal corrected it.
       recordFlip(pair);
@@ -339,7 +340,7 @@ async function runFundingCheck() {
         origin: 'funding',
       };
       LAST_ACTIVE[pair] = Date.now();
-      // v3.5.5: Don't delete old bot from tracking until processActions confirms
+      // v3.6.0: Don't delete old bot from tracking until processActions confirms
       // the close succeeded — same pattern as the webhook handler fix in v3.5.0.
       const oldFundingUuid = oppositeBot?.uuid;
 
@@ -356,12 +357,15 @@ async function runFundingCheck() {
       const fundingContext = { pair, direction, price: result.data.markPrice?.toFixed(2) };
       processActions(actions, requestId, false, fundingContext).then(pResult => {
         if (pResult?.completed) {
-          // v3.5.5: Set LAST_DIRECTION only after confirmed dispatch
+          // v3.6.0: Set LAST_DIRECTION only after confirmed dispatch
           LAST_DIRECTION[pair] = direction;
+          // v3.6.0: Journal
           if (oldFundingUuid) {
+            tradeJournal.recordExit({ botUuid: oldFundingUuid, exitPrice: result.data.markPrice, exitReason: 'funding-flip' });
             delete ACTIVE_BOTS[oldFundingUuid];
             log(`[${requestId}] [FUNDING] 📋 Removed old bot ${oldFundingUuid.substring(0, 8)} from tracking (close verified)`);
           }
+          tradeJournal.recordEntry({ pair, direction, botName: targetBot.name, botUuid: targetBot.uuid, entryPrice: result.data.markPrice, origin: 'funding', gateData: gateResult.data });
         } else {
           if (oldFundingUuid && ACTIVE_BOTS[oldFundingUuid]) {
             log(`[${requestId}] [FUNDING] ⚠ Close may have failed — keeping ${ACTIVE_BOTS[oldFundingUuid]?.botName} in ACTIVE_BOTS for safety`);
@@ -440,14 +444,14 @@ async function processDeferredQueue() {
 
       if (result && result.completed) {
         log(`[${item.requestId}] ✅ Deferred flip SUCCEEDED for ${item.targetBot.name} on retry ${item.retryCount}`);
-        // v3.5.5: Clean up old bot from ACTIVE_BOTS. The original webhook handler's
+        // v3.6.0: Clean up old bot from ACTIVE_BOTS. The original webhook handler's
         // .then() saw completed=false (abort) and didn't delete. The deferred retry
         // succeeded, so the old bot's deals are now verified closed.
         if (item.targetBot.uuid && ACTIVE_BOTS[item.targetBot.uuid]) {
           log(`[${item.requestId}] 📋 Removing old bot ${item.targetBot.name} from ACTIVE_BOTS (deferred close verified)`);
           delete ACTIVE_BOTS[item.targetBot.uuid];
         }
-        // v3.5.5: Identify the NEW bot from the startBot action (item.targetBot is the OLD bot being closed)
+        // v3.6.0: Identify the NEW bot from the startBot action (item.targetBot is the OLD bot being closed)
         const startAction = item.actions.find(a => a.action === 'startBot');
         const newBotName = startAction ? (BOT_MAP[startAction.uuid]?.name || 'new bot') : 'new bot';
         sendTelegramAlert(
@@ -759,6 +763,8 @@ app.get('/', (req, res) => {
     recoveryLocks: RECOVERY_LOCK,
     gatePending: GATE_PENDING,
     signalGate: signalGate.getConfig(),
+    journal: tradeJournal.getSessionStats(),
+    whaleHealth: tradeJournal.getWhaleWalletStatus(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
     exchangeDataSource: 'gainium',
@@ -1063,7 +1069,7 @@ app.post('/webhook', (req, res) => {
       ).catch(() => {});
       return;
     }
-    // v3.5.5: Gate pending lock — prevent concurrent gate checks for the same pair.
+    // v3.6.0: Gate pending lock — prevent concurrent gate checks for the same pair.
     // Without this, two signals arriving during the async gate window could both
     // pass the duplicate check and dispatch concurrently.
     if (GATE_PENDING[pair]) {
@@ -1100,7 +1106,7 @@ app.post('/webhook', (req, res) => {
       return;
     }
 
-    // v3.5.5: recordFlip moved AFTER gate pass — gated signals should not
+    // v3.6.0: recordFlip moved AFTER gate pass — gated signals should not
     // count toward the circuit breaker threshold. Previously at this location,
     // 3 gated signals in 15 min would trip the breaker with zero actual trades.
   }
@@ -1112,7 +1118,7 @@ app.post('/webhook', (req, res) => {
     const { pair, direction, botName } = signal;
     signalGate.validateSignal(pair, direction).then(gateResult => {
       if (!gateResult.allowed) {
-        // v3.5.5: Clear gate lock — don't set LAST_DIRECTION since we're not dispatching
+        // v3.6.0: Clear gate lock — don't set LAST_DIRECTION since we're not dispatching
         delete GATE_PENDING[pair];
         log(`[${requestId}] 🚫 SIGNAL GATED — ${gateResult.reason}`);
         sendTelegramAlert(
@@ -1127,12 +1133,12 @@ app.post('/webhook', (req, res) => {
       }
 
       // Gate passed — proceed with dispatch
-      // v3.5.5: Set LAST_DIRECTION here (after gate success) instead of before
+      // v3.6.0: Set LAST_DIRECTION here (after gate success) instead of before
       // the async gate check. Prevents race where a second signal during the
       // gate window gets wrongly suppressed as duplicate.
       LAST_DIRECTION[pair] = direction;
       delete GATE_PENDING[pair];
-      // v3.5.5: Record flip AFTER gate pass — only actual dispatches count
+      // v3.6.0: Record flip AFTER gate pass — only actual dispatches count
       // toward circuit breaker. Previously recorded before gate, causing
       // phantom trips on gated signals.
       recordFlip(pair);
@@ -1177,9 +1183,16 @@ app.post('/webhook', (req, res) => {
 
       const tradeContext = { pair, direction, price: gateResult.data.currentPrice?.toFixed(2), isNoOp };
       processActions(actions, requestId, false, tradeContext).then(result => {
-        if (result?.completed && oldBotUuid) {
-          delete ACTIVE_BOTS[oldBotUuid];
-          log(`[${requestId}] 📋 Removed old bot ${oldBotUuid.substring(0, 8)} from tracking (close verified)`);
+        if (result?.completed) {
+          // v3.6.0: Journal — record exit for old bot, entry for new bot
+          if (oldBotUuid) {
+            tradeJournal.recordExit({ botUuid: oldBotUuid, exitPrice: gateResult.data.currentPrice, exitReason: 'signal-flip' });
+            delete ACTIVE_BOTS[oldBotUuid];
+            log(`[${requestId}] 📋 Removed old bot ${oldBotUuid.substring(0, 8)} from tracking (close verified)`);
+          }
+          if (startAction && !isNoOp) {
+            tradeJournal.recordEntry({ pair, direction, botName: signal.botName, botUuid: startAction.uuid, entryPrice: gateResult.data.currentPrice, origin: 'signal', gateData: gateResult.data });
+          }
         } else if (oldBotUuid && ACTIVE_BOTS[oldBotUuid]) {
           log(`[${requestId}] ⚠ Close may have failed — keeping ${ACTIVE_BOTS[oldBotUuid]?.botName} in ACTIVE_BOTS for safety`);
         }
@@ -1235,7 +1248,7 @@ async function runRevalidation() {
     return;
   }
 
-  // v3.5.5: Cache exchange position map once per reval cycle instead of
+  // v3.6.0: Cache exchange position map once per reval cycle instead of
   // calling getExchangePositionMap() per bot (was 8 identical API calls).
   let cachedPosMap = null;
   if (gainiumApi.isConfigured()) {
@@ -1264,7 +1277,7 @@ async function runRevalidation() {
       const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
 
       // v3.5.0: Use DCA-averaged entry price for profit shield + drawdown check.
-      // v3.5.5: Uses cached position map (one API call per cycle, not per bot).
+      // v3.6.0: Uses cached position map (one API call per cycle, not per bot).
       let effectiveEntry = bot.entryPrice;
       if (cachedPosMap && result.data.currentPrice) {
         const base = bot.pair.replace('USDT', '').replace('/USDT', '');
@@ -1276,7 +1289,7 @@ async function runRevalidation() {
           }
         }
       }
-      // v3.5.5: If entry price is still unknown (self-heal retrack, API failure),
+      // v3.6.0: If entry price is still unknown (self-heal retrack, API failure),
       // persist the current spot price as a baseline so drawdown protection
       // activates from this cycle forward. Without this, a retracked bot with
       // null entryPrice has zero drawdown protection until the position map
@@ -1393,6 +1406,7 @@ async function runRevalidation() {
                 } else {
                   // External gates fail — stop bot before ASAP reopens
                   log(`🔄 Re-entry: ${bot.botName} deal closed, external gates FAILED — stopping bot`);
+                  tradeJournal.recordExit({ botUuid: uuid, exitPrice: fullGate.data?.currentPrice || result.data.currentPrice, exitReason: 'gate-stop' });
                   try {
                     await sendAction({ action: 'stopBot', uuid });
                   } catch (stopErr) {
@@ -1501,12 +1515,15 @@ async function runRevalidation() {
 
           if (processResult && processResult.completed) {
             // Close succeeded — safe to remove old bot from tracking
+            // v3.6.0: Journal — record exit reason based on what triggered the reval failure
+            const exitReason = result.reason?.includes('PRICE DRAWDOWN') ? 'drawdown' : 'reval-flip';
+            tradeJournal.recordExit({ botUuid: uuid, exitPrice: result.data.currentPrice, exitReason });
             delete ACTIVE_BOTS[uuid];
 
             // Update tracking based on outcome
             if (flipResult && flipResult.reason === 'pending' && oppositeBot) {
               // Flip succeeded — track the new bot
-              // v3.5.5: Use currentPrice from the reval check already done — no need
+              // v3.6.0: Use currentPrice from the reval check already done — no need
               // for a second validateSignal call (was making redundant API calls for
               // daily candles, 4H candles, spot price, and whale positions).
               ACTIVE_BOTS[oppositeBot.uuid] = {
@@ -1522,6 +1539,7 @@ async function runRevalidation() {
               FLIP_COOLDOWN[bot.pair] = new Date().toISOString();
               recordFlip(bot.pair);
               flipResult = { flipped: true, botName: oppositeBot.name, gateData: result.data || {} };
+              tradeJournal.recordEntry({ pair: bot.pair, direction: oppositeDir, botName: oppositeBot.name, botUuid: oppositeBot.uuid, entryPrice: result.data.currentPrice, origin: 'auto-flip', gateData: result.data });
               log(`🔄 Auto-flip: ${oppositeBot.name} started via verified pipeline (cooldown set)`);
             } else {
               // Close-only succeeded (no flip attempted or gates blocked)
@@ -1781,6 +1799,7 @@ async function runSelfHeal() {
             entryPrice: bestGateResult.data?.currentPrice || null,
             origin: 'self-heal',
           };
+          tradeJournal.recordEntry({ pair, direction: bestDirection, botName: targetBot.name, botUuid: targetBot.uuid, entryPrice: bestGateResult.data?.currentPrice, origin: 'self-heal', gateData: bestGateResult.data });
           LAST_ACTIVE[pair] = Date.now();
           SELF_HEAL_COOLDOWNS[pair] = Date.now();
           LAST_DIRECTION[pair] = bestDirection;
@@ -1820,10 +1839,55 @@ setInterval(runSelfHeal, SELF_HEAL_INTERVAL);
 // Run once on startup after a short delay (catches orphans from redeploys)
 setTimeout(runSelfHeal, 30 * 1000);
 
+// ── Daily P&L Summary (v3.6.0) ─────────────────────────────────────────
+// Sends a daily summary to Telegram at 23:30 IST.
+// Uses setInterval checking every 5 min — simple, no cron dependency.
+let lastDailySummaryDate = null;
+
+function checkDailySummary() {
+  const now = new Date();
+  // Convert to IST
+  const istHour = (now.getUTCHours() + 5 + Math.floor((now.getUTCMinutes() + 30) / 60)) % 24;
+  const istMin = (now.getUTCMinutes() + 30) % 60;
+  const today = tradeJournal.getTodayStats();
+  const todayDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000)).toISOString().split('T')[0];
+
+  // Send between 23:30-23:35 IST, once per day
+  if (istHour === 23 && istMin >= 30 && istMin < 35 && lastDailySummaryDate !== todayDate) {
+    lastDailySummaryDate = todayDate;
+    const summary = tradeJournal.formatDailySummary();
+    sendTelegramAlert(summary).catch(() => {});
+    log(`📊 Daily P&L summary sent for ${todayDate}`);
+  }
+}
+setInterval(checkDailySummary, 5 * 60 * 1000); // Check every 5 min
+
+// ── Whale Wallet Health Check (v3.6.0) ─────────────────────────────────
+// Runs on the self-heal interval. If a wallet goes stale (7+ days no
+// position on our coins), alert once via Telegram.
+let lastWhaleHealthDate = null;
+
+function checkWhaleHealth() {
+  const alerts = tradeJournal.checkWhaleWalletHealth();
+  if (alerts.length === 0) return;
+
+  const today = new Date().toISOString().split('T')[0];
+  if (lastWhaleHealthDate === today) return; // Once per day
+
+  lastWhaleHealthDate = today;
+  const msg = `🐋 Whale wallet health alert\n\n` +
+    alerts.map(a => `⚠️ ${a.message}`).join('\n') +
+    `\n\nGate 5 may be degraded — these wallets aren't providing data for our coins.\n\n${istTimestamp()}`;
+  sendTelegramAlert(msg).catch(() => {});
+  log(`🐋 Whale wallet staleness alert sent: ${alerts.map(a => a.label).join(', ')}`);
+}
+// Run alongside self-heal (every 5 min)
+setInterval(checkWhaleHealth, SELF_HEAL_INTERVAL);
+
 // ── Telegram Bot Commands (v3.2.8) ──────────────────────────────────────
 // Lets Manav query the system from Telegram on his phone.
 // POST /telegram — receives updates from Telegram webhook.
-// Supported commands: /positions, /status, /bots
+// Supported commands: /positions, /status, /bots, /trades, /journal, /whales
 
 async function handleTelegramCommand(text, chatId) {
   const cmd = (text || '').trim().toLowerCase().split(/\s+/)[0];
@@ -1917,7 +1981,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.5.5`,
+      `Version: v3.6.0`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -1983,9 +2047,39 @@ async function handleTelegramCommand(text, chatId) {
     }
   }
 
+  if (cmd === '/trades') {
+    return tradeJournal.formatTradesSummary();
+  }
+
+  if (cmd === '/journal') {
+    return tradeJournal.formatJournalSummary();
+  }
+
+  if (cmd === '/whales') {
+    const status = tradeJournal.getWhaleWalletStatus();
+    if (typeof status === 'object' && !Array.isArray(status)) {
+      return `🐋 <b>Whale Wallets</b>\n\n${status.status}\n\n${istTimestamp()} IST`;
+    }
+    let lines = ['🐋 <b>Whale Wallet Health</b>\n'];
+    for (const w of status) {
+      const icon = w.stale ? '⚠️' : '✅';
+      lines.push(`${icon} ${w.label}: ${w.lastCoin} ${w.lastDirection} — seen ${w.lastSeen}${w.stale ? ' (STALE)' : ''}`);
+    }
+    const alerts = tradeJournal.checkWhaleWalletHealth();
+    if (alerts.length > 0) {
+      lines.push('\n⚠️ <b>Stale Alerts:</b>');
+      for (const a of alerts) lines.push(`  ${a.message}`);
+    }
+    lines.push(`\n${istTimestamp()} IST`);
+    return lines.join('\n');
+  }
+
   // Unknown command — show help
   return '🤖 <b>Sentinel Commands</b>\n\n' +
     '/positions — Current open deals with P&L\n' +
+    '/trades — Open trades + today\'s closed\n' +
+    '/journal — Full session stats + win rate\n' +
+    '/whales — Whale wallet health status\n' +
     '/status — System health & uptime\n' +
     '/bots — Bot overview (active/stopped)\n' +
     '/binance — Binance API diagnostic';
@@ -2139,7 +2233,7 @@ async function recoverActiveState() {
       recovered.push(`${botInfo.name} (${direction}, entry ${priceStr}${pnlStr})`);
     }
 
-    // v3.5.5: Detect conflicting positions — both Long and Short active on same pair.
+    // v3.6.0: Detect conflicting positions — both Long and Short active on same pair.
     // This is a position conflict that should never happen normally. Alert immediately.
     const recoveredPairs = {};
     for (const [uuid, botInfo] of Object.entries(ACTIVE_BOTS)) {
@@ -2205,7 +2299,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.5.5 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.6.0 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);

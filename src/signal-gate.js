@@ -18,6 +18,7 @@
 
 const { EMA, RSI } = require('trading-signals');
 const binanceApi = require('./binance-api');
+const tradeJournal = require('./trade-journal');
 
 // ── Configuration ─────────────────────────────────────────────────────────
 // These thresholds can be tuned without touching TradingView.
@@ -107,6 +108,20 @@ const CONFIG = {
     { name: 'Bybit', type: 'bybit', baseUrl: 'https://api.bybit.com' },
   ],
   fetchTimeout: 5000,      // 5s timeout per API call
+
+  // v3.6.0: ATR volatility filter (Gate 6 — ADVISORY)
+  // Average True Range on 4H timeframe. When ATR is below threshold,
+  // the market is range-bound and EMA crossovers are noise.
+  // Advisory first — collecting data to determine optimal thresholds.
+  atr: {
+    period: 14,
+    timeframe: '4h',       // Same candles as EMA 9/21 — no extra API call
+    // Minimum ATR as % of price. Below this = low volatility, crossovers unreliable.
+    // BTC: 1.5% of ~$80k = $1,200 range per 4H candle — reasonable threshold.
+    // ALTs (SOL/ETH/XRP) naturally have higher ATR% so this mainly catches BTC chop.
+    minAtrPct: 1.0,
+    mode: 'advisory',      // 'advisory' (log only) or 'blocking'
+  },
 };
 
 // ── Pair name mapping ────────────────────────────────────────────────────
@@ -476,6 +491,35 @@ function calculateRSI(closes, period) {
 }
 
 /**
+ * Calculate ATR (Average True Range) for a series of candles (v3.6.0).
+ * True Range = max(high-low, |high-prevClose|, |low-prevClose|)
+ * ATR = EMA of True Range over N periods.
+ *
+ * @param {Array<{high, low, close}>} candles - OHLC candle array (oldest first)
+ * @param {number} period - ATR period (default 14)
+ * @returns {number|null} - current ATR value, or null if not enough data
+ */
+function calculateATR(candles, period) {
+  if (candles.length < period + 1) return null;
+
+  const trueRanges = [];
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1].close;
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    trueRanges.push(tr);
+  }
+
+  // Use EMA for ATR smoothing
+  const ema = new EMA(period);
+  for (const tr of trueRanges) {
+    ema.update(tr);
+  }
+  return ema.isStable ? parseFloat(ema.getResult().toFixed(6)) : null;
+}
+
+/**
  * Validate a crossover signal against trend and momentum filters.
  *
  * @param {string} pair - e.g. 'ETH', 'SOL', 'XRP'
@@ -630,6 +674,11 @@ async function validateSignal(pair, direction) {
     // Single API call fetches positions for ALL tracked wallets
     const whalePositions = await fetchHyperliquidWhalePositions(pair);
 
+    // v3.6.0: Record whale activity for staleness monitoring
+    for (const wp of whalePositions) {
+      tradeJournal.recordWhaleActivity(wp.address, wp.label, wp.coin, wp.direction);
+    }
+
     // Split positions by wallet into tracker 1 and tracker 2
     const wallet1 = hlConfig.wallets[0]; // pension-usdt.eth
     const wallet2 = hlConfig.wallets[1]; // 0x418a
@@ -728,6 +777,33 @@ async function validateSignal(pair, direction) {
       };
     } else {
       data.smartMoney = { status: 'unavailable', mode: 'advisory' };
+    }
+
+    // ── Gate 6: ATR volatility filter (v3.6.0 — ADVISORY) ──────────────
+    // Low ATR = tight range = EMA crossovers are noise.
+    // Uses the 4H candles already fetched (no extra API call).
+    const atr = calculateATR(fourHourCandles, CONFIG.atr.period);
+    if (atr !== null && currentPrice > 0) {
+      const atrPct = (atr / currentPrice) * 100;
+      const wouldBlock = atrPct < CONFIG.atr.minAtrPct;
+      data.gate6Volatility = {
+        atr: parseFloat(atr.toFixed(4)),
+        atrPct: parseFloat(atrPct.toFixed(3)),
+        minAtrPct: CONFIG.atr.minAtrPct,
+        wouldBlock,
+        mode: CONFIG.atr.mode,
+        detail: wouldBlock
+          ? `ATR ${atrPct.toFixed(2)}% < ${CONFIG.atr.minAtrPct}% — low volatility, crossovers may be noise`
+          : `ATR ${atrPct.toFixed(2)}% ≥ ${CONFIG.atr.minAtrPct}% — sufficient volatility`,
+      };
+      // Block if mode is 'blocking' (currently advisory — collecting data)
+      if (wouldBlock && CONFIG.atr.mode === 'blocking') {
+        return {
+          allowed: false,
+          reason: `VOLATILITY FILTER: 4H ATR ${atrPct.toFixed(2)}% < ${CONFIG.atr.minAtrPct}% — market too quiet for reliable crossover signals`,
+          data,
+        };
+      }
     }
 
     // All gates passed
@@ -935,6 +1011,7 @@ function getConfig() {
       tracker2: `Hyperliquid: ${CONFIG.smartMoney.hyperliquid.wallets[1]?.label} (live positions)`,
       logic: 'BLOCK only when both trackers oppose signal direction',
     },
+    volatility: `ATR(${CONFIG.atr.period}) on ${CONFIG.atr.timeframe} — min ${CONFIG.atr.minAtrPct}% (${CONFIG.atr.mode.toUpperCase()})`,
   };
 }
 
