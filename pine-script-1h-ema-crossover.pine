@@ -1,0 +1,38 @@
+// ═══════════════════════════════════════════════════════════════════════
+// Signal Bot Router — 1H EMA 9/21 Crossover Indicator (v3.7.0)
+// ═══════════════════════════════════════════════════════════════════════
+// This indicator generates alerts when EMA 9 crosses above/below EMA 21
+// on the 1-hour timeframe. Alerts fire webhook payloads to the relay at
+// https://signal-bot-router.onrender.com/webhook
+//
+// IMPORTANT: Add this to TradingView as a NEW indicator.
+//            Do NOT overwrite the existing 4H script.
+//            The 4H script should be removed only AFTER this is confirmed working.
+// ═══════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator("Sentinel 1H EMA 9/21 Crossover v3.7.0", overlay=true)
+
+// ── EMA Calculations ─────────────────────────────────────────────────
+ema9  = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+
+// ── Plot EMAs on chart ───────────────────────────────────────────────
+plot(ema9,  "EMA 9",  color=color.new(color.blue, 0),  linewidth=2)
+plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
+
+// ── Crossover Detection ──────────────────────────────────────────────
+bullishCross = ta.crossover(ema9, ema21)   // EMA9 crosses ABOVE EMA21 → LONG
+bearishCross = ta.crossunder(ema9, ema21)  // EMA9 crosses BELOW EMA21 → SHORT
+
+// ── Visual markers on chart ──────────────────────────────────────────
+plotshape(bullishCross, "Bull Cross", shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(bearishCross, "Bear Cross", shape.triangledown, location.abovebar, color.red,   size=size.small)
+
+// ── Alert Conditions ─────────────────────────────────────────────────
+// Each pair needs its own alert. The alert MESSAGE (set in the alert dialog)
+// contains the JSON payload with the correct bot UUIDs.
+// Trigger must be set to "Once Per Bar Close" to prevent repainting.
+
+alertcondition(bullishCross, title="LONG Signal",  message="EMA 9/21 bullish crossover on 1H")
+alertcondition(bearishCross, title="SHORT Signal", message="EMA 9/21 bearish crossover on 1H")

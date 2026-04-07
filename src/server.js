@@ -10,6 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
+const VERSION = '3.7.0';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -155,12 +156,13 @@ function isRecoveryLocked(pair) {
   return true;
 }
 
-// ── Circuit Breaker (v1.9.0) ───────────────────────────────────────────
-// 3 flips (auto-flip OR TradingView-triggered) on the same pair within 15 min
-// = park that pair for 30 min. During park: no auto-flips, no TradingView signals.
+// ── Circuit Breaker (v1.9.0, tightened v3.7.0) ───────────────────────────────────────────
+// v3.7.0: Tightened from 3 to 2 flips. 1H signals generate more crossovers
+// in chop — the circuit breaker needs to be more sensitive to prevent
+// rapid flip-flopping on the faster timeframe.
 // Key = pair name, Value = { flips: [timestamps], parkedUntil: ISO | null }
 const CIRCUIT_BREAKER = {};
-const CB_FLIP_THRESHOLD = 3;
+const CB_FLIP_THRESHOLD = 2;    // v3.7.0: was 3 — tighter for 1H signals
 const CB_WINDOW_MS = 15 * 60 * 1000;   // 15-minute window
 const CB_PARK_MS = 30 * 60 * 1000;     // 30-minute park duration
 
@@ -752,11 +754,11 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.6.3',
+    version: VERSION,
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50 — ADVISORY) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50 — ADVISORY) + Gate 2 (1H EMA 9/21) + Gate 3 (1H RSI 35/65) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -1123,6 +1125,7 @@ app.post('/webhook', (req, res) => {
         log(`[${requestId}] 🚫 SIGNAL GATED — ${gateResult.reason}`);
         sendTelegramAlert(
           `🚫 Trade signal rejected\n\n` +
+          `Signal: 1H EMA 9/21 crossover\n` +
           `TradingView said go ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}, but the safety checks ("signal gate") blocked it.\n\n` +
           `Why: ${gateResult.reason}\n` +
           `RSI(14): ${gateResult.data.rsi14 || '?'} · EMA50: $${gateResult.data.ema50?.toFixed(2) || '?'} (price ${gateResult.data.priceVsEma || '?'})\n\n` +
@@ -1145,8 +1148,9 @@ app.post('/webhook', (req, res) => {
       log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
       const startedBot = botNames.find(n => n !== '?') || '?';
       const telegramSummary = `📨 New trade opening\n\n` +
+        `Signal: 1H EMA 9/21 crossover\n` +
         `TradingView crossover alert → going ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}.\n\n` +
-        `✅ 4H trend: ${gateResult.data.shortTermTrend || '?'} (EMA9 vs EMA21 — the short-term moving averages agree)\n` +
+        `✅ 1H trend: ${gateResult.data.shortTermTrend || '?'} (EMA9 vs EMA21 — the short-term moving averages agree)\n` +
         `✅ RSI(14): ${gateResult.data.rsi14 || '?'} ${gateResult.data.rsiDirection || ''} (momentum indicator is in range)\n` +
         `✅ Price is ${gateResult.data.priceVsEma || '?'} the 50-period EMA ($${gateResult.data.ema50?.toFixed(2) || '?'})\n\n` +
         `Bot: ${botNames.join(', ')}\n` +
@@ -1206,6 +1210,7 @@ app.post('/webhook', (req, res) => {
       log(`[${requestId}] 🚫 Gate error (BLOCKED — fail-closed): ${err.message}`);
       sendTelegramAlert(
         `🚫 Signal blocked — gate error\n\n` +
+        `Signal: 1H EMA 9/21 crossover\n` +
         `TradingView sent ${direction} on ${pair}, but the safety gate couldn't run: ${err.message}\n\n` +
         `Signal was NOT executed. Will wait for next signal when data is available.\n\n` +
         `${istTimestamp()}`
@@ -1227,7 +1232,7 @@ app.post('/webhook', (req, res) => {
 });
 
 // ── Periodic Re-validation (v1.7.1) ─────────────────────────────────────
-// Every 2 minutes, re-check all running bots against Gate 2 (4H EMA 9/21)
+// Every 2 minutes, re-check all running bots against Gate 2 (1H EMA 9/21)
 // and Gate 4 (RSI direction). If conditions have changed, stop the bot.
 // FAIL-CLOSED: If data fetch fails, stop the bot.
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
@@ -1246,7 +1251,7 @@ const REVAL_PROFIT_SHIELD_PCT = 2.0;   // Skip flip if deal is > 2% in profit
 // Binance data showed the opposite: reval wasn't cutting ANYTHING. Positions sat
 // underwater 10-30 hours with no intervention. 5 min = enough for Gainium deal
 // creation + first safety order, then full reval protection kicks in.
-const REVAL_GRACE_PERIOD_MS = 5 * 60 * 1000; // 5 minutes
+const REVAL_GRACE_PERIOD_MS = 20 * 60 * 1000; // 20 minutes (v3.7.0: was 5min) // 5 minutes
 // v3.6.2: Time-based stop — close positions that have been underwater too long.
 // The ETH SHORT sat losing for 30 hours because EMAs still "supported" it.
 // If a position is in drawdown for > this duration, close it regardless of what
@@ -1428,8 +1433,9 @@ async function runRevalidation() {
                     markTelegramAlertSent(uuid, 'gated-reentry');
                     sendTelegramAlert(
                       `🔄 Deal closed — re-entering\n\n` +
+                      `Signal: 1H EMA 9/21\n` +
                       `${bot.botName} took profit or hit stop loss. The market still supports a ${bot.direction} on ${bot.pair}:\n\n` +
-                      `• 4H EMAs (9 vs 21): ${fullGate.data.shortTermTrend || '?'} — moving averages still aligned\n` +
+                      `• 1H EMAs (9 vs 21): ${fullGate.data.shortTermTrend || '?'} — moving averages still aligned\n` +
                       `• RSI(14): ${fullGate.data.rsi14 || '?'} — momentum in range\n` +
                       `• Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n\n` +
                       `A new deal will open automatically after the 5-minute cooldown.\n\n` +
@@ -1560,7 +1566,7 @@ async function runRevalidation() {
               // Flip succeeded — track the new bot
               // v3.6.0: Use currentPrice from the reval check already done — no need
               // for a second validateSignal call (was making redundant API calls for
-              // daily candles, 4H candles, spot price, and whale positions).
+              // daily candles, 1H candles, spot price, and whale positions).
               ACTIVE_BOTS[oppositeBot.uuid] = {
                 pair: bot.pair,
                 direction: oppositeDir,
@@ -1613,24 +1619,27 @@ async function runRevalidation() {
         let alertMsg;
         if (isDrawdown) {
           alertMsg = `🛑 ${bot.botName} closed — price moved against us\n\n` +
+            `Signal: 1H EMA 9/21 | Reval check\n` +
             `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit = ~${(REVAL_MAX_DRAWDOWN_PCT * 5).toFixed(0)}% ROI at 5x), so the deal was closed to cut losses.\n\n` +
-            `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
+            `1H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else if (isTimeStop) {
           alertMsg = `⏰ ${bot.botName} closed — underwater too long\n\n` +
+            `Signal: 1H EMA 9/21 | Time stop\n` +
             `This ${bot.direction} has been losing for over ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)} hours. The entry thesis is no longer valid.\n\n` +
             `${result.reason}\n\n` +
-            `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
+            `1H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else {
           alertMsg = `🛑 ${bot.botName} closed — market structure changed\n\n` +
-            `The 4H checks ("revalidation") found the market no longer supports this ${bot.direction}:\n` +
+            `Signal: 1H EMA 9/21 | Reval check\n` +
+            `The 1H checks ("revalidation") found the market no longer supports this ${bot.direction}:\n` +
             `${result.reason}\n\n` +
-            `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
+            `1H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         }
 
         if (flipResult && flipResult.flipped) {
           alertMsg += `\n\n↔️ Auto-flipped to ${flipResult.botName} (verified)\n` +
             `The opposite direction passed all checks and the old position was verified closed before starting.\n` +
-            `4H trend: ${flipResult.gateData?.shortTermTrend || '?'} · RSI(14): ${flipResult.gateData?.rsi14 || '?'} ${flipResult.gateData?.rsiDirection || ''}`;
+            `1H trend: ${flipResult.gateData?.shortTermTrend || '?'} · RSI(14): ${flipResult.gateData?.rsi14 || '?'} ${flipResult.gateData?.rsiDirection || ''}`;
         } else if (flipResult) {
           alertMsg += `\n\n⏸️ Didn't flip to the other direction: ${flipResult.reason}`;
         }
@@ -1816,7 +1825,7 @@ async function runSelfHeal() {
             markTelegramAlertSent(pair, 'self-heal-blocked');
             sendTelegramAlert(
               `🩺 Self-heal: ${pair} idle but no clear direction\n\n` +
-              `Both ${pair} bots are stopped with no deals. The system checked if it should re-enter, but neither LONG nor SHORT passed the 4H signal gate checks.\n\n` +
+              `Both ${pair} bots are stopped with no deals. The system checked if it should re-enter, but neither LONG nor SHORT passed the 1H signal gate checks.\n\n` +
               `Will keep checking every 5 minutes until a clear direction emerges, or the next TradingView signal arrives.\n\n` +
               `${istTimestamp()}`
             ).catch(() => {});
@@ -1849,7 +1858,7 @@ async function runSelfHeal() {
           sendTelegramAlert(
             `🩺 Self-heal: ${targetBot.name} restarted\n\n` +
             `Both ${pair} bots were stopped with no active deals (orphaned pair). The system detected this and confirmed ${bestDirection} is the correct direction:\n\n` +
-            `• 4H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
+            `• 1H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
             `• RSI(14): ${bestGateResult.data?.rsi14 || '?'} ${bestGateResult.data?.rsiDirection || ''}\n` +
             `• Price: $${bestGateResult.data?.currentPrice?.toFixed(2) || '?'}\n\n` +
             `A new deal will open automatically via ASAP start.\n\n` +
@@ -2022,7 +2031,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.6.2`,
+      `Version: v${VERSION}`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -2340,13 +2349,14 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.6.3 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v${VERSION} listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
+  log(`   Signal timeframe: 1H (v3.7.0 — migrated from 4H for faster entries)`);
   log(`   Gate 1 (Daily EMA50): ADVISORY (demoted v3.6.3 — logged, not blocking)`);
   log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_MAX_DRAWDOWN_PCT}% drawdown limit, ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h max underwater, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);

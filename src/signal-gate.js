@@ -30,11 +30,11 @@ const CONFIG = {
     candlesNeeded: 60,     // Need 60 daily candles to stabilize a 50-period EMA
   },
 
-  // 4H EMA 9/21 short-term trend filter — must agree with daily trend
+  // 1H EMA 9/21 short-term trend filter (v3.7.0: migrated from 4H) — must agree with daily trend
   shortTermEma: {
     fast: 9,
     slow: 21,
-    timeframe: '4h',
+    timeframe: '1h',
     candlesNeeded: 30,     // Need 30 candles to stabilize a 21-period EMA
     // v3.2.3: Minimum percentage spread between EMA9 and EMA21 before
     // revalidation considers the cross "real". Prevents micro-crosses
@@ -46,10 +46,10 @@ const CONFIG = {
   // RSI momentum confirmation (4h timeframe — same as crossover chart)
   rsi: {
     period: 14,
-    timeframe: '4h',
+    timeframe: '1h',
     candlesNeeded: 20,     // Need 20 candles to stabilize a 14-period RSI
-    longMinimum: 30,       // Only go LONG if RSI > 30 (widened from 40)
-    shortMaximum: 70,      // Only go SHORT if RSI < 70 (widened from 60)
+    longMinimum: 35,       // v3.7.0: was 30 — tightened for 1H noise       // Only go LONG if RSI > 30 (widened from 40)
+    shortMaximum: 65,      // v3.7.0: was 70 — tightened for 1H noise      // Only go SHORT if RSI < 70 (widened from 60)
     slopeCandles: 3,       // Compare RSI now vs N candles ago for direction
   },
 
@@ -110,16 +110,16 @@ const CONFIG = {
   fetchTimeout: 5000,      // 5s timeout per API call
 
   // v3.6.0: ATR volatility filter (Gate 6 — ADVISORY)
-  // Average True Range on 4H timeframe. When ATR is below threshold,
+  // Average True Range on 1H timeframe. When ATR is below threshold,
   // the market is range-bound and EMA crossovers are noise.
   // Advisory first — collecting data to determine optimal thresholds.
   atr: {
     period: 14,
-    timeframe: '4h',       // Same candles as EMA 9/21 — no extra API call
+    timeframe: '1h',       // Same candles as EMA 9/21 — no extra API call
     // Minimum ATR as % of price. Below this = low volatility, crossovers unreliable.
-    // BTC: 1.5% of ~$80k = $1,200 range per 4H candle — reasonable threshold.
+    // BTC: 1.5% of ~$80k = $1,200 range per 1H candle — reasonable threshold.
     // ALTs (SOL/ETH/XRP) naturally have higher ATR% so this mainly catches BTC chop.
-    minAtrPct: 1.0,
+    minAtrPct: 0.5,        // v3.7.0: was 1.0 — 1H ATR naturally lower than 4H
     mode: 'advisory',      // 'advisory' (log only) or 'blocking'
   },
 };
@@ -535,8 +535,8 @@ async function validateSignal(pair, direction) {
   const data = {};
 
   try {
-    // Fetch daily candles, 4h candles, Binance L/S ratio, and Hyperliquid whale positions in parallel
-    // We need more 4h candles now (30) for the 21-period EMA to stabilize
+    // Fetch daily candles, 1h candles, Binance L/S ratio, and Hyperliquid whale positions in parallel
+    // We need more 1h candles now (30) for the 21-period EMA to stabilize
     const [dailyCandles, fourHourCandles, smartMoney] = await Promise.all([
       fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
       fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded),
@@ -556,12 +556,12 @@ async function validateSignal(pair, direction) {
     const spotPrice = await binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null);
     const currentPrice = spotPrice || candleClose;
 
-    // Calculate 4h EMA 9 and EMA 21 (short-term trend)
+    // Calculate 1h EMA 9 and EMA 21 (short-term trend)
     const fourHourCloses = fourHourCandles.map(c => c.close);
     const ema9 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.fast);
     const ema21 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.slow);
 
-    // Calculate 4h RSI(14) — current value
+    // Calculate 1h RSI(14) — current value
     const rsi14 = calculateRSI(fourHourCloses, CONFIG.rsi.period);
 
     // Calculate RSI direction — compare current RSI to N candles ago
@@ -580,8 +580,8 @@ async function validateSignal(pair, direction) {
 
     data.currentPrice = currentPrice;
     data.ema50 = ema50;
-    data.ema9_4h = ema9;
-    data.ema21_4h = ema21;
+    data.ema9_1h = ema9;
+    data.ema21_1h = ema21;
     data.shortTermTrend = (ema9 && ema21) ? (ema9 > ema21 ? 'BULLISH' : 'BEARISH') : 'UNKNOWN';
     data.rsi14 = rsi14;
     data.rsiDirection = rsiDirection;
@@ -592,7 +592,7 @@ async function validateSignal(pair, direction) {
     // Was blocking from v3.4.0–v3.6.2, but in range-bound markets it creates
     // dead zones where BOTH directions are gated (Gate 1 blocks longs while
     // Gate 2 blocks shorts). BTC sat completely frozen for days.
-    // Demoted to advisory — Gate 2 (4H EMA) + Gate 3 (RSI) + Gate 5 (whales)
+    // Demoted to advisory — Gate 2 (1H EMA) + Gate 3 (RSI) + Gate 5 (whales)
     // still provide directional filtering. Gate 1 data is logged for review.
     if (ema50 !== null) {
       const g1WouldBlock =
@@ -607,21 +607,21 @@ async function validateSignal(pair, direction) {
       };
     }
 
-    // ── Gate 2: 4H EMA 9/21 short-term trend filter ──────────────────
+    // ── Gate 2: 1H EMA 9/21 short-term trend filter ──────────────────
     // The short-term trend must agree with the trade direction.
     // This prevents shorting during intraday rallies in a daily bearish trend.
     if (ema9 !== null && ema21 !== null) {
       if (direction === 'LONG' && ema9 < ema21) {
         return {
           allowed: false,
-          reason: `SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} — short-term bearish, LONG rejected`,
+          reason: `SHORT-TERM TREND: 1H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} — short-term bearish, LONG rejected`,
           data,
         };
       }
       if (direction === 'SHORT' && ema9 > ema21) {
         return {
           allowed: false,
-          reason: `SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} — short-term bullish, SHORT rejected`,
+          reason: `SHORT-TERM TREND: 1H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} — short-term bullish, SHORT rejected`,
           data,
         };
       }
@@ -777,7 +777,7 @@ async function validateSignal(pair, direction) {
 
     // ── Gate 6: ATR volatility filter (v3.6.0 — ADVISORY) ──────────────
     // Low ATR = tight range = EMA crossovers are noise.
-    // Uses the 4H candles already fetched (no extra API call).
+    // Uses the 1H candles already fetched (no extra API call).
     const atr = calculateATR(fourHourCandles, CONFIG.atr.period);
     if (atr !== null && currentPrice > 0) {
       const atrPct = (atr / currentPrice) * 100;
@@ -796,7 +796,7 @@ async function validateSignal(pair, direction) {
       if (wouldBlock && CONFIG.atr.mode === 'blocking') {
         return {
           allowed: false,
-          reason: `VOLATILITY FILTER: 4H ATR ${atrPct.toFixed(2)}% < ${CONFIG.atr.minAtrPct}% — market too quiet for reliable crossover signals`,
+          reason: `VOLATILITY FILTER: 1H ATR ${atrPct.toFixed(2)}% < ${CONFIG.atr.minAtrPct}% — market too quiet for reliable crossover signals`,
           data,
         };
       }
@@ -806,7 +806,7 @@ async function validateSignal(pair, direction) {
     const consensusInfo = data.whaleGate.reason || 'no whale data';
     return {
       allowed: true,
-      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, ${consensusInfo}`,
+      reason: `PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50 $${ema50?.toFixed(2) || '?'}, 1H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}, ${consensusInfo}`,
       data,
     };
 
@@ -825,7 +825,7 @@ async function validateSignal(pair, direction) {
 
 /**
  * Re-validation for running bots (v3.5.0).
- * Checks Gate 1 (daily EMA50), Gate 2 (4H EMA 9/21), Gate 3 (RSI level).
+ * Checks Gate 1 (daily EMA50), Gate 2 (1H EMA 9/21), Gate 3 (RSI level).
  * Uses live spot price from Binance, not stale candle closes.
  *
  * FAIL-CLOSED: If data fetch fails, returns allowed=false.
@@ -844,7 +844,7 @@ async function revalidateSignal(pair, direction) {
   const data = {};
 
   try {
-    // v3.5.0: Fetch daily candles (for Gate 1) and 4H candles (for Gate 2+3) in parallel
+    // v3.5.0: Fetch daily candles (for Gate 1) and 1H candles (for Gate 2+3) in parallel
     // Plus live spot price so we're not using stale candle closes
     const [dailyCandles, fourHourCandles, spotPrice] = await Promise.all([
       fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
@@ -855,14 +855,14 @@ async function revalidateSignal(pair, direction) {
     const fourHourCloses = fourHourCandles.map(c => c.close);
     const dailyCloses = dailyCandles.map(c => c.close);
 
-    // v3.5.0: Use live spot price, fall back to 4H candle close
+    // v3.5.0: Use live spot price, fall back to 1H candle close
     const candlePrice = fourHourCloses[fourHourCloses.length - 1];
     const currentPrice = spotPrice || candlePrice;
 
     // Gate 1: Daily EMA50 (v3.5.0 — now checked during revalidation too)
     const ema50 = calculateEMA(dailyCloses, CONFIG.trendEma.period);
 
-    // Gate 2: 4H EMA 9/21 short-term trend
+    // Gate 2: 1H EMA 9/21 short-term trend
     const ema9 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.fast);
     const ema21 = calculateEMA(fourHourCloses, CONFIG.shortTermEma.slow);
 
@@ -894,7 +894,7 @@ async function revalidateSignal(pair, direction) {
     // ── Gate 1 (reval): Daily EMA50 — ADVISORY v3.6.3 ──
     // Demoted from blocking. In range-bound markets, price oscillates around
     // EMA50 constantly — closing positions every time price dips below it
-    // causes premature exits during normal volatility. The 4H EMA cross and
+    // causes premature exits during normal volatility. The 1H EMA cross and
     // RSI still drive reval exits. Gate 1 data is logged for review.
     if (ema50 !== null) {
       const g1WouldFail =
@@ -907,7 +907,7 @@ async function revalidateSignal(pair, direction) {
       };
     }
 
-    // ── Gate 2 (reval): 4H EMA 9/21 ──
+    // ── Gate 2 (reval): 1H EMA 9/21 ──
     // v3.2.3: Require minimum spread before flipping — prevents micro-crosses
     if (ema9 !== null && ema21 !== null) {
       const emaSpreadPct = Math.abs(ema9 - ema21) / ema21 * 100;
@@ -918,14 +918,14 @@ async function revalidateSignal(pair, direction) {
       if (direction === 'LONG' && ema9 < ema21 && emaSpreadPct >= minSpread) {
         return {
           allowed: false,
-          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} (spread ${emaSpreadPct.toFixed(3)}% ≥ ${minSpread}%) — short-term bearish, LONG no longer valid`,
+          reason: `REVALIDATION — SHORT-TERM TREND: 1H EMA9 $${ema9.toFixed(2)} < EMA21 $${ema21.toFixed(2)} (spread ${emaSpreadPct.toFixed(3)}% ≥ ${minSpread}%) — short-term bearish, LONG no longer valid`,
           data,
         };
       }
       if (direction === 'SHORT' && ema9 > ema21 && emaSpreadPct >= minSpread) {
         return {
           allowed: false,
-          reason: `REVALIDATION — SHORT-TERM TREND: 4H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} (spread ${emaSpreadPct.toFixed(3)}% ≥ ${minSpread}%) — short-term bullish, SHORT no longer valid`,
+          reason: `REVALIDATION — SHORT-TERM TREND: 1H EMA9 $${ema9.toFixed(2)} > EMA21 $${ema21.toFixed(2)} (spread ${emaSpreadPct.toFixed(3)}% ≥ ${minSpread}%) — short-term bullish, SHORT no longer valid`,
           data,
         };
       }
@@ -972,7 +972,7 @@ async function revalidateSignal(pair, direction) {
     // All reval gates passed
     return {
       allowed: true,
-      reason: `REVALIDATION PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50, 4H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
+      reason: `REVALIDATION PASSED: Price $${currentPrice.toFixed(2)} ${data.priceVsEma} EMA50, 1H trend ${data.shortTermTrend}, RSI(14) = ${rsi14 || '?'} ${rsiDirection}`,
       data,
     };
 
@@ -992,7 +992,7 @@ async function revalidateSignal(pair, direction) {
 function getConfig() {
   return {
     trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (ADVISORY — demoted v3.6.3, was blocking v3.4.0–v3.6.2)`,
-    shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — must agree with trade direction)`,
+    shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — v3.7.0: migrated from 4H to 1H) (BLOCKING — must agree with trade direction)`,
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,
     smartMoney: `Binance top trader L/S ratio on ${CONFIG.smartMoney.period} (ADVISORY — fallback)`,
