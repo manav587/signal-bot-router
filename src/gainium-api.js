@@ -213,7 +213,7 @@ async function getBotDealsWithBackoff(botUuid, botName, maxAttempts = 4) {
  * @param {number} maxRetries — How many verify-then-close cycles (default 2)
  * @returns {{ flat: boolean, forceClosed: number, error: string|null }}
  */
-async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2) {
+async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 3) {
   let totalForceClosed = 0;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -221,7 +221,23 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
 
     const deals = await getBotDealsWithBackoff(botUuid, botName);
     if (!deals) {
-      return { flat: false, forceClosed: totalForceClosed, error: 'Failed to read bot state from Gainium API (all retries exhausted)' };
+      // v3.8.1: Blind close on API read failure — don't give up, attempt close anyway
+      log(`[${botName}] ⚠ API read failed (attempt ${attempt}) — attempting blind close via webhook...`);
+      const blindClosed = await forceCloseDeals(botUuid);
+      if (blindClosed) {
+        log(`[${botName}] Blind close webhook sent — waiting 12s...`);
+        await new Promise(r => setTimeout(r, 12000));
+        // Try one more read to confirm
+        const retryDeals = await getBotDealsWithBackoff(botUuid, botName);
+        if (retryDeals && retryDeals.active === 0) {
+          log(`[${botName}] ✅ Confirmed flat after blind close — deals.active = 0`);
+          return { flat: true, forceClosed: totalForceClosed + 1, error: null };
+        }
+      }
+      if (attempt === maxRetries) {
+        return { flat: false, forceClosed: totalForceClosed, error: 'Failed to read bot state from Gainium API (all retries exhausted) — blind close attempted' };
+      }
+      continue;
     }
 
     if (deals.active === 0) {
@@ -240,7 +256,7 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
 
     // Wait for Binance to process the close
     log(`[${botName}] Waiting 5s for Binance to settle after force-close...`);
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 10000));
   }
 
   // Final check after all retries (also with backoff)
@@ -255,7 +271,13 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 2)
   const restResult = await closeDealsViaApi(botMongoId, botName, 'closeByMarket');
   if (restResult.closed > 0) {
     totalForceClosed += restResult.closed;
-    log(`[${botName}] REST fallback closed ${restResult.closed} deal(s) — waiting 5s for Binance...`);
+    log(`[${botName}] REST fallback closed ${restResult.closed} deal(s) — waiting 14s for Binance...`);
+    await new Promise(r => setTimeout(r, 14000));
+
+    // v3.8.1: Extra webhook after REST API — ensure bot state is synced
+    log(`[${botName}] Sending extra webhook after REST close to sync bot state...`);
+    const recheck = await forceCloseDeals(botUuid);
+    log(`[${botName}] Extra webhook sent (${recheck ? 'success' : 'failed'}) — waiting 5s...`);
     await new Promise(r => setTimeout(r, 5000));
 
     finalDeals = await getBotDealsWithBackoff(botUuid, botName);

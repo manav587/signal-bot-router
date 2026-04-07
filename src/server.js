@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.8.0';
+const VERSION = '3.8.1';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1284,7 +1284,7 @@ const REVAL_GRACE_PERIOD_MS = 20 * 60 * 1000; // 20 minutes (v3.7.0: was 5min) /
 // The ETH SHORT sat losing for 30 hours because EMAs still "supported" it.
 // If a position is in drawdown for > this duration, close it regardless of what
 // the indicators say. The market has moved on — the entry thesis is dead.
-const REVAL_MAX_UNDERWATER_MS = 4 * 60 * 60 * 1000; // 4 hours max underwater
+const REVAL_MAX_UNDERWATER_MS = 8 * 60 * 60 * 1000; // 8 hours max underwater
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1389,8 +1389,8 @@ async function runRevalidation() {
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
         const pctMove = ((currentPrice - effectiveEntry) / effectiveEntry) * 100;
-        const isUnderwater = (bot.direction === 'LONG' && pctMove < -0.1) ||
-                             (bot.direction === 'SHORT' && pctMove > 0.1);
+        const isUnderwater = (bot.direction === 'LONG' && pctMove < -0.5) ||
+                             (bot.direction === 'SHORT' && pctMove > 0.5);
 
         if (isUnderwater && ageMs > REVAL_MAX_UNDERWATER_MS) {
           const underwaterHours = (ageMs / (60 * 60 * 1000)).toFixed(1);
