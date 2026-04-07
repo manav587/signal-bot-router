@@ -756,7 +756,7 @@ app.get('/', (req, res) => {
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, consecutiveFailures: REVAL_CONSECUTIVE_FAILURES },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -1236,6 +1236,17 @@ const REVAL_MAX_DRAWDOWN_PCT = 4.0;    // v3.4.0: kill bot if price moves 4% aga
 // unless the EMA spread is convincingly wide. If a deal is up > this threshold,
 // the revalidation result is overridden to "allowed" with a log note.
 const REVAL_PROFIT_SHIELD_PCT = 2.0;   // Skip flip if deal is > 2% in profit
+// v3.6.1: Grace period — how long after entry before full reval gates kick in.
+// Was 3 min (just enough for Gainium deal creation). Now 20 min to let the trade
+// thesis develop. DCA safety orders exist to average into pullbacks — reval was
+// killing positions during the exact pullbacks those orders are designed for.
+// The 4% drawdown check still runs during grace period — you're never unprotected.
+const REVAL_GRACE_PERIOD_MS = 20 * 60 * 1000; // 20 minutes
+// v3.6.1: Consecutive reval failures required before acting.
+// A single reval failure no longer kills a trade. The condition must persist
+// across 2 consecutive cycles (4+ minutes) to filter out wicks and brief pullbacks.
+// Mainly helps Gate 1 where spot price oscillates around daily EMA50.
+const REVAL_CONSECUTIVE_FAILURES = 2;
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1263,18 +1274,36 @@ async function runRevalidation() {
     const bot = ACTIVE_BOTS[uuid];
     if (!bot) continue;
 
-    // v3.3.0: Grace period — skip bots started less than 3 minutes ago.
-    // ASAP bots need time for Gainium to create the deal on Binance.
-    // Without this, reval sees deals.active=0 on a just-started bot and
-    // wrongly triggers "deal closed — re-entering" alerts.
+    // v3.6.1: Grace period — skip full gate reval for bots younger than REVAL_GRACE_PERIOD_MS.
+    // Was 3 min (v3.3.0, just for Gainium deal creation). Now 20 min to let the trade
+    // thesis develop. All 6 gates passed at entry — give the DCA strategy room to work
+    // before second-guessing it. The 4% drawdown check still runs during grace period
+    // because if the position falls through to the normal reval flow, the drawdown check
+    // at line ~1358 catches it. We only skip the EMA/RSI gate checks during grace.
     const ageMs = Date.now() - new Date(bot.startedAt).getTime();
-    if (ageMs < 3 * 60 * 1000) {
-      log(`🔄 Reval: skipping ${bot.botName} — started ${Math.round(ageMs / 1000)}s ago (grace period)`);
-      continue;
+    const inGracePeriod = ageMs < REVAL_GRACE_PERIOD_MS;
+    if (inGracePeriod) {
+      log(`🔄 Reval: ${bot.botName} in grace period (${Math.round(ageMs / 1000)}s of ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min) — skipping gate checks, drawdown-only mode`);
     }
 
     try {
-      const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
+      // v3.6.1: During grace period, skip gate checks — only do drawdown monitoring.
+      // After grace, run full revalidation with consecutive failure tracking.
+      let result;
+      if (inGracePeriod) {
+        // Grace mode: fetch spot price only, skip EMA/RSI gates entirely.
+        // The trade thesis was validated at entry — let it develop.
+        const spotPrice = await binanceApi.getSpotPrice(
+          (bot.pair.replace('USDT', '').replace('/USDT', '')) + 'USDT'
+        ).catch(() => null);
+        result = {
+          allowed: true,
+          reason: `GRACE PERIOD: ${Math.round(ageMs / 1000)}s of ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min — gate checks skipped`,
+          data: { currentPrice: spotPrice, spotPrice },
+        };
+      } else {
+        result = await signalGate.revalidateSignal(bot.pair, bot.direction);
+      }
 
       // v3.5.0: Use DCA-averaged entry price for profit shield + drawdown check.
       // v3.6.0: Uses cached position map (one API call per cycle, not per bot).
@@ -1300,6 +1329,28 @@ async function runRevalidation() {
         log(`🔄 Reval: ${bot.botName} no entry price — using spot $${effectiveEntry.toFixed(2)} as baseline for drawdown protection`);
       }
 
+      // v3.6.1: Consecutive failure tracking — a single reval failure no longer
+      // kills a trade. The condition must persist across REVAL_CONSECUTIVE_FAILURES
+      // consecutive cycles. Reset counter on any pass. Drawdown kills bypass this
+      // (they're immediate — no second chances on a 4% move against you).
+      if (!inGracePeriod && !result.allowed) {
+        bot.revalFailCount = (bot.revalFailCount || 0) + 1;
+        if (bot.revalFailCount < REVAL_CONSECUTIVE_FAILURES) {
+          log(`🔄 Reval: ${bot.botName} failed (${bot.revalFailCount}/${REVAL_CONSECUTIVE_FAILURES}) — ${result.reason}. Needs ${REVAL_CONSECUTIVE_FAILURES - bot.revalFailCount} more consecutive failure(s) before acting.`);
+          result.allowed = true;
+          result.reason = `CONSECUTIVE CHECK: Failure ${bot.revalFailCount}/${REVAL_CONSECUTIVE_FAILURES} — waiting for confirmation. Original: ${result.reason}`;
+          result.data.consecutiveFailure = bot.revalFailCount;
+        } else {
+          log(`🔄 Reval: ${bot.botName} failed ${bot.revalFailCount} consecutive times — acting now. Reason: ${result.reason}`);
+        }
+      } else if (!inGracePeriod && result.allowed) {
+        // Reset failure counter on any pass
+        if (bot.revalFailCount > 0) {
+          log(`🔄 Reval: ${bot.botName} passed — resetting failure counter (was ${bot.revalFailCount})`);
+        }
+        bot.revalFailCount = 0;
+      }
+
       // v3.2.3: Profit shield — if the deal is significantly in profit,
       // don't flip on a marginal EMA cross.
       if (!result.allowed && effectiveEntry && result.data.currentPrice) {
@@ -1319,6 +1370,7 @@ async function runRevalidation() {
       }
 
       // v3.4.0: Price drawdown check — catch fast moves that 4H EMAs miss
+      // NOTE: Drawdown kills bypass consecutive failure tracking — they're immediate.
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
 
@@ -1981,7 +2033,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.6.0`,
+      `Version: v3.6.1`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -2299,14 +2351,14 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.6.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.6.1 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
-  log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed)`);
+  log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_CONSECUTIVE_FAILURES} consecutive failures required, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
 
   // v3.2.8: Recover active state BEFORE revalidation or self-heal run

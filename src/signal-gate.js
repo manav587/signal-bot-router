@@ -40,7 +40,7 @@ const CONFIG = {
     // revalidation considers the cross "real". Prevents micro-crosses
     // (e.g. $80.53 vs $80.52 = 0.01%) from flipping profitable positions.
     // Only applies to revalidation — initial entry still uses exact cross.
-    minRevalSpreadPct: 0.15, // 0.15% minimum spread to trigger reval flip
+    minRevalSpreadPct: 0.30, // v3.6.1: 0.30% minimum spread (was 0.15% — too thin, ~$4 on ETH = one wick)
   },
 
   // RSI momentum confirmation (4h timeframe — same as crossover chart)
