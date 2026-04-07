@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.7.1';
+const VERSION = '3.8.0';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -110,6 +110,15 @@ const LAST_ACTIVE = {};
 const SELF_HEAL_COOLDOWNS = {};
 const SELF_HEAL_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (circuit breaker handles real churn)
 const SELF_HEAL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — only recover pairs active within this window
+
+// ── Cold-Start Mode (v3.8.0) ─────────────────────────────────────────────
+// On fresh startup with no active positions, self-heal skips all pairs because
+// LAST_ACTIVE is empty ("never started by this relay instance"). Cold-start mode
+// bypasses that check on the FIRST self-heal run so the system can detect the
+// existing market trend and enter positions without waiting for a TradingView
+// crossover that may have already happened before the alerts were created.
+// Set to true on boot, cleared after the first self-heal cycle completes.
+let COLD_START_MODE = true;
 
 // ── Telegram Alert Cooldown (v3.1.1) ──────────────────────────────────
 // Prevents spamming the same alert type per bot. Tracks last send time.
@@ -1727,15 +1736,23 @@ async function runSelfHeal() {
         // v3.2.8 Guardrail 1: Recent-activity requirement
         // Only recover pairs that were active within the last 6 hours.
         // A pair that's been intentionally flat won't get auto-restarted.
+        // v3.8.0: Cold-start mode bypasses this check — on fresh startup,
+        // no pairs have activity records yet, but we still want to detect
+        // the existing market trend and enter if the gates pass.
         const lastActive = LAST_ACTIVE[pair];
-        if (!lastActive) {
+        if (!lastActive && !COLD_START_MODE) {
           log(`🩺 Self-heal: ${pair} — no activity record (never started by this relay instance) — skipping`);
           continue;
         }
-        const ageMs = Date.now() - lastActive;
-        if (ageMs > SELF_HEAL_MAX_AGE_MS) {
-          log(`🩺 Self-heal: ${pair} — last active ${Math.round(ageMs / 60000)}min ago (>${SELF_HEAL_MAX_AGE_MS / 3600000}h) — too old, skipping`);
-          continue;
+        if (lastActive) {
+          const ageMs = Date.now() - lastActive;
+          if (ageMs > SELF_HEAL_MAX_AGE_MS) {
+            log(`🩺 Self-heal: ${pair} — last active ${Math.round(ageMs / 60000)}min ago (>${SELF_HEAL_MAX_AGE_MS / 3600000}h) — too old, skipping`);
+            continue;
+          }
+        }
+        if (COLD_START_MODE && !lastActive) {
+          log(`🧭 Cold-start: ${pair} — no prior activity, scanning market for existing trend...`);
         }
 
         // v3.2.8 Guardrail 2: Per-pair self-heal cooldown
@@ -1814,8 +1831,9 @@ async function runSelfHeal() {
           continue;
         }
 
-        // Both bots are closed with 0 deals — pair is orphaned
-        log(`🩺 Self-heal: ${pair} ORPHANED — both bots closed, 0 deals. Running signal gate...`);
+        // Both bots are closed with 0 deals — pair is orphaned (or cold start)
+        const scanLabel = (COLD_START_MODE && !lastActive) ? '🧭 Cold-start' : '🩺 Self-heal';
+        log(`${scanLabel}: ${pair} — both bots closed, 0 deals. Running signal gate...`);
 
         // v3.5.0: Prefer the last known direction (if available) — avoids
         // always defaulting to LONG when both directions pass gates.
@@ -1839,12 +1857,14 @@ async function runSelfHeal() {
         }
 
         if (!bestDirection) {
-          log(`🩺 Self-heal: ${pair} — neither direction passes signal gate. Will retry next cycle.`);
-          if (canSendTelegramAlert(pair, 'self-heal-blocked')) {
-            markTelegramAlertSent(pair, 'self-heal-blocked');
+          log(`${scanLabel}: ${pair} — neither direction passes signal gate. Will retry next cycle.`);
+          const alertType = COLD_START_MODE ? 'cold-start-blocked' : 'self-heal-blocked';
+          if (canSendTelegramAlert(pair, alertType)) {
+            markTelegramAlertSent(pair, alertType);
+            const header = COLD_START_MODE ? '🧭 Cold-start scan' : '🩺 Self-heal';
             sendTelegramAlert(
-              `🩺 Self-heal: ${pair} idle but no clear direction\n\n` +
-              `Both ${pair} bots are stopped with no deals. The system checked if it should re-enter, but neither LONG nor SHORT passed the 1H signal gate checks.\n\n` +
+              `${header}: ${pair} — no clear direction\n\n` +
+              `Both ${pair} bots are stopped with no deals. The system checked if it should enter, but neither LONG nor SHORT passed the 1H signal gate checks.\n\n` +
               `Will keep checking every 5 minutes until a clear direction emerges, or the next TradingView signal arrives.\n\n` +
               `${istTimestamp()}`
             ).catch(() => {});
@@ -1852,9 +1872,10 @@ async function runSelfHeal() {
           continue;
         }
 
-        // Found a valid direction — restart the bot
+        // Found a valid direction — start the bot
         const targetBot = bestDirection === 'LONG' ? longBot : shortBot;
-        log(`🩺 Self-heal: ${pair} → starting ${targetBot.name} (${bestDirection})`);
+        const origin = (COLD_START_MODE && !lastActive) ? 'cold-start' : 'self-heal';
+        log(`${scanLabel}: ${pair} → starting ${targetBot.name} (${bestDirection})`);
 
         try {
           await sendAction({ action: 'startBot', uuid: targetBot.uuid });
@@ -1866,17 +1887,19 @@ async function runSelfHeal() {
             botName: targetBot.name,
             startedAt: new Date().toISOString(),
             entryPrice: bestGateResult.data?.currentPrice || null,
-            origin: 'self-heal',
+            origin,
           };
-          tradeJournal.recordEntry({ pair, direction: bestDirection, botName: targetBot.name, botUuid: targetBot.uuid, entryPrice: bestGateResult.data?.currentPrice, origin: 'self-heal', gateData: bestGateResult.data });
+          tradeJournal.recordEntry({ pair, direction: bestDirection, botName: targetBot.name, botUuid: targetBot.uuid, entryPrice: bestGateResult.data?.currentPrice, origin, gateData: bestGateResult.data });
           LAST_ACTIVE[pair] = Date.now();
           SELF_HEAL_COOLDOWNS[pair] = Date.now();
           LAST_DIRECTION[pair] = bestDirection;
 
-          log(`🩺 Self-heal: ✅ ${targetBot.name} restarted successfully`);
+          log(`${scanLabel}: ✅ ${targetBot.name} started successfully`);
+          const header = origin === 'cold-start'
+            ? `🧭 Cold-start: ${targetBot.name} entered\n\nSystem detected an existing ${bestDirection} trend on ${pair} at startup. All 1H signal gates passed — entering position:`
+            : `🩺 Self-heal: ${targetBot.name} restarted\n\nBoth ${pair} bots were stopped with no active deals (orphaned pair). Confirmed ${bestDirection} is the correct direction:`;
           sendTelegramAlert(
-            `🩺 Self-heal: ${targetBot.name} restarted\n\n` +
-            `Both ${pair} bots were stopped with no active deals (orphaned pair). The system detected this and confirmed ${bestDirection} is the correct direction:\n\n` +
+            `${header}\n\n` +
             `• 1H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
             `• RSI(14): ${bestGateResult.data?.rsi14 || '?'} ${bestGateResult.data?.rsiDirection || ''}\n` +
             `• Price: $${bestGateResult.data?.currentPrice?.toFixed(2) || '?'}\n\n` +
@@ -1884,10 +1907,10 @@ async function runSelfHeal() {
             `${istTimestamp()}`
           ).catch(() => {});
         } catch (startErr) {
-          log(`🩺 Self-heal: ❌ startBot failed for ${targetBot.name}: ${startErr.message}`);
+          log(`${scanLabel}: ❌ startBot failed for ${targetBot.name}: ${startErr.message}`);
           sendTelegramAlert(
-            `🩺 Self-heal FAILED: ${targetBot.name}\n\n` +
-            `Tried to restart ${targetBot.name} but the webhook failed: ${startErr.message}\n\n` +
+            `${scanLabel} FAILED: ${targetBot.name}\n\n` +
+            `Tried to start ${targetBot.name} but the webhook failed: ${startErr.message}\n\n` +
             `Will retry next cycle.\n\n` +
             `${istTimestamp()}`
           ).catch(() => {});
@@ -1898,6 +1921,12 @@ async function runSelfHeal() {
     }
   } catch (err) {
     log(`🩺 Self-heal: unexpected error: ${err.message}`);
+  }
+
+  // v3.8.0: Clear cold-start mode after first run
+  if (COLD_START_MODE) {
+    log(`🧭 Cold-start scan complete — switching to normal self-heal mode`);
+    COLD_START_MODE = false;
   }
 
   selfHealRunning = false;
@@ -2376,6 +2405,7 @@ app.listen(PORT, async () => {
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
   log(`   Signal timeframe: 1H (v3.7.0 — migrated from 4H for faster entries)`);
+  log(`   Cold-start scan: ✅ enabled (v3.8.0 — detects existing trends on startup)`);
   log(`   Gate 1 (Daily EMA50): ADVISORY (demoted v3.6.3 — logged, not blocking)`);
   log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_MAX_DRAWDOWN_PCT}% drawdown limit, ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h max underwater, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
