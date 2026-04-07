@@ -1267,9 +1267,11 @@ const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
 // v3.6.2: Drawdown limit — was 4% (set in v3.4.0 for DCA room). But at 5x leverage
 // a 4% price move = 20% ROI loss. Binance position history showed positions bleeding
 // 2.4-3.7% (12-19% ROI) for hours without triggering the hard stop.
-// New limit: 2% price move = 10% ROI loss at 5x. This catches losses earlier
-// while still giving safety orders room to fill (0.3% step × 2 orders = 0.6%).
-const REVAL_MAX_DRAWDOWN_PCT = 2.0;
+// v3.8.2: 2% → 3.5%. At 5x, 3.5% price = 17.5% ROI loss — still disciplined.
+// 2% was too tight — killed positions during normal volatility that later recovered.
+// Copy trader analysis: held through 4.3% adverse and recovered when trend confirmed.
+// Safety orders room: 0.3% step × 2 orders = 0.6%, well within 3.5%.
+const REVAL_MAX_DRAWDOWN_PCT = 3.5;
 // v3.2.3: Profit protection — don't flip a deal that's significantly in profit
 // unless the EMA spread is convincingly wide. If a deal is up > this threshold,
 // the revalidation result is overridden to "allowed" with a log note.
