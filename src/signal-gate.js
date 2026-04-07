@@ -752,14 +752,12 @@ async function validateSignal(pair, direction) {
 }
 
 /**
- * Lightweight re-validation for running bots (v1.7.1).
- * Only checks Gate 2 (4H EMA 9/21) and Gate 4 (RSI direction).
- * Skips daily EMA50 (doesn't change intraday) and RSI level (less actionable).
+ * Re-validation for running bots (v3.5.0).
+ * Checks Gate 1 (daily EMA50), Gate 2 (4H EMA 9/21), Gate 3 (RSI level).
+ * Uses live spot price from Binance, not stale candle closes.
  *
  * FAIL-CLOSED: If data fetch fails, returns allowed=false.
- * This is the opposite of the initial gate (fail-open) because:
- * - Initial gate: deciding whether to START → fail-open (don't miss opportunities)
- * - Re-validation: bot is already RUNNING → fail-closed (stop if we can't verify)
+ * Bot is already RUNNING → fail-closed (stop if we can't verify safety).
  *
  * @param {string} pair - e.g. 'ETH', 'SOL', 'XRP'
  * @param {string} direction - 'LONG' or 'SHORT'

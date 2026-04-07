@@ -583,7 +583,7 @@ async function processActions(actions, requestId, isRetry = false, context = {})
   // After TP/SL, ASAP re-enters after 5-min cooldown (Gainium-side).
   // Relay safety layers prevent churning:
   //   - 5-min cooldown between deals (Gainium-side, longer than 2-min reval)
-  //   - 2-min revalidation with 1.5% drawdown kill (relay-side)
+  //   - 2-min revalidation with 4% drawdown kill (relay-side)
   //   - Bot stopped if external gates fail while deal is closed (pre-re-entry)
 
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
@@ -1241,11 +1241,13 @@ async function runRevalidation() {
               // v3.2.8: Stale deal detection — if Gainium says deal is active but
               // the loss exceeds the -8% SL, Binance likely already closed it.
               // Force-close on Gainium to sync state.
-              if (deals && deals.active > 0 && bot.entryPrice && result.data.currentPrice) {
+              // v3.5.0: Use DCA avgPrice (effectiveEntry) for stale deal detection,
+              // not signal entryPrice which is the daily candle close from signal time
+              if (deals && deals.active > 0 && effectiveEntry && result.data.currentPrice) {
                 const curPrice = result.data.currentPrice;
                 const lossPct = bot.direction === 'LONG'
-                  ? ((curPrice - bot.entryPrice) / bot.entryPrice) * 100
-                  : ((bot.entryPrice - curPrice) / bot.entryPrice) * 100;
+                  ? ((curPrice - effectiveEntry) / effectiveEntry) * 100
+                  : ((effectiveEntry - curPrice) / effectiveEntry) * 100;
 
                 if (lossPct < -8.5) {
                   // Loss exceeds SL — deal should have been closed by Binance
@@ -1256,7 +1258,7 @@ async function runRevalidation() {
                       `🚨 STALE DEAL: ${bot.botName}\n\n` +
                       `Gainium shows an active deal but the loss (${lossPct.toFixed(2)}%) exceeds the -8% stop loss. ` +
                       `Binance likely already closed this position.\n\n` +
-                      `Entry: $${bot.entryPrice.toFixed(2)} | Now: $${curPrice.toFixed(2)}\n\n` +
+                      `Entry: $${effectiveEntry.toFixed(2)} | Now: $${curPrice.toFixed(2)}\n\n` +
                       `Attempting to force-close the stale Gainium deal...\n\n` +
                       `${istTimestamp()}`
                     ).catch(() => {});
@@ -1561,7 +1563,8 @@ async function runSelfHeal() {
         }
 
         // Check circuit breaker
-        const cbCheck = checkCircuitBreaker(pair + 'USDT');
+        // v3.5.0 fix: was pair+'USDT' but recordFlip() uses bare pair name (e.g. 'SOL')
+        const cbCheck = checkCircuitBreaker(pair);
         if (cbCheck.parked) {
           log(`🩺 Self-heal: ${pair} parked by circuit breaker — skipping`);
           continue;
@@ -1606,7 +1609,8 @@ async function runSelfHeal() {
                   pair,
                   direction: dir,
                   botName: bot.name,
-                  startedAt: new Date().toISOString(),
+                  // Backdate startedAt so reval's 3-min grace period doesn't delay monitoring
+                  startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
                   entryPrice: null, // will be fetched by reval's getExchangePositionMap
                   origin: 'self-heal-retrack',
                 };
