@@ -1267,11 +1267,11 @@ const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
 // v3.6.2: Drawdown limit — was 4% (set in v3.4.0 for DCA room). But at 5x leverage
 // a 4% price move = 20% ROI loss. Binance position history showed positions bleeding
 // 2.4-3.7% (12-19% ROI) for hours without triggering the hard stop.
-// v3.8.2: 2% → 3.5%. At 5x, 3.5% price = 17.5% ROI loss — still disciplined.
-// 2% was too tight — killed positions during normal volatility that later recovered.
-// Copy trader analysis: held through 4.3% adverse and recovered when trend confirmed.
-// Safety orders room: 0.3% step × 2 orders = 0.6%, well within 3.5%.
-const REVAL_MAX_DRAWDOWN_PCT = 3.5;
+// v3.8.3: 3.5% → 2.0% for 10x leverage. At 10x, 2% price = 20% ROI loss.
+// Was 3.5% when running 5x (= 17.5% ROI). Now all bots on 10x, so tighten
+// to keep same ~20% ROI pain level. Gainium SL backstop also tightened 8% → 5%.
+// Safety orders room: 0.3% step × 2 orders = 0.6%, well within 2%.
+const REVAL_MAX_DRAWDOWN_PCT = 2.0;
 // v3.2.3: Profit protection — don't flip a deal that's significantly in profit
 // unless the EMA spread is convincingly wide. If a deal is up > this threshold,
 // the revalidation result is overridden to "allowed" with a log note.
@@ -1380,7 +1380,7 @@ async function runRevalidation() {
         const drawdown = bot.direction === 'LONG' ? -pctMove : pctMove; // positive = bad
 
         if (drawdown > REVAL_MAX_DRAWDOWN_PCT) {
-          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max → ~${(drawdown * 5).toFixed(0)}% ROI loss at 5x)`;
+          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max → ~${(drawdown * 10).toFixed(0)}% ROI loss at 10x)`;
           log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
           result.allowed = false;
           result.reason = reason;
@@ -1667,7 +1667,7 @@ async function runRevalidation() {
         if (isDrawdown) {
           alertMsg = `🛑 ${bot.botName} closed — price moved against us\n\n` +
             `Signal: 1H EMA 9/21 | Reval check\n` +
-            `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit = ~${(REVAL_MAX_DRAWDOWN_PCT * 5).toFixed(0)}% ROI at 5x), so the deal was closed to cut losses.\n\n` +
+            `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit = ~${(REVAL_MAX_DRAWDOWN_PCT * 10).toFixed(0)}% ROI at 10x), so the deal was closed to cut losses.\n\n` +
             `1H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else if (isTimeStop) {
           alertMsg = `⏰ ${bot.botName} closed — weak trend + underwater too long\n\n` +
