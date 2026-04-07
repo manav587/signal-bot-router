@@ -115,6 +115,12 @@ function markTelegramAlertSent(uuid, alertType) {
 // Key = pair name (e.g. 'SOLUSDT'), Value = 'LONG' | 'SHORT' | null
 const LAST_DIRECTION = {};
 
+// ── Gate Pending Lock (v3.5.3) ─────────────────────────────────────────
+// Prevents duplicate concurrent gate checks on the same pair.
+// Set when a gate check starts, cleared when it completes (pass or fail).
+// Key = pair name, Value = { direction, timestamp }
+const GATE_PENDING = {};
+
 // ── Flip Cooldown (v1.9.0) ─────────────────────────────────────────────
 // After an auto-flip, block further auto-flips on that pair for 10 minutes.
 // TradingView signals still pass — only relay-initiated auto-flips are throttled.
@@ -332,9 +338,9 @@ async function runFundingCheck() {
         origin: 'funding',
       };
       LAST_ACTIVE[pair] = Date.now();
-      if (oppositeBot) {
-        delete ACTIVE_BOTS[oppositeBot.uuid];
-      }
+      // v3.5.3: Don't delete old bot from tracking until processActions confirms
+      // the close succeeded — same pattern as the webhook handler fix in v3.5.0.
+      const oldFundingUuid = oppositeBot?.uuid;
 
       // Send Telegram notification
       sendTelegramAlert(
@@ -347,7 +353,14 @@ async function runFundingCheck() {
       // Execute through the same pipeline
       log(`[${requestId}] [FUNDING] Dispatching: ${actions.map(a => `${a.action}(${a.uuid.substring(0, 8)})`).join(' → ')}`);
       const fundingContext = { pair, direction, price: result.data.markPrice?.toFixed(2) };
-      processActions(actions, requestId, false, fundingContext).catch(err => {
+      processActions(actions, requestId, false, fundingContext).then(pResult => {
+        if (pResult?.completed && oldFundingUuid) {
+          delete ACTIVE_BOTS[oldFundingUuid];
+          log(`[${requestId}] [FUNDING] 📋 Removed old bot ${oldFundingUuid.substring(0, 8)} from tracking (close verified)`);
+        } else if (oldFundingUuid && ACTIVE_BOTS[oldFundingUuid]) {
+          log(`[${requestId}] [FUNDING] ⚠ Close may have failed — keeping ${ACTIVE_BOTS[oldFundingUuid]?.botName} in ACTIVE_BOTS for safety`);
+        }
+      }).catch(err => {
         log(`[${requestId}] [FUNDING] ❌ Execution error: ${err.message}`);
       });
     }
@@ -718,7 +731,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.5.2',
+    version: '3.5.3',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -727,6 +740,7 @@ app.get('/', (req, res) => {
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
     recoveryLocks: RECOVERY_LOCK,
+    gatePending: GATE_PENDING,
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
@@ -1032,13 +1046,19 @@ app.post('/webhook', (req, res) => {
       ).catch(() => {});
       return;
     }
-    // Valid new direction — update tracking BEFORE dispatch
-    LAST_DIRECTION[pair] = direction;
+    // v3.5.3: Gate pending lock — prevent concurrent gate checks for the same pair.
+    // Without this, two signals arriving during the async gate window could both
+    // pass the duplicate check and dispatch concurrently.
+    if (GATE_PENDING[pair]) {
+      log(`[${requestId}] 🔇 GATE IN PROGRESS — ${pair} already has a ${GATE_PENDING[pair].direction} gate check running. Dropping signal.`);
+      return;
+    }
+    GATE_PENDING[pair] = { direction, timestamp: Date.now() };
     log(`[${requestId}] 📊 Rising-edge: ${pair} direction change → ${direction}`);
 
     // ── v3.5.2: Recovery lock — defer signals to reval during startup ──
     if (isRecoveryLocked(pair)) {
-      delete LAST_DIRECTION[pair];
+      delete GATE_PENDING[pair];
       log(`[${requestId}] 🔒 RECOVERY LOCK — ${pair} was just recovered from restart. Deferring to revalidation for verification.`);
       sendTelegramAlert(
         `🔒 Signal deferred — recovery lock\n\n` +
@@ -1052,8 +1072,7 @@ app.post('/webhook', (req, res) => {
     // ── v1.9.0: Circuit breaker — block parked pairs ──────────────────
     const cbCheck = checkCircuitBreaker(pair);
     if (cbCheck.parked) {
-      // Revert LAST_DIRECTION since we're not dispatching
-      delete LAST_DIRECTION[pair];
+      delete GATE_PENDING[pair];
       log(`[${requestId}] ⚡ CIRCUIT BREAKER — ${pair} is parked: ${cbCheck.reason}`);
       sendTelegramAlert(
         `⚡ Circuit breaker — ${pair} paused\n\n` +
@@ -1075,8 +1094,8 @@ app.post('/webhook', (req, res) => {
     const { pair, direction, botName } = signal;
     signalGate.validateSignal(pair, direction).then(gateResult => {
       if (!gateResult.allowed) {
-        // Revert the LAST_DIRECTION since we're not dispatching
-        delete LAST_DIRECTION[pair];
+        // v3.5.3: Clear gate lock — don't set LAST_DIRECTION since we're not dispatching
+        delete GATE_PENDING[pair];
         log(`[${requestId}] 🚫 SIGNAL GATED — ${gateResult.reason}`);
         sendTelegramAlert(
           `🚫 Trade signal rejected\n\n` +
@@ -1090,6 +1109,11 @@ app.post('/webhook', (req, res) => {
       }
 
       // Gate passed — proceed with dispatch
+      // v3.5.3: Set LAST_DIRECTION here (after gate success) instead of before
+      // the async gate check. Prevents race where a second signal during the
+      // gate window gets wrongly suppressed as duplicate.
+      LAST_DIRECTION[pair] = direction;
+      delete GATE_PENDING[pair];
       log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
       const startedBot = botNames.find(n => n !== '?') || '?';
       const telegramSummary = `📨 New trade opening\n\n` +
@@ -1143,7 +1167,7 @@ app.post('/webhook', (req, res) => {
     }).catch(err => {
       // v3.5.0: FAIL-CLOSED — gate error blocks signal (was fail-open).
       // A Binance API hiccup is not a reason to bypass all 5 safety gates.
-      delete LAST_DIRECTION[pair];
+      delete GATE_PENDING[pair];
       log(`[${requestId}] 🚫 Gate error (BLOCKED — fail-closed): ${err.message}`);
       sendTelegramAlert(
         `🚫 Signal blocked — gate error\n\n` +
@@ -1189,6 +1213,17 @@ async function runRevalidation() {
     return;
   }
 
+  // v3.5.3: Cache exchange position map once per reval cycle instead of
+  // calling getExchangePositionMap() per bot (was 8 identical API calls).
+  let cachedPosMap = null;
+  if (gainiumApi.isConfigured()) {
+    try {
+      cachedPosMap = await gainiumApi.getExchangePositionMap();
+    } catch (e) {
+      log(`🔄 Reval: failed to get exchange position map for cycle: ${e.message}`);
+    }
+  }
+
   for (const uuid of activeUUIDs) {
     const bot = ACTIVE_BOTS[uuid];
     if (!bot) continue;
@@ -1206,22 +1241,17 @@ async function runRevalidation() {
     try {
       const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
 
-      // v3.5.0: Single API call to get DCA-averaged entry price — used by both
-      // profit shield and drawdown check (was two separate calls before).
+      // v3.5.0: Use DCA-averaged entry price for profit shield + drawdown check.
+      // v3.5.3: Uses cached position map (one API call per cycle, not per bot).
       let effectiveEntry = bot.entryPrice;
-      if (gainiumApi.isConfigured() && result.data.currentPrice) {
-        try {
-          const posMap = await gainiumApi.getExchangePositionMap();
-          const base = bot.pair.replace('USDT', '').replace('/USDT', '');
-          const pos = posMap.get(base);
-          if (pos && pos.entryPrice > 0) {
-            effectiveEntry = pos.entryPrice;
-            if (effectiveEntry !== bot.entryPrice) {
-              log(`🔄 Reval: ${bot.botName} using DCA avgPrice $${effectiveEntry.toFixed(2)} (signal entry was $${bot.entryPrice?.toFixed(2) || '?'})`);
-            }
+      if (cachedPosMap && result.data.currentPrice) {
+        const base = bot.pair.replace('USDT', '').replace('/USDT', '');
+        const pos = cachedPosMap.get(base);
+        if (pos && pos.entryPrice > 0) {
+          effectiveEntry = pos.entryPrice;
+          if (effectiveEntry !== bot.entryPrice) {
+            log(`🔄 Reval: ${bot.botName} using DCA avgPrice $${effectiveEntry.toFixed(2)} (signal entry was $${bot.entryPrice?.toFixed(2) || '?'})`);
           }
-        } catch (e) {
-          log(`🔄 Reval: ${bot.botName} failed to get DCA avgPrice, using signal entry: ${e.message}`);
         }
       }
 
@@ -1853,7 +1883,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.5.2`,
+      `Version: v3.5.3`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -2121,7 +2151,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.5.2 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.5.3 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
