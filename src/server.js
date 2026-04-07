@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.7.0';
+const VERSION = '3.7.1';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -41,7 +41,8 @@ async function sendTelegramAlert(message) {
   }
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url, {
+    // Try HTML parse mode first (supports <b>, <i>, etc. in hand-crafted alerts)
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -50,6 +51,24 @@ async function sendTelegramAlert(message) {
         parse_mode: 'HTML',
       }),
     });
+    const body = await res.json().catch(() => ({}));
+    if (!body.ok) {
+      // HTML parse failed (likely unescaped < or > in gate reason strings).
+      // Retry as plain text — lose bold/italic but the message gets delivered.
+      log(`⚠ Telegram HTML send failed (${body.description || res.status}), retrying as plain text`);
+      const res2 = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: message,
+        }),
+      });
+      const body2 = await res2.json().catch(() => ({}));
+      if (!body2.ok) {
+        log(`❌ Telegram plain-text send also failed: ${body2.description || res2.status}`);
+      }
+    }
   } catch (err) {
     log(`Telegram send failed: ${err.message}`);
   }
