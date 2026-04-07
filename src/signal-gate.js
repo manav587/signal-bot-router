@@ -587,28 +587,24 @@ async function validateSignal(pair, direction) {
     data.rsiDirection = rsiDirection;
     data.priceVsEma = ema50 ? (currentPrice > ema50 ? 'ABOVE' : 'BELOW') : 'UNKNOWN';
 
-    // ── Gate 1: Daily 50 EMA trend filter (BLOCKING — promoted v3.4.0) ──
-    // Price must be above daily EMA50 for LONG, below for SHORT.
-    // Previously advisory-only; promoted to blocking after confirmed bad entries
-    // on SOL & XRP where price was well below EMA50 during clear downtrends.
+    // ── Gate 1: Daily 50 EMA trend filter (ADVISORY — demoted v3.6.3) ──
+    // Price vs daily EMA50: logged but not blocking.
+    // Was blocking from v3.4.0–v3.6.2, but in range-bound markets it creates
+    // dead zones where BOTH directions are gated (Gate 1 blocks longs while
+    // Gate 2 blocks shorts). BTC sat completely frozen for days.
+    // Demoted to advisory — Gate 2 (4H EMA) + Gate 3 (RSI) + Gate 5 (whales)
+    // still provide directional filtering. Gate 1 data is logged for review.
     if (ema50 !== null) {
-      const g1Blocked =
+      const g1WouldBlock =
         (direction === 'LONG' && currentPrice < ema50) ||
         (direction === 'SHORT' && currentPrice > ema50);
       data.gate1 = {
-        blocked: g1Blocked,
-        mode: 'blocking',
-        detail: g1Blocked
-          ? `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — BLOCKED ${direction}`
+        wouldBlock: g1WouldBlock,
+        mode: 'advisory',
+        detail: g1WouldBlock
+          ? `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — would have blocked ${direction}`
           : `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — aligned with ${direction}`,
       };
-      if (g1Blocked) {
-        return {
-          allowed: false,
-          reason: `DAILY TREND: Price $${currentPrice.toFixed(2)} ${direction === 'LONG' ? 'below' : 'above'} daily EMA50 $${ema50.toFixed(2)} — ${direction} rejected`,
-          data,
-        };
-      }
     }
 
     // ── Gate 2: 4H EMA 9/21 short-term trend filter ──────────────────
@@ -895,24 +891,20 @@ async function revalidateSignal(pair, direction) {
     data.rsiDirection = rsiDirection;
     data.priceVsEma = ema50 ? (currentPrice > ema50 ? 'ABOVE' : 'BELOW') : 'UNKNOWN';
 
-    // ── Gate 1 (reval): Daily EMA50 — v3.5.0 ──
-    // If price has moved to the wrong side of EMA50 since entry, this position
-    // is fighting the daily trend. Close it.
+    // ── Gate 1 (reval): Daily EMA50 — ADVISORY v3.6.3 ──
+    // Demoted from blocking. In range-bound markets, price oscillates around
+    // EMA50 constantly — closing positions every time price dips below it
+    // causes premature exits during normal volatility. The 4H EMA cross and
+    // RSI still drive reval exits. Gate 1 data is logged for review.
     if (ema50 !== null) {
-      const g1Failed =
+      const g1WouldFail =
         (direction === 'LONG' && currentPrice < ema50) ||
         (direction === 'SHORT' && currentPrice > ema50);
       data.gate1Reval = {
-        failed: g1Failed,
-        detail: `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — ${g1Failed ? 'WRONG SIDE' : 'aligned'}`,
+        wouldFail: g1WouldFail,
+        mode: 'advisory',
+        detail: `Price $${currentPrice.toFixed(2)} vs EMA50 $${ema50.toFixed(2)} — ${g1WouldFail ? 'WRONG SIDE (advisory)' : 'aligned'}`,
       };
-      if (g1Failed) {
-        return {
-          allowed: false,
-          reason: `REVALIDATION — DAILY TREND: Price $${currentPrice.toFixed(2)} ${direction === 'LONG' ? 'below' : 'above'} daily EMA50 $${ema50.toFixed(2)} — ${direction} fighting the trend`,
-          data,
-        };
-      }
     }
 
     // ── Gate 2 (reval): 4H EMA 9/21 ──
@@ -999,7 +991,7 @@ async function revalidateSignal(pair, direction) {
  */
 function getConfig() {
   return {
-    trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (BLOCKING — entry + reval, v3.4.0+)`,
+    trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (ADVISORY — demoted v3.6.3, was blocking v3.4.0–v3.6.2)`,
     shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — must agree with trade direction)`,
     rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,

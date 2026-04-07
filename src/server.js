@@ -752,11 +752,11 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.5.4',
+    version: '3.6.3',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50 — ADVISORY) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -2340,13 +2340,14 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.6.2 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.6.3 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
+  log(`   Gate 1 (Daily EMA50): ADVISORY (demoted v3.6.3 — logged, not blocking)`);
   log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_MAX_DRAWDOWN_PCT}% drawdown limit, ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h max underwater, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
 
