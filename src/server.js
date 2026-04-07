@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.8.1';
+const VERSION = '3.8.2';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1280,11 +1280,16 @@ const REVAL_PROFIT_SHIELD_PCT = 2.0;   // Skip flip if deal is > 2% in profit
 // underwater 10-30 hours with no intervention. 5 min = enough for Gainium deal
 // creation + first safety order, then full reval protection kicks in.
 const REVAL_GRACE_PERIOD_MS = 20 * 60 * 1000; // 20 minutes (v3.7.0: was 5min) // 5 minutes
-// v3.6.2: Time-based stop — close positions that have been underwater too long.
-// The ETH SHORT sat losing for 30 hours because EMAs still "supported" it.
-// If a position is in drawdown for > this duration, close it regardless of what
-// the indicators say. The market has moved on — the entry thesis is dead.
-const REVAL_MAX_UNDERWATER_MS = 8 * 60 * 60 * 1000; // 8 hours max underwater
+// v3.8.2: Trend-aware time stop — learned from copy trader analysis.
+// Old: flat 4h/8h time stop killed ETH SHORT at 0.13% against entry while
+// 1H EMAs still confirmed bearish. Copy trader held 4 days through 4.3% adverse
+// and recovered because the trend was right.
+//
+// New logic: EMA spread determines patience.
+//   Strong trend (spread ≥ 0.5%): NO time stop — trust the trend. 2% drawdown is safety net.
+//   Weak trend (spread < 0.5%):   12h time stop — trend is thin, don't overstay.
+const REVAL_MAX_UNDERWATER_MS = 12 * 60 * 60 * 1000; // 12 hours — only used when trend is weak
+const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1382,22 +1387,34 @@ async function runRevalidation() {
         }
       }
 
-      // v3.6.2: Time-based stop — kill positions that have been underwater too long.
-      // The ETH SHORT sat losing for 30 hours because EMAs still "supported" it.
-      // If price is against you AND you've been open > REVAL_MAX_UNDERWATER_MS, close.
-      // This catches the slow grind that stays under the drawdown % but bleeds for hours.
+      // v3.8.2: Trend-aware time stop — learned from copy trader analysis.
+      // Old: flat time stop killed positions when EMAs still confirmed the direction.
+      // New: if EMA spread is strong (≥ 0.5%), trust the trend — no time stop.
+      // The 2% drawdown hard stop is the real safety net.
+      // Only time-stop when trend is weak (thin EMA spread) AND underwater too long.
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
         const pctMove = ((currentPrice - effectiveEntry) / effectiveEntry) * 100;
-        const isUnderwater = (bot.direction === 'LONG' && pctMove < -0.5) ||
-                             (bot.direction === 'SHORT' && pctMove > 0.5);
+        const isUnderwater = (bot.direction === 'LONG' && pctMove < -REVAL_UNDERWATER_THRESHOLD_PCT) ||
+                             (bot.direction === 'SHORT' && pctMove > REVAL_UNDERWATER_THRESHOLD_PCT);
 
-        if (isUnderwater && ageMs > REVAL_MAX_UNDERWATER_MS) {
+        if (isUnderwater) {
+          const emaSpread = result.data.emaSpreadPct || 0;
+          const strongTrend = emaSpread >= REVAL_STRONG_TREND_SPREAD_PCT;
           const underwaterHours = (ageMs / (60 * 60 * 1000)).toFixed(1);
-          const reason = `TIME STOP: ${bot.direction} underwater for ${underwaterHours}h (max ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h). Entry $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}%). The entry thesis is dead — closing.`;
-          log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
-          result.allowed = false;
-          result.reason = reason;
+
+          if (strongTrend) {
+            // Trend is strong — trust it. Drawdown % is the safety net.
+            log(`🔄 Reval: ${bot.botName} underwater ${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% for ${underwaterHours}h but EMA spread ${emaSpread.toFixed(3)}% ≥ ${REVAL_STRONG_TREND_SPREAD_PCT}% — strong trend, holding`);
+          } else if (ageMs > REVAL_MAX_UNDERWATER_MS) {
+            // Weak trend + underwater too long → close
+            const reason = `TIME STOP: ${bot.direction} underwater for ${underwaterHours}h (max ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h) with weak trend (EMA spread ${emaSpread.toFixed(3)}% < ${REVAL_STRONG_TREND_SPREAD_PCT}%). Entry $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}%). Trend too thin to justify patience — closing.`;
+            log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
+            result.allowed = false;
+            result.reason = reason;
+          } else {
+            log(`🔄 Reval: ${bot.botName} underwater ${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% for ${underwaterHours}h — weak trend (${emaSpread.toFixed(3)}%) but within ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h limit, holding`);
+          }
         }
       }
 
@@ -1651,9 +1668,9 @@ async function runRevalidation() {
             `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit = ~${(REVAL_MAX_DRAWDOWN_PCT * 5).toFixed(0)}% ROI at 5x), so the deal was closed to cut losses.\n\n` +
             `1H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else if (isTimeStop) {
-          alertMsg = `⏰ ${bot.botName} closed — underwater too long\n\n` +
-            `Signal: 1H EMA 9/21 | Time stop\n` +
-            `This ${bot.direction} has been losing for over ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)} hours. The entry thesis is no longer valid.\n\n` +
+          alertMsg = `⏰ ${bot.botName} closed — weak trend + underwater too long\n\n` +
+            `Signal: 1H EMA 9/21 | Time stop (weak trend)\n` +
+            `This ${bot.direction} has been losing for over ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)} hours AND the EMA spread is thin (trend not strong enough to justify patience).\n\n` +
             `${result.reason}\n\n` +
             `1H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else {
