@@ -756,7 +756,7 @@ app.get('/', (req, res) => {
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, consecutiveFailures: REVAL_CONSECUTIVE_FAILURES },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50) + Gate 2 (4H EMA 9/21) + Gate 3 (RSI level) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
@@ -1231,22 +1231,27 @@ app.post('/webhook', (req, res) => {
 // and Gate 4 (RSI direction). If conditions have changed, stop the bot.
 // FAIL-CLOSED: If data fetch fails, stop the bot.
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
-const REVAL_MAX_DRAWDOWN_PCT = 4.0;    // v3.4.0: kill bot if price moves 4% against direction (was 1.5% — too tight for DCA with 2 safety orders at 0.3% step)
+// v3.6.2: Drawdown limit — was 4% (set in v3.4.0 for DCA room). But at 5x leverage
+// a 4% price move = 20% ROI loss. Binance position history showed positions bleeding
+// 2.4-3.7% (12-19% ROI) for hours without triggering the hard stop.
+// New limit: 2% price move = 10% ROI loss at 5x. This catches losses earlier
+// while still giving safety orders room to fill (0.3% step × 2 orders = 0.6%).
+const REVAL_MAX_DRAWDOWN_PCT = 2.0;
 // v3.2.3: Profit protection — don't flip a deal that's significantly in profit
 // unless the EMA spread is convincingly wide. If a deal is up > this threshold,
 // the revalidation result is overridden to "allowed" with a log note.
 const REVAL_PROFIT_SHIELD_PCT = 2.0;   // Skip flip if deal is > 2% in profit
-// v3.6.1: Grace period — how long after entry before full reval gates kick in.
-// Was 3 min (just enough for Gainium deal creation). Now 20 min to let the trade
-// thesis develop. DCA safety orders exist to average into pullbacks — reval was
-// killing positions during the exact pullbacks those orders are designed for.
-// The 4% drawdown check still runs during grace period — you're never unprotected.
-const REVAL_GRACE_PERIOD_MS = 20 * 60 * 1000; // 20 minutes
-// v3.6.1: Consecutive reval failures required before acting.
-// A single reval failure no longer kills a trade. The condition must persist
-// across 2 consecutive cycles (4+ minutes) to filter out wicks and brief pullbacks.
-// Mainly helps Gate 1 where spot price oscillates around daily EMA50.
-const REVAL_CONSECUTIVE_FAILURES = 2;
+// v3.6.2: Grace period — reverted from 20min back to 5min.
+// v3.6.1 extended to 20min based on theory that reval was cutting winners short.
+// Binance data showed the opposite: reval wasn't cutting ANYTHING. Positions sat
+// underwater 10-30 hours with no intervention. 5 min = enough for Gainium deal
+// creation + first safety order, then full reval protection kicks in.
+const REVAL_GRACE_PERIOD_MS = 5 * 60 * 1000; // 5 minutes
+// v3.6.2: Time-based stop — close positions that have been underwater too long.
+// The ETH SHORT sat losing for 30 hours because EMAs still "supported" it.
+// If a position is in drawdown for > this duration, close it regardless of what
+// the indicators say. The market has moved on — the entry thesis is dead.
+const REVAL_MAX_UNDERWATER_MS = 4 * 60 * 60 * 1000; // 4 hours max underwater
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1274,36 +1279,16 @@ async function runRevalidation() {
     const bot = ACTIVE_BOTS[uuid];
     if (!bot) continue;
 
-    // v3.6.1: Grace period — skip full gate reval for bots younger than REVAL_GRACE_PERIOD_MS.
-    // Was 3 min (v3.3.0, just for Gainium deal creation). Now 20 min to let the trade
-    // thesis develop. All 6 gates passed at entry — give the DCA strategy room to work
-    // before second-guessing it. The 4% drawdown check still runs during grace period
-    // because if the position falls through to the normal reval flow, the drawdown check
-    // at line ~1358 catches it. We only skip the EMA/RSI gate checks during grace.
+    // v3.6.2: Grace period — 5 min for Gainium deal creation + first safety order.
+    // After grace, full reval + drawdown protection.
     const ageMs = Date.now() - new Date(bot.startedAt).getTime();
-    const inGracePeriod = ageMs < REVAL_GRACE_PERIOD_MS;
-    if (inGracePeriod) {
-      log(`🔄 Reval: ${bot.botName} in grace period (${Math.round(ageMs / 1000)}s of ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min) — skipping gate checks, drawdown-only mode`);
+    if (ageMs < REVAL_GRACE_PERIOD_MS) {
+      log(`🔄 Reval: skipping ${bot.botName} — started ${Math.round(ageMs / 1000)}s ago (grace period ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min)`);
+      continue;
     }
 
     try {
-      // v3.6.1: During grace period, skip gate checks — only do drawdown monitoring.
-      // After grace, run full revalidation with consecutive failure tracking.
-      let result;
-      if (inGracePeriod) {
-        // Grace mode: fetch spot price only, skip EMA/RSI gates entirely.
-        // The trade thesis was validated at entry — let it develop.
-        const spotPrice = await binanceApi.getSpotPrice(
-          (bot.pair.replace('USDT', '').replace('/USDT', '')) + 'USDT'
-        ).catch(() => null);
-        result = {
-          allowed: true,
-          reason: `GRACE PERIOD: ${Math.round(ageMs / 1000)}s of ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min — gate checks skipped`,
-          data: { currentPrice: spotPrice, spotPrice },
-        };
-      } else {
-        result = await signalGate.revalidateSignal(bot.pair, bot.direction);
-      }
+      const result = await signalGate.revalidateSignal(bot.pair, bot.direction);
 
       // v3.5.0: Use DCA-averaged entry price for profit shield + drawdown check.
       // v3.6.0: Uses cached position map (one API call per cycle, not per bot).
@@ -1320,35 +1305,11 @@ async function runRevalidation() {
       }
       // v3.6.0: If entry price is still unknown (self-heal retrack, API failure),
       // persist the current spot price as a baseline so drawdown protection
-      // activates from this cycle forward. Without this, a retracked bot with
-      // null entryPrice has zero drawdown protection until the position map
-      // API succeeds — which could be never if the deal is a ghost.
+      // activates from this cycle forward.
       if (!effectiveEntry && result.data.currentPrice) {
         effectiveEntry = result.data.currentPrice;
         bot.entryPrice = effectiveEntry;
         log(`🔄 Reval: ${bot.botName} no entry price — using spot $${effectiveEntry.toFixed(2)} as baseline for drawdown protection`);
-      }
-
-      // v3.6.1: Consecutive failure tracking — a single reval failure no longer
-      // kills a trade. The condition must persist across REVAL_CONSECUTIVE_FAILURES
-      // consecutive cycles. Reset counter on any pass. Drawdown kills bypass this
-      // (they're immediate — no second chances on a 4% move against you).
-      if (!inGracePeriod && !result.allowed) {
-        bot.revalFailCount = (bot.revalFailCount || 0) + 1;
-        if (bot.revalFailCount < REVAL_CONSECUTIVE_FAILURES) {
-          log(`🔄 Reval: ${bot.botName} failed (${bot.revalFailCount}/${REVAL_CONSECUTIVE_FAILURES}) — ${result.reason}. Needs ${REVAL_CONSECUTIVE_FAILURES - bot.revalFailCount} more consecutive failure(s) before acting.`);
-          result.allowed = true;
-          result.reason = `CONSECUTIVE CHECK: Failure ${bot.revalFailCount}/${REVAL_CONSECUTIVE_FAILURES} — waiting for confirmation. Original: ${result.reason}`;
-          result.data.consecutiveFailure = bot.revalFailCount;
-        } else {
-          log(`🔄 Reval: ${bot.botName} failed ${bot.revalFailCount} consecutive times — acting now. Reason: ${result.reason}`);
-        }
-      } else if (!inGracePeriod && result.allowed) {
-        // Reset failure counter on any pass
-        if (bot.revalFailCount > 0) {
-          log(`🔄 Reval: ${bot.botName} passed — resetting failure counter (was ${bot.revalFailCount})`);
-        }
-        bot.revalFailCount = 0;
       }
 
       // v3.2.3: Profit shield — if the deal is significantly in profit,
@@ -1369,8 +1330,9 @@ async function runRevalidation() {
         }
       }
 
-      // v3.4.0: Price drawdown check — catch fast moves that 4H EMAs miss
-      // NOTE: Drawdown kills bypass consecutive failure tracking — they're immediate.
+      // v3.6.2: Price drawdown check — was 4%, now 2% to account for 5x leverage.
+      // At 5x, a 2% price move = 10% ROI loss. Previously positions bled 3-3.7%
+      // (15-19% ROI) without triggering the 4% hard stop.
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
 
@@ -1378,12 +1340,31 @@ async function runRevalidation() {
         const drawdown = bot.direction === 'LONG' ? -pctMove : pctMove; // positive = bad
 
         if (drawdown > REVAL_MAX_DRAWDOWN_PCT) {
-          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max)`;
+          const reason = `PRICE DRAWDOWN: ${bot.direction} entered @ $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% — exceeds ${REVAL_MAX_DRAWDOWN_PCT}% max → ~${(drawdown * 5).toFixed(0)}% ROI loss at 5x)`;
           log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
           result.allowed = false;
           result.reason = reason;
         } else {
           log(`🔄 Reval price check: ${bot.botName} @ $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}% from entry $${effectiveEntry.toFixed(2)}) — within ${REVAL_MAX_DRAWDOWN_PCT}% limit`);
+        }
+      }
+
+      // v3.6.2: Time-based stop — kill positions that have been underwater too long.
+      // The ETH SHORT sat losing for 30 hours because EMAs still "supported" it.
+      // If price is against you AND you've been open > REVAL_MAX_UNDERWATER_MS, close.
+      // This catches the slow grind that stays under the drawdown % but bleeds for hours.
+      if (result.allowed && effectiveEntry && result.data.currentPrice) {
+        const currentPrice = result.data.currentPrice;
+        const pctMove = ((currentPrice - effectiveEntry) / effectiveEntry) * 100;
+        const isUnderwater = (bot.direction === 'LONG' && pctMove < -0.1) ||
+                             (bot.direction === 'SHORT' && pctMove > 0.1);
+
+        if (isUnderwater && ageMs > REVAL_MAX_UNDERWATER_MS) {
+          const underwaterHours = (ageMs / (60 * 60 * 1000)).toFixed(1);
+          const reason = `TIME STOP: ${bot.direction} underwater for ${underwaterHours}h (max ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h). Entry $${effectiveEntry.toFixed(2)}, now $${currentPrice.toFixed(2)} (${pctMove > 0 ? '+' : ''}${pctMove.toFixed(2)}%). The entry thesis is dead — closing.`;
+          log(`🔄 Reval FAILED: ${bot.botName} — ${reason}`);
+          result.allowed = false;
+          result.reason = reason;
         }
       }
 
@@ -1568,7 +1549,9 @@ async function runRevalidation() {
           if (processResult && processResult.completed) {
             // Close succeeded — safe to remove old bot from tracking
             // v3.6.0: Journal — record exit reason based on what triggered the reval failure
-            const exitReason = result.reason?.includes('PRICE DRAWDOWN') ? 'drawdown' : 'reval-flip';
+            const exitReason = result.reason?.includes('PRICE DRAWDOWN') ? 'drawdown'
+              : result.reason?.includes('TIME STOP') ? 'time-stop'
+              : 'reval-flip';
             tradeJournal.recordExit({ botUuid: uuid, exitPrice: result.data.currentPrice, exitReason });
             delete ACTIVE_BOTS[uuid];
 
@@ -1626,10 +1609,16 @@ async function runRevalidation() {
 
         // Alert to Telegram (includes flip result)
         const isDrawdown = result.reason && result.reason.includes('PRICE DRAWDOWN');
+        const isTimeStop = result.reason && result.reason.includes('TIME STOP');
         let alertMsg;
         if (isDrawdown) {
           alertMsg = `🛑 ${bot.botName} closed — price moved against us\n\n` +
-            `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit), so the deal was closed to cut losses.\n\n` +
+            `The ${bot.direction} position was losing too much (past the ${REVAL_MAX_DRAWDOWN_PCT}% safety limit = ~${(REVAL_MAX_DRAWDOWN_PCT * 5).toFixed(0)}% ROI at 5x), so the deal was closed to cut losses.\n\n` +
+            `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
+        } else if (isTimeStop) {
+          alertMsg = `⏰ ${bot.botName} closed — underwater too long\n\n` +
+            `This ${bot.direction} has been losing for over ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)} hours. The entry thesis is no longer valid.\n\n` +
+            `${result.reason}\n\n` +
             `4H trend: ${result.data.shortTermTrend || '?'} · RSI(14): ${result.data.rsi14 || '?'} ${result.data.rsiDirection || ''}`;
         } else {
           alertMsg = `🛑 ${bot.botName} closed — market structure changed\n\n` +
@@ -2033,7 +2022,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.6.1`,
+      `Version: v3.6.2`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -2351,14 +2340,14 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.6.1 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.6.2 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
-  log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_CONSECUTIVE_FAILURES} consecutive failures required, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
+  log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_MAX_DRAWDOWN_PCT}% drawdown limit, ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h max underwater, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
 
   // v3.2.8: Recover active state BEFORE revalidation or self-heal run
