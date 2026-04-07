@@ -128,6 +128,26 @@ function isFlipOnCooldown(pair) {
   return (Date.now() - new Date(lastFlip).getTime()) < FLIP_COOLDOWN_MS;
 }
 
+// ── Recovery Lock (v3.5.2) ────────────────────────────────────────────
+// After startup recovery, lock recovered pairs for 3 minutes so incoming
+// TradingView signals don't try to flip ghost positions (stale Gainium deals
+// that no longer have a matching Binance position). Revalidation runs every
+// 2 min and handles cleanup — the lock prevents an alert cascade from
+// signals arriving during recovery before reval has had a chance to verify.
+// Key = pair name, Value = unlock timestamp (ms)
+const RECOVERY_LOCK = {};
+const RECOVERY_LOCK_MS = 3 * 60 * 1000; // 3 minutes
+
+function isRecoveryLocked(pair) {
+  const unlockAt = RECOVERY_LOCK[pair];
+  if (!unlockAt) return false;
+  if (Date.now() >= unlockAt) {
+    delete RECOVERY_LOCK[pair];
+    return false;
+  }
+  return true;
+}
+
 // ── Circuit Breaker (v1.9.0) ───────────────────────────────────────────
 // 3 flips (auto-flip OR TradingView-triggered) on the same pair within 15 min
 // = park that pair for 30 min. During park: no auto-flips, no TradingView signals.
@@ -698,7 +718,7 @@ app.get('/', (req, res) => {
     pausedAt: PAUSED_AT,
     pausedSignals: PAUSED_SIGNALS,
     uptime: Math.floor(process.uptime()) + 's',
-    version: '3.5.0',
+    version: '3.5.2',
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
@@ -706,6 +726,7 @@ app.get('/', (req, res) => {
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     flipCooldowns: FLIP_COOLDOWN,
+    recoveryLocks: RECOVERY_LOCK,
     signalGate: signalGate.getConfig(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
@@ -1014,6 +1035,19 @@ app.post('/webhook', (req, res) => {
     // Valid new direction — update tracking BEFORE dispatch
     LAST_DIRECTION[pair] = direction;
     log(`[${requestId}] 📊 Rising-edge: ${pair} direction change → ${direction}`);
+
+    // ── v3.5.2: Recovery lock — defer signals to reval during startup ──
+    if (isRecoveryLocked(pair)) {
+      delete LAST_DIRECTION[pair];
+      log(`[${requestId}] 🔒 RECOVERY LOCK — ${pair} was just recovered from restart. Deferring to revalidation for verification.`);
+      sendTelegramAlert(
+        `🔒 Signal deferred — recovery lock\n\n` +
+        `TradingView sent ${direction} on ${pair}, but this pair was just recovered during server restart. ` +
+        `Signals are deferred for 3 minutes while revalidation verifies the position is real.\n\n` +
+        `${istTimestamp()}`
+      ).catch(() => {});
+      return;
+    }
 
     // ── v1.9.0: Circuit breaker — block parked pairs ──────────────────
     const cbCheck = checkCircuitBreaker(pair);
@@ -1819,7 +1853,7 @@ async function handleTelegramCommand(text, chatId) {
 
     let statusLines = [
       '🔧 <b>System Status</b>\n',
-      `Version: v3.5.0`,
+      `Version: v3.5.2`,
       `State: ${PAUSED ? '⏸️ PAUSED' : '✅ Running'}`,
       `Uptime: ${hrs}h ${mins}m`,
       `Strategy: ${STRATEGY_MODE}`,
@@ -2021,16 +2055,20 @@ async function recoverActiveState() {
       }
 
       // Populate trackers
+      // v3.5.2: Backdate startedAt so reval's 3-min grace period doesn't
+      // delay checking recovered positions. Also set recovery lock so
+      // incoming signals don't try to flip ghost deals before reval verifies.
       ACTIVE_BOTS[uuid] = {
         pair,
         direction,
         botName: botInfo.name,
-        startedAt: new Date().toISOString(),
+        startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
         entryPrice,
         origin: 'recovery',
       };
       LAST_ACTIVE[pair] = Date.now();
       LAST_DIRECTION[pair] = direction;
+      RECOVERY_LOCK[pair] = Date.now() + RECOVERY_LOCK_MS;
 
       const priceStr = entryPrice ? `$${entryPrice.toFixed(2)}` : '?';
       const pnlStr = pnl !== null ? ` PnL $${pnl.toFixed(2)}` : '';
@@ -2083,7 +2121,7 @@ async function recoverActiveState() {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  log(`🚀 Signal Bot Router v3.5.0 listening on port ${PORT}`);
+  log(`🚀 Signal Bot Router v3.5.2 listening on port ${PORT}`);
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
