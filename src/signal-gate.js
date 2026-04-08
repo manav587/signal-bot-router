@@ -1007,4 +1007,121 @@ function getConfig() {
   };
 }
 
-module.exports = { validateSignal, revalidateSignal, getConfig, CONFIG };
+/**
+ * Crossover Proximity Analysis (v3.9.1)
+ *
+ * For each pair, computes:
+ * - Current EMA9/EMA21 gap (absolute and %)
+ * - Rate of convergence over last N candles
+ * - Estimated hours until crossover (linear extrapolation)
+ * - Probability score (0-100%) based on convergence speed, RSI, and gap size
+ * - Current trend direction
+ */
+async function getCrossoverProximity() {
+  const pairs = Object.keys(PAIR_TO_SYMBOL);
+  const results = {};
+
+  await Promise.all(pairs.map(async (pair) => {
+    const pairInfo = PAIR_TO_SYMBOL[pair];
+    try {
+      const candles = await fetchCandles(pairInfo, '1h', 30);
+      if (candles.length < 25) {
+        results[pair] = { error: 'Insufficient candle data' };
+        return;
+      }
+
+      const closes = candles.map(c => c.close);
+      const spotPrice = await binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null);
+      const currentPrice = spotPrice || closes[closes.length - 1];
+
+      // Calculate EMA9 and EMA21 at multiple points to get convergence rate
+      const snapshots = [];
+      for (let offset = 0; offset < 6 && (closes.length - offset) >= 22; offset++) {
+        const slice = closes.slice(0, closes.length - offset);
+        const ema9 = calculateEMA(slice, 9);
+        const ema21 = calculateEMA(slice, 21);
+        if (ema9 !== null && ema21 !== null) {
+          snapshots.push({ hoursAgo: offset, ema9, ema21, gap: ema9 - ema21 });
+        }
+      }
+
+      if (snapshots.length < 2) {
+        results[pair] = { error: 'Not enough EMA snapshots' };
+        return;
+      }
+
+      const current = snapshots[0];
+      const gapAbs = Math.abs(current.gap);
+      const gapPct = (gapAbs / currentPrice) * 100;
+      const trend = current.ema9 > current.ema21 ? 'BULLISH' : 'BEARISH';
+
+      // Convergence rate: how fast is the gap closing per hour?
+      let convergencePerHour = 0;
+      if (snapshots.length >= 3) {
+        const rates = [];
+        for (let i = 1; i < snapshots.length; i++) {
+          const oldGapAbs = Math.abs(snapshots[i].gap);
+          const newGapAbs = Math.abs(snapshots[i - 1].gap);
+          rates.push(oldGapAbs - newGapAbs); // positive = converging
+        }
+        convergencePerHour = rates.reduce((a, b) => a + b, 0) / rates.length;
+      } else {
+        const oldGapAbs = Math.abs(snapshots[1].gap);
+        convergencePerHour = oldGapAbs - gapAbs;
+      }
+
+      // Estimated hours until crossover
+      let estHours = null;
+      if (convergencePerHour > 0 && gapAbs > 0) {
+        estHours = gapAbs / convergencePerHour;
+        if (estHours > 48) estHours = null;
+      }
+
+      // RSI for context
+      const rsi14 = calculateRSI(closes, 14);
+
+      // Probability score (0-100%)
+      let probability = 0;
+
+      // Factor 1: Gap size (40% weight)
+      const gapScore = Math.max(0, 40 * (1 - gapPct / 0.5));
+
+      // Factor 2: Convergence speed (35% weight)
+      let convScore = 0;
+      if (convergencePerHour > 0) {
+        const hoursToClose = gapAbs / convergencePerHour;
+        convScore = Math.max(0, 35 * (1 - Math.min(hoursToClose, 12) / 12));
+      }
+
+      // Factor 3: RSI momentum (25% weight)
+      let rsiScore = 0;
+      if (rsi14 !== null) {
+        const rsiDistFrom50 = Math.abs(rsi14 - 50);
+        rsiScore = Math.max(0, 25 * (1 - rsiDistFrom50 / 30));
+      }
+
+      probability = Math.round(Math.min(100, gapScore + convScore + rsiScore));
+
+      results[pair] = {
+        price: currentPrice,
+        trend,
+        ema9: current.ema9,
+        ema21: current.ema21,
+        gapAbs: parseFloat(gapAbs.toFixed(6)),
+        gapPct: parseFloat(gapPct.toFixed(4)),
+        convergencePerHour: parseFloat(convergencePerHour.toFixed(6)),
+        converging: convergencePerHour > 0,
+        estHours: estHours !== null ? parseFloat(estHours.toFixed(1)) : null,
+        rsi14: rsi14 !== null ? parseFloat(rsi14.toFixed(2)) : null,
+        probability,
+        nextSignal: trend === 'BULLISH' ? 'SHORT (bearish cross)' : 'LONG (bullish cross)',
+      };
+    } catch (err) {
+      results[pair] = { error: err.message };
+    }
+  }));
+
+  return results;
+}
+
+module.exports = { validateSignal, revalidateSignal, getConfig, getCrossoverProximity, CONFIG };

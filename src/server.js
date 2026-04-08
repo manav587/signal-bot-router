@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.0';
+const VERSION = '3.9.1';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -2146,6 +2146,56 @@ setInterval(runSelfHeal, SELF_HEAL_INTERVAL);
 // Run once on startup after a short delay (catches orphans from redeploys)
 setTimeout(runSelfHeal, 30 * 1000);
 
+// ── v3.9.1: Crossover Proximity Auto-Alert ──────────────────────────────
+// Checks every 15 min if any pair's EMA9/EMA21 gap is narrowing fast.
+// Sends Telegram alert when probability hits threshold.
+const PROXIMITY_ALERT_INTERVAL = 15 * 60 * 1000;
+const PROXIMITY_ALERT_THRESHOLD = 60;
+let lastProximityAlert = {};
+const PROXIMITY_ALERT_COOLDOWN = 60 * 60 * 1000;
+
+async function checkCrossoverProximity() {
+  if (PAUSED) return;
+  try {
+    const proximity = await signalGate.getCrossoverProximity();
+    for (const [pair, d] of Object.entries(proximity)) {
+      if (d.error || !d.converging) continue;
+      if (d.probability < PROXIMITY_ALERT_THRESHOLD) continue;
+
+      const lastAlert = lastProximityAlert[pair];
+      if (lastAlert && (Date.now() - lastAlert) < PROXIMITY_ALERT_COOLDOWN) continue;
+
+      lastProximityAlert[pair] = Date.now();
+
+      let timeEst = 'unknown';
+      if (d.estHours !== null) {
+        if (d.estHours < 1) timeEst = `~${Math.round(d.estHours * 60)} min`;
+        else timeEst = `~${d.estHours.toFixed(1)} hours`;
+      }
+
+      const probEmoji = d.probability >= 80 ? '🔴' : '🟡';
+
+      sendTelegramAlert(
+        `${probEmoji} <b>Crossover Alert: ${pair}</b>\n\n` +
+        `EMAs converging — ${d.probability}% crossover probability\n` +
+        `Gap: ${d.gapPct.toFixed(3)}% and shrinking\n` +
+        `ETA: ${timeEst}\n` +
+        `RSI: ${d.rsi14 || '?'}\n` +
+        `Current trend: ${d.trend}\n` +
+        `Next signal: ${d.nextSignal}\n\n` +
+        `${istTimestamp()} IST`
+      ).catch(() => {});
+
+      log(`📐 Crossover proximity alert: ${pair} at ${d.probability}% (ETA: ${timeEst})`);
+    }
+  } catch (err) {
+    log(`⚠ Crossover proximity check error: ${err.message}`);
+  }
+}
+
+setInterval(checkCrossoverProximity, PROXIMITY_ALERT_INTERVAL);
+setTimeout(checkCrossoverProximity, 2 * 60 * 1000);
+
 // ── Daily P&L Summary (v3.6.0) ─────────────────────────────────────────
 // Sends a daily summary to Telegram at 23:30 IST.
 // Uses setInterval checking every 5 min — simple, no cron dependency.
@@ -2381,6 +2431,50 @@ async function handleTelegramCommand(text, chatId) {
     return lines.join('\n');
   }
 
+  // ── v3.9.1: Crossover proximity command ─────────────────────────────────
+  if (cmd === '/crossover' || cmd === '/cross') {
+    try {
+      const proximity = await signalGate.getCrossoverProximity();
+      const lines = ['📐 <b>Crossover Proximity</b>\n'];
+
+      for (const [pair, d] of Object.entries(proximity)) {
+        if (d.error) {
+          lines.push(`<b>${pair}</b>: ⚠️ ${d.error}\n`);
+          continue;
+        }
+
+        const arrow = d.converging ? '🔻 converging' : '🔺 diverging';
+        const probEmoji = d.probability >= 70 ? '🔴' : d.probability >= 40 ? '🟡' : '🟢';
+        const probBar = '▓'.repeat(Math.round(d.probability / 10)) + '░'.repeat(10 - Math.round(d.probability / 10));
+
+        let timeEst = 'N/A';
+        if (d.estHours !== null) {
+          if (d.estHours < 1) timeEst = `~${Math.round(d.estHours * 60)}min`;
+          else if (d.estHours < 24) timeEst = `~${d.estHours.toFixed(1)}h`;
+          else timeEst = `~${(d.estHours / 24).toFixed(1)}d`;
+        } else if (!d.converging) {
+          timeEst = 'moving apart';
+        }
+
+        lines.push(
+          `<b>${pair}</b> $${d.price.toFixed(pair === 'BTC' ? 0 : pair === 'XRP' ? 4 : 2)} — ${d.trend}\n` +
+          `  EMA9: $${d.ema9.toFixed(pair === 'BTC' ? 0 : pair === 'XRP' ? 4 : 2)} vs EMA21: $${d.ema21.toFixed(pair === 'BTC' ? 0 : pair === 'XRP' ? 4 : 2)}\n` +
+          `  Gap: ${d.gapPct.toFixed(3)}% ${arrow}\n` +
+          `  RSI: ${d.rsi14 || '?'}\n` +
+          `  ⏱ ETA: ${timeEst}\n` +
+          `  ${probEmoji} ${probBar} ${d.probability}% chance\n` +
+          `  Next signal: ${d.nextSignal}\n`
+        );
+      }
+
+      lines.push(`\n${istTimestamp()} IST`);
+      return lines.join('\n');
+    } catch (err) {
+      log(`❌ /crossover error: ${err.message}`);
+      return `❌ Crossover check failed: ${err.message}`;
+    }
+  }
+
   // ── v3.9.0: Remote control commands ────────────────────────────────────
   if (cmd === '/pause') {
     if (PAUSED) return `⏸️ Already paused since ${new Date(PAUSED_AT).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false })}`;
@@ -2426,7 +2520,8 @@ async function handleTelegramCommand(text, chatId) {
     '/whales — Whale wallet health status\n' +
     '/status — System health & uptime\n' +
     '/bots — Bot overview (active/stopped)\n' +
-    '/binance — Binance API diagnostic\n\n' +
+    '/binance — Binance API diagnostic\n' +
+    '/crossover — EMA crossover proximity + ETA\n\n' +
     '<b>🎮 Control</b>\n' +
     '/pause — Stop processing signals\n' +
     '/resume — Resume signal processing\n' +
