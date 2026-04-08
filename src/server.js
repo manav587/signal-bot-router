@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.8.4';
+const VERSION = '3.8.5';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -2035,7 +2035,16 @@ async function runSelfHeal() {
         }
 
         // Both bots are closed with 0 deals — pair is orphaned (or cold start)
-        const scanLabel = (COLD_START_MODE && !lastActive) ? '🧭 Cold-start' : '🩺 Self-heal';
+        // v3.8.4: Self-heal no longer auto-starts bots on orphaned pairs.
+        // Phase 0 (exchange reconciliation) handles re-tracking existing Binance positions.
+        // New positions should ONLY be opened by TradingView webhook signals through the gates.
+        // Cold-start mode is the one exception — on first boot, if Phase 0 found no positions
+        // but gates pass, we enter. After cold-start clears, orphaned = wait for webhook.
+        if (!COLD_START_MODE) {
+          log(`🩺 Self-heal: ${pair} — both bots closed, 0 deals. Skipping auto-restart (v3.8.4: webhook-only entry). Phase 0 covers existing positions.`);
+          continue;
+        }
+        const scanLabel = '🧭 Cold-start';
         log(`${scanLabel}: ${pair} — both bots closed, 0 deals. Running signal gate...`);
 
         // v3.5.0: Prefer the last known direction (if available) — avoids
