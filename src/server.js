@@ -74,91 +74,6 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// ── Telegram Command Listener (v3.9.0) ──────────────────────────────────
-// Polls for commands from the authorized chat. Supports:
-//   /pause   — pause relay (stop processing signals)
-//   /resume  — resume relay
-//   /status  — show current positions, version, uptime
-//   /closeall or /kill — close all deals, stop all bots, pause relay
-let telegramOffset = 0;
-
-async function pollTelegramCommands() {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=0&limit=10`;
-    const res = await fetch(url);
-    const body = await res.json();
-    if (!body.ok || !body.result?.length) return;
-    for (const update of body.result) {
-      telegramOffset = update.update_id + 1;
-      const msg = update.message;
-      if (!msg?.text || String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) continue;
-      const cmd = msg.text.trim().toLowerCase().split(/\s+/)[0];
-      await handleTelegramCommand(cmd);
-    }
-  } catch (err) { /* silent — don't crash relay */ }
-}
-
-async function handleTelegramCommand(cmd) {
-  switch (cmd) {
-    case '/pause': {
-      if (PAUSED) {
-        await sendTelegramAlert(`⏸️ Already paused since ${new Date(PAUSED_AT).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false })}`);
-        return;
-      }
-      PAUSED = true;
-      PAUSED_AT = new Date().toISOString();
-      log('⏸️ PAUSED via Telegram command');
-      await sendTelegramAlert(`⏸️ Relay PAUSED via Telegram\n\nNo new signals will be processed.\nActive positions remain monitored.\n\n${istTimestamp()}`);
-      break;
-    }
-    case '/resume': {
-      if (!PAUSED) { await sendTelegramAlert(`▶️ Already running (not paused)`); return; }
-      PAUSED = false;
-      const skipped = PAUSED_SIGNALS;
-      PAUSED_SIGNALS = 0;
-      PAUSED_AT = null;
-      log('▶️ RESUMED via Telegram command');
-      await sendTelegramAlert(`▶️ Relay RESUMED via Telegram\n\n${skipped} signal(s) were skipped while paused.\n\n${istTimestamp()}`);
-      break;
-    }
-    case '/status': {
-      const bots = Object.values(ACTIVE_BOTS);
-      const botLines = bots.length > 0
-        ? bots.map(b => `• ${b.pair} ${b.direction} (entry $${b.entryPrice || '?'})`).join('\n')
-        : 'No active positions';
-      const upMin = Math.floor(process.uptime() / 60);
-      await sendTelegramAlert(
-        `📊 Status: v${VERSION}\n\nState: ${PAUSED ? '⏸️ PAUSED' : '▶️ RUNNING'}\nUptime: ${upMin}m\nPositions:\n${botLines}\n\n${istTimestamp()}`
-      );
-      break;
-    }
-    case '/closeall':
-    case '/kill': {
-      log('🚨 KILL SWITCH via Telegram — closing all positions');
-      await sendTelegramAlert(`🚨 KILL SWITCH activated via Telegram\n\nClosing all deals and stopping all bots...\n\n${istTimestamp()}`);
-      PAUSED = true;
-      PAUSED_AT = new Date().toISOString();
-      let closed = 0, stopped = 0;
-      for (const [uuid, bot] of Object.entries(ACTIVE_BOTS)) {
-        try { await gainiumApi.forceCloseDeals(uuid); closed++; } catch (err) { log(`🚨 Kill: close failed ${bot.botName}: ${err.message}`); }
-      }
-      for (const [uuid] of Object.entries(BOT_MAP)) {
-        try { await sendAction({ action: 'stopBot', uuid }); stopped++; } catch (err) { /* may already be stopped */ }
-      }
-      const prevBots = { ...ACTIVE_BOTS };
-      for (const uuid of Object.keys(ACTIVE_BOTS)) delete ACTIVE_BOTS[uuid];
-      const summary = Object.values(prevBots).map(b => `• ${b.pair} ${b.direction}`).join('\n') || 'None tracked';
-      await sendTelegramAlert(
-        `🚨 KILL SWITCH complete\n\nDeals closed: ${closed}\nBots stopped: ${stopped}\nRelay: PAUSED\n\n${summary}\n\nSend /resume when ready.\n\n${istTimestamp()}`
-      );
-      break;
-    }
-  }
-}
-
-const telegramPollInterval = setInterval(pollTelegramCommands, 5000);
-
 // ── Pause Mode (v1.5.0) ─────────────────────────────────────────────────
 // When paused, the relay logs incoming signals to Telegram but skips execution.
 // This lets you see what TradingView is sending without any bots being started.
@@ -2466,15 +2381,56 @@ async function handleTelegramCommand(text, chatId) {
     return lines.join('\n');
   }
 
+  // ── v3.9.0: Remote control commands ────────────────────────────────────
+  if (cmd === '/pause') {
+    if (PAUSED) return `⏸️ Already paused since ${new Date(PAUSED_AT).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false })}`;
+    PAUSED = true;
+    PAUSED_AT = new Date().toISOString();
+    log('⏸️ PAUSED via Telegram command');
+    return `⏸️ <b>Relay PAUSED</b>\n\nNo new signals will be processed.\nActive positions remain monitored by self-heal.\n\nSend /resume to go live again.\n\n${istTimestamp()} IST`;
+  }
+
+  if (cmd === '/resume') {
+    if (!PAUSED) return '▶️ Already running (not paused)';
+    PAUSED = false;
+    const skipped = PAUSED_SIGNALS;
+    PAUSED_SIGNALS = 0;
+    PAUSED_AT = null;
+    log('▶️ RESUMED via Telegram command');
+    return `▶️ <b>Relay RESUMED</b>\n\n${skipped} signal(s) were skipped while paused.\nNow processing incoming TradingView signals.\n\n${istTimestamp()} IST`;
+  }
+
+  if (cmd === '/kill' || cmd === '/closeall') {
+    log('🚨 KILL SWITCH via Telegram — closing all positions');
+    PAUSED = true;
+    PAUSED_AT = new Date().toISOString();
+    let closed = 0, stopped = 0;
+    const prevBots = { ...ACTIVE_BOTS };
+    for (const [uuid, bot] of Object.entries(ACTIVE_BOTS)) {
+      try { await gainiumApi.forceCloseDeals(uuid); closed++; } catch (err) { log(`🚨 Kill: close failed ${bot.botName}: ${err.message}`); }
+    }
+    for (const [uuid] of Object.entries(BOT_MAP)) {
+      try { await sendAction({ action: 'stopBot', uuid }); stopped++; } catch (err) { /* may already be stopped */ }
+    }
+    for (const uuid of Object.keys(ACTIVE_BOTS)) delete ACTIVE_BOTS[uuid];
+    const summary = Object.values(prevBots).map(b => `• ${b.pair} ${b.direction}`).join('\n') || 'None were tracked';
+    return `🚨 <b>KILL SWITCH complete</b>\n\nDeals closed: ${closed}\nBots stopped: ${stopped}\nRelay: PAUSED\n\n${summary}\n\nSend /resume when ready.\n\n${istTimestamp()} IST`;
+  }
+
   // Unknown command — show help
   return '🤖 <b>Sentinel Commands</b>\n\n' +
+    '<b>📊 Info</b>\n' +
     '/positions — Current open deals with P&L\n' +
     '/trades — Open trades + today\'s closed\n' +
     '/journal — Full session stats + win rate\n' +
     '/whales — Whale wallet health status\n' +
     '/status — System health & uptime\n' +
     '/bots — Bot overview (active/stopped)\n' +
-    '/binance — Binance API diagnostic';
+    '/binance — Binance API diagnostic\n\n' +
+    '<b>🎮 Control</b>\n' +
+    '/pause — Stop processing signals\n' +
+    '/resume — Resume signal processing\n' +
+    '/kill — ⚠️ Close ALL positions + pause';
 }
 
 function buildProgressBar(currentPct, targetPct) {
