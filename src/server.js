@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.8.3';
+const VERSION = '3.8.4';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -640,10 +640,48 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 
   if (result.flat) {
     if (result.forceClosed > 0) {
-      log(`[${requestId}]   ✅ Verified flat — force-closed ${result.forceClosed} deal(s)`);
+      log(`[${requestId}]   ✅ Gainium verified flat — force-closed ${result.forceClosed} deal(s)`);
     } else {
-      log(`[${requestId}]   ✅ Verified flat — closeAllDeals worked correctly`);
+      log(`[${requestId}]   ✅ Gainium verified flat — closeAllDeals worked correctly`);
     }
+
+    // v3.8.4: Exchange-level cross-check — Gainium says flat, but does Binance agree?
+    // A Gainium deal can show "closed" while the Binance position persists.
+    try {
+      const exchangeMap = await gainiumApi.getExchangePositionMap();
+      // Extract pair from bot name (e.g. "SOL Short v2" → "SOL")
+      const pair = targetBot.name.split(' ')[0];
+      const exchangePos = exchangeMap.get(pair);
+      if (exchangePos) {
+        log(`[${requestId}]   ⚠ EXCHANGE CROSS-CHECK FAIL: Gainium says flat but Binance still shows ${pair} ${exchangePos.side} (entry $${exchangePos.entryPrice?.toFixed(2)}, PnL $${exchangePos.pnl?.toFixed(2)})`);
+        // Try one more round of force-close
+        log(`[${requestId}]   🔁 Attempting extra force-close to sync exchange...`);
+        await gainiumApi.forceCloseDeals(targetBot.uuid);
+        await new Promise(r => setTimeout(r, 10000));
+        // Re-check exchange
+        const recheck = await gainiumApi.getExchangePositionMap();
+        const stillOpen = recheck.get(pair);
+        if (stillOpen) {
+          log(`[${requestId}]   🚨 Exchange position STILL OPEN after extra close attempt`);
+          const alertMsg = `🚨 Close verification: Gainium/Binance desync — ${targetBot.name}\n\n` +
+            `Gainium reports 0 active deals but Binance still shows a ${pair} ${stillOpen.side} position.\n` +
+            `Entry: $${stillOpen.entryPrice?.toFixed(2)} | PnL: $${stillOpen.pnl?.toFixed(2)}\n\n` +
+            `To prevent position conflicts, the new bot was NOT started.\n` +
+            `⚠️ Check Binance manually.\n\n` +
+            `${istTimestamp()}`;
+          await sendTelegramAlert(alertMsg);
+          return { verified: false, abortRemaining: true };
+        } else {
+          log(`[${requestId}]   ✅ Exchange cross-check: position closed after extra attempt`);
+        }
+      } else {
+        log(`[${requestId}]   ✅ Exchange cross-check: Binance confirms flat for ${pair}`);
+      }
+    } catch (exchangeErr) {
+      // Non-fatal — Gainium already confirmed flat, exchange check is bonus hardening
+      log(`[${requestId}]   ⚠ Exchange cross-check failed: ${exchangeErr.message} (proceeding — Gainium confirmed flat)`);
+    }
+
     return { verified: true, abortRemaining: false };
   }
 
@@ -1016,6 +1054,43 @@ app.get('/test-verify/:uuid', async (req, res) => {
     apiConfigured: results.apiConfigured,
     getBotDeals: results.getBotDeals,
     listOpenDeals: results.listOpenDeals,
+    timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
+  });
+});
+
+// ── v3.8.4: Test reconciliation endpoint ────────────────────────────────
+// Simulates "lost tracking" by temporarily removing a bot from ACTIVE_BOTS
+// for one self-heal cycle. If Phase 0/1 catches it and re-tracks, the system works.
+// Usage: GET /test-reconcile/:pair (e.g. /test-reconcile/XRP)
+// Safety: only works when exactly one bot is tracked for the pair.
+app.get('/test-reconcile/:pair', async (req, res) => {
+  const pair = req.params.pair.toUpperCase();
+
+  // Find the tracked bot for this pair
+  const trackedEntry = Object.entries(ACTIVE_BOTS).find(([, b]) => b.pair === pair);
+  if (!trackedEntry) {
+    return res.json({ error: `No tracked bot for ${pair} in ACTIVE_BOTS`, activeBots: Object.values(ACTIVE_BOTS).map(b => `${b.pair} ${b.direction}`) });
+  }
+
+  const [uuid, bot] = trackedEntry;
+  const snapshot = { ...bot };
+
+  // Remove from ACTIVE_BOTS — simulating the relay losing track
+  delete ACTIVE_BOTS[uuid];
+  log(`🧪 TEST-RECONCILE: Removed ${bot.botName} (${pair} ${bot.direction}) from ACTIVE_BOTS. Waiting for Phase 0/1 to catch it...`);
+
+  sendTelegramAlert(
+    `🧪 RECONCILIATION TEST STARTED\n\n` +
+    `Deliberately removed ${bot.botName} from tracking to simulate a lost position.\n` +
+    `Phase 0 (exchange reconciliation) and Phase 1 (deal scan) should detect and re-track this within the next self-heal cycle (≤5 min).\n\n` +
+    `Watch for a "🔍 Exchange reconciliation" or "🩺 Self-heal: RE-TRACKED" alert.\n\n` +
+    `${istTimestamp()}`
+  ).catch(() => {});
+
+  res.json({
+    status: 'test started',
+    removed: { pair, direction: bot.direction, botName: bot.botName, uuid },
+    expect: 'Phase 0 or Phase 1 should re-track this within 5 minutes. Watch Telegram for the alert.',
     timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }),
   });
 });
@@ -1738,6 +1813,100 @@ async function runSelfHeal() {
       log(`🩺 Self-heal: API call failed — skipping this cycle`);
       selfHealRunning = false;
       return;
+    }
+
+    // ── Phase 0: Exchange Position Reconciliation (v3.8.4) ─────────────
+    // Query actual exchange positions via Gainium (reads Binance directly).
+    // Compare against ACTIVE_BOTS to catch two failure modes:
+    //   A) Binance has a position the relay doesn't know about → re-track it
+    //   B) ACTIVE_BOTS shows a position but Binance is flat → clean up stale tracking
+    // This is the ultimate ground truth — Gainium deal state can desync from
+    // Binance, but the exchange position map reflects actual Binance exposure.
+    try {
+      const exchangeMap = await gainiumApi.getExchangePositionMap();
+      // Build tracked pairs — if both LONG + SHORT are tracked for same pair, that's
+      // already a conflict state. Store all tracked bots, keyed by pair+direction.
+      const trackedByPairDir = new Map(); // "SOL:LONG" → { uuid, botName }
+      const trackedPairs = new Map(); // pair → { direction, uuid, botName }
+      for (const [uuid, bot] of Object.entries(ACTIVE_BOTS)) {
+        trackedByPairDir.set(`${bot.pair}:${bot.direction}`, { uuid, botName: bot.botName });
+        trackedPairs.set(bot.pair, { direction: bot.direction, uuid, botName: bot.botName });
+      }
+
+      // A) Exchange has position, relay doesn't know → re-track
+      for (const [base, pos] of exchangeMap) {
+        if (!SELF_HEAL_PAIRS.includes(base)) continue; // only manage our pairs
+        // Check if this exact pair+direction is already tracked
+        const exactMatch = trackedByPairDir.has(`${base}:${pos.side}`);
+        if (exactMatch) continue; // already tracked correctly
+
+        // This pair+direction is NOT tracked. Either completely unknown, or tracked in opposite direction.
+        const matchBot = findBot(base, pos.side);
+        if (!matchBot) continue;
+
+        // Check if relay is tracking the OPPOSITE direction for this pair
+        const oppositeDir = pos.side === 'LONG' ? 'SHORT' : 'LONG';
+        const hasOpposite = trackedByPairDir.has(`${base}:${oppositeDir}`);
+
+        if (hasOpposite) {
+          // Relay tracks opposite direction — Binance says otherwise. Re-track to match exchange.
+          const oldTracking = trackedByPairDir.get(`${base}:${oppositeDir}`);
+          log(`🚨 Phase 0: DIRECTION MISMATCH — relay tracks ${base} ${oppositeDir} but Binance shows ${pos.side}. Re-tracking to match exchange.`);
+          delete ACTIVE_BOTS[oldTracking.uuid];
+        } else {
+          log(`🔍 Phase 0: EXCHANGE RECONCILE — ${base} ${pos.side} found on Binance (entry $${pos.entryPrice?.toFixed(2) || '?'}, PnL $${pos.pnl?.toFixed(2) || '?'}) but NOT tracked. Now monitored.`);
+        }
+
+        ACTIVE_BOTS[matchBot.uuid] = {
+          pair: base,
+          direction: pos.side,
+          botName: matchBot.name,
+          startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+          entryPrice: pos.entryPrice || null,
+          origin: hasOpposite ? 'exchange-reconcile-mismatch' : 'exchange-reconcile',
+        };
+        LAST_ACTIVE[base] = Date.now();
+        LAST_DIRECTION[base] = pos.side;
+
+        sendTelegramAlert(
+          hasOpposite
+            ? `🚨 Direction mismatch fixed: ${base}\n\n` +
+              `Relay was tracking ${oppositeDir} but Binance shows ${pos.side}.\n` +
+              `Re-tracked to match the actual exchange position.\n\n` +
+              `${istTimestamp()}`
+            : `🔍 Exchange reconciliation: ${base} ${pos.side}\n\n` +
+              `Found a ${pos.side} position on Binance for ${base} that the relay didn't know about.\n` +
+              `Entry: $${pos.entryPrice?.toFixed(2) || '?'} | PnL: $${pos.pnl?.toFixed(2) || '?'}\n\n` +
+              `Now tracked with full drawdown + revalidation protection.\n\n` +
+              `${istTimestamp()}`
+        ).catch(() => {});
+      }
+
+      // B) Relay tracks a position but Binance is flat → stale tracking
+      for (const [pair, info] of trackedPairs) {
+        if (!exchangeMap.has(pair)) {
+          // Relay thinks there's a position, Binance disagrees
+          // Only clean up if bot also shows 0 active deals (double-check)
+          const botInfo = BOT_MAP[info.uuid];
+          if (botInfo) {
+            const bStatus = botStatuses.get(info.uuid);
+            if (bStatus && bStatus.deals.active === 0) {
+              log(`🧹 Phase 0: STALE TRACKING — ${pair} ${info.direction} in ACTIVE_BOTS but Binance is flat and Gainium shows 0 deals. Cleaning up.`);
+              delete ACTIVE_BOTS[info.uuid];
+              sendTelegramAlert(
+                `🧹 Stale tracking cleaned: ${info.botName}\n\n` +
+                `Relay was monitoring ${pair} ${info.direction} but Binance has no position and Gainium shows 0 active deals.\n` +
+                `Removed from tracking — pair is now available for re-entry.\n\n` +
+                `${istTimestamp()}`
+              ).catch(() => {});
+            }
+          }
+        }
+      }
+
+      log(`🔍 Phase 0 complete: exchange has ${exchangeMap.size} position(s), relay tracks ${Object.keys(ACTIVE_BOTS).length} bot(s)`);
+    } catch (exchangeErr) {
+      log(`🔍 Phase 0: exchange reconciliation failed — ${exchangeErr.message} (continuing to Phase 1)`);
     }
 
     // ── Phase 1: Orphaned Deal Scan (v3.8.3) ───────────────────────────
