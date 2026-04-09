@@ -466,16 +466,35 @@ async function listAllOpenDeals() {
 }
 
 /**
- * Build an exchange position map from Gainium's open deals.
- * Returns the SAME shape as binanceApi.getPositionMap() so callers
- * don't need to change — but data comes via Gainium (which reads Binance).
+ * Build an exchange position map.
  *
- * Data path: Binance → Gainium (via their API key) → Gainium REST API → relay
+ * v3.9.5: When BINANCE_PROXY_URL is set, uses REAL Binance position data
+ * via Cloudflare Worker proxy (bypasses US geo-block). This is ground truth.
  *
- * @returns {Map<string, { symbol, side, size, entryPrice, markPrice, pnl, leverage, marginType, notional }>}
- *          Key = base asset (e.g. 'SOL'), Value = position details. Only non-zero positions.
+ * Fallback: Gainium's open deals (stale/cached -- cannot detect external closes).
+ *
+ * @returns {Map<string, { symbol, side, size, entryPrice, markPrice, pnl, leverage, marginType, notional, source }>}
  */
 async function getExchangePositionMap() {
+  // v3.9.5: Prefer real Binance data when proxy is available
+  const binanceApi = require('./binance-api');
+  if (binanceApi.isProxyConfigured() && binanceApi.isConfigured()) {
+    try {
+      const binanceMap = await binanceApi.getPositionMap();
+      if (binanceMap.size >= 0) {
+        for (const [key, val] of binanceMap) {
+          val.source = 'binance';
+          val.positionAmt = val.side === 'SHORT' ? -val.size : val.size;
+        }
+        log(`getExchangePositionMap: ${binanceMap.size} position(s) from BINANCE (live)${binanceMap.size > 0 ? ' -- ' + [...binanceMap.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
+        return binanceMap;
+      }
+    } catch (err) {
+      log(`getExchangePositionMap: Binance proxy failed (${err.message}), falling back to Gainium deals`);
+    }
+  }
+
+  // Fallback: Gainium deals (stale data, cannot detect external closes)
   const deals = await listAllOpenDeals();
   const map = new Map();
 
@@ -498,6 +517,11 @@ async function getExchangePositionMap() {
       source: 'gainium',
     });
   }
+
+  log(`getExchangePositionMap: ${map.size} active position(s) from GAINIUM (fallback)${map.size > 0 ? ' -- ' + [...map.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
+  return map;
+}
+
 
   log(`getExchangePositionMap: ${map.size} active position(s)${map.size > 0 ? ' — ' + [...map.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
   return map;

@@ -13,9 +13,12 @@
 
 const crypto = require('crypto');
 
-const BASE_URL = 'https://fapi.binance.com';
+// v3.9.5: BINANCE_PROXY_URL routes API calls through Cloudflare Worker
+// to bypass US geo-restriction (HTTP 451). Falls back to direct Binance.
+const BASE_URL = process.env.BINANCE_PROXY_URL || 'https://fapi.binance.com';
 const API_KEY = process.env.BINANCE_API_KEY || '';
 const API_SECRET = process.env.BINANCE_API_SECRET || '';
+const PROXY_TOKEN = process.env.BINANCE_PROXY_TOKEN || '';
 
 // ── Logging (uses same IST format as server.js / gainium-api.js) ──────────
 
@@ -68,7 +71,7 @@ async function getOpenPositions(symbol) {
 
     const res = await fetch(url, {
       method: 'GET',
-      headers: { 'X-MBX-APIKEY': API_KEY },
+      headers: apiHeaders(),
       signal: controller.signal,
     });
     clearTimeout(timeout);
@@ -105,7 +108,7 @@ async function getAccountInfo() {
 
     const res = await fetch(url, {
       method: 'GET',
-      headers: { 'X-MBX-APIKEY': API_KEY },
+      headers: apiHeaders(),
       signal: controller.signal,
     });
     clearTimeout(timeout);
@@ -188,7 +191,7 @@ async function testConnection() {
 
     const res = await fetch(url, {
       method: 'GET',
-      headers: { 'X-MBX-APIKEY': API_KEY },
+      headers: apiHeaders(),
       signal: controller.signal,
     });
     clearTimeout(timeout);
@@ -264,12 +267,25 @@ async function getSpotPrice(symbol) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
+// v3.9.5: Standard headers for all Binance API calls.
+// Includes proxy token when routing through Cloudflare Worker.
+function apiHeaders() {
+  const headers = { 'X-MBX-APIKEY': API_KEY };
+  if (PROXY_TOKEN) headers['X-Proxy-Token'] = PROXY_TOKEN;
+  return headers;
+}
+
 function isConfigured() {
   return API_KEY.length > 0 && API_SECRET.length > 0;
 }
 
+function isProxyConfigured() {
+  return !!process.env.BINANCE_PROXY_URL;
+}
+
 module.exports = {
   isConfigured,
+  isProxyConfigured,
   getOpenPositions,
   getAccountInfo,
   getPositionMap,

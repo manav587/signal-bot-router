@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.4';
+const VERSION = '3.9.5';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -2469,6 +2469,7 @@ async function handleTelegramCommand(text, chatId) {
       const result = await binanceApi.testConnection();
       let lines = ['🔍 <b>Binance API Diagnostic</b>\n'];
       lines.push(`Key: ${result.keyPrefix}`);
+      lines.push(`Proxy: ${binanceApi.isProxyConfigured() ? '✅ Cloudflare Worker' : '❌ Direct (geo-blocked from US)'}`);
       lines.push(`HTTP: ${result.status}`);
       lines.push(`OK: ${result.ok}`);
 
