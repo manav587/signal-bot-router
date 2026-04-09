@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.1';
+const VERSION = '3.9.2';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1373,7 +1373,7 @@ async function runRevalidation() {
   if (revalRunning) return; // prevent overlapping runs
   revalRunning = true;
 
-  const activeUUIDs = Object.keys(ACTIVE_BOTS);
+  let activeUUIDs = Object.keys(ACTIVE_BOTS);
   if (activeUUIDs.length === 0) {
     revalRunning = false;
     return;
@@ -1388,6 +1388,52 @@ async function runRevalidation() {
     } catch (e) {
       log(`🔄 Reval: failed to get exchange position map for cycle: ${e.message}`);
     }
+  }
+
+  // v3.9.2: Cross-check tracked bots against Binance positions.
+  // If Binance has no position but relay is tracking a bot, the position was
+  // closed externally (manual close on Binance app, liquidation, etc.).
+  // Force-close the Gainium deal and clean up tracking immediately.
+  if (cachedPosMap) {
+    for (const uuid of activeUUIDs) {
+      const bot = ACTIVE_BOTS[uuid];
+      if (!bot) continue;
+
+      const base = bot.pair.replace('USDT', '').replace('/USDT', '');
+      const pos = cachedPosMap.get(base);
+
+      if (!pos || (pos.positionAmt !== undefined && parseFloat(pos.positionAmt) === 0)) {
+        // Binance has no position for this pair — position was closed externally
+        log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but Binance has no ${base} position. Cleaning up.`);
+
+        // Force-close the Gainium deal via REST API
+        const botInfo = BOT_MAP[uuid];
+        if (botInfo) {
+          try {
+            const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
+            log(`🧹 External close cleanup: ${bot.botName} — ${restResult.closed} deal(s) closed on Gainium`);
+          } catch (cleanErr) {
+            log(`🧹 External close cleanup error for ${bot.botName}: ${cleanErr.message}`);
+          }
+        }
+
+        delete ACTIVE_BOTS[uuid];
+        sendTelegramAlert(
+          `🧹 External close detected: ${bot.botName}
+
+` +
+          `Position was closed outside the relay (Binance app, manual close, or liquidation).
+` +
+          `Gainium deal cleaned up. ${base} is now available for re-entry on next signal.
+
+` +
+          `${istTimestamp()}`
+        ).catch(() => {});
+        continue;
+      }
+    }
+    // Refresh activeUUIDs after cleanup
+    activeUUIDs = Object.keys(ACTIVE_BOTS);
   }
 
   for (const uuid of activeUUIDs) {
