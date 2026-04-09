@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.2';
+const VERSION = '3.9.3';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1369,6 +1369,14 @@ const REVAL_MAX_UNDERWATER_MS = 12 * 60 * 60 * 1000; // 12 hours — only used w
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 let revalRunning = false;
 
+// v3.9.3: Ghost deal detection — track PnL across reval cycles.
+// If a tracked bot's PnL from Gainium is exactly unchanged for GHOST_STALE_CYCLES
+// consecutive cycles, the Gainium deal is likely a ghost (Binance position closed
+// externally but Gainium still shows deal "open"). Cancel the deal so the v3.9.2
+// cross-check can detect the mismatch and clean up.
+const GHOST_STALE_CYCLES = 3; // 3 x 2min = 6 minutes of frozen PnL -> ghost probe
+const GHOST_PROBE = new Map(); // uuid -> { pnl: number, staleCount: number }
+
 async function runRevalidation() {
   if (revalRunning) return; // prevent overlapping runs
   revalRunning = true;
@@ -1390,10 +1398,67 @@ async function runRevalidation() {
     }
   }
 
-  // v3.9.2: Cross-check tracked bots against Binance positions.
-  // If Binance has no position but relay is tracking a bot, the position was
-  // closed externally (manual close on Binance app, liquidation, etc.).
-  // Force-close the Gainium deal and clean up tracking immediately.
+  // v3.9.3: Ghost deal detection — probe PnL staleness.
+  // Gainium deals don't auto-close when a Binance position is closed externally.
+  // getExchangePositionMap() reads Gainium deals (not Binance), so the v3.9.2
+  // cross-check can't fire until the Gainium deal is removed.
+  // Solution: track PnL across reval cycles. A ghost deal's PnL freezes because
+  // there's no real Binance position generating profit/loss. After GHOST_STALE_CYCLES
+  // of frozen PnL, cancel the Gainium deal — next cycle the cross-check cleans up.
+  if (cachedPosMap) {
+    for (const uuid of activeUUIDs) {
+      const bot = ACTIVE_BOTS[uuid];
+      if (!bot) continue;
+
+      const base = bot.pair.replace('USDT', '').replace('/USDT', '');
+      const pos = cachedPosMap.get(base);
+      if (!pos) continue; // no Gainium deal → handled by cross-check below
+
+      const currentPnl = pos.pnl || 0;
+      const probe = GHOST_PROBE.get(uuid);
+
+      if (probe && probe.pnl === currentPnl) {
+        // PnL unchanged from last cycle
+        probe.staleCount++;
+        if (probe.staleCount >= GHOST_STALE_CYCLES) {
+          log(`👻 Ghost probe: ${bot.botName} PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} cycles — canceling Gainium deal`);
+          const botInfo = BOT_MAP[uuid];
+          if (botInfo) {
+            try {
+              const cancelResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName, 'cancel');
+              log(`👻 Ghost cancel: ${bot.botName} — ${cancelResult.closed} deal(s) canceled`);
+              sendTelegramAlert(
+                `👻 Ghost deal detected: ${bot.botName}\n\n` +
+                `PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} reval cycles (${probe.staleCount * 2} min).\n` +
+                `Gainium deal canceled. If Binance position is truly gone, cleanup will follow in next cycle.\n\n` +
+                `${istTimestamp()}`
+              ).catch(() => {});
+            } catch (err) {
+              log(`👻 Ghost cancel error for ${bot.botName}: ${err.message}`);
+            }
+          }
+          GHOST_PROBE.delete(uuid);
+          // Don't delete from ACTIVE_BOTS here — let the cross-check below handle
+          // it on the NEXT cycle once the Gainium deal is gone.
+          // If the position was real (rare false positive in perfectly flat market),
+          // the deal cancel closed it cleanly and the relay will stop tracking.
+        }
+      } else {
+        // PnL changed — position is alive, reset probe
+        GHOST_PROBE.set(uuid, { pnl: currentPnl, staleCount: 0 });
+      }
+    }
+
+    // Clean up probes for bots no longer tracked
+    for (const uuid of GHOST_PROBE.keys()) {
+      if (!ACTIVE_BOTS[uuid]) GHOST_PROBE.delete(uuid);
+    }
+  }
+
+  // v3.9.2: Cross-check tracked bots against Gainium position map.
+  // If Gainium has no deal for a tracked bot (deal was canceled/closed/expired),
+  // the position is gone. Clean up relay tracking immediately.
+  // v3.9.3: Uses 'cancel' closeType — ghost deals have no Binance position to market-close.
   if (cachedPosMap) {
     for (const uuid of activeUUIDs) {
       const bot = ACTIVE_BOTS[uuid];
@@ -1403,30 +1468,24 @@ async function runRevalidation() {
       const pos = cachedPosMap.get(base);
 
       if (!pos || (pos.positionAmt !== undefined && parseFloat(pos.positionAmt) === 0)) {
-        // Binance has no position for this pair — position was closed externally
-        log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but Binance has no ${base} position. Cleaning up.`);
+        log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but no ${base} position in Gainium. Cleaning up.`);
 
-        // Force-close the Gainium deal via REST API
         const botInfo = BOT_MAP[uuid];
         if (botInfo) {
           try {
-            const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
-            log(`🧹 External close cleanup: ${bot.botName} — ${restResult.closed} deal(s) closed on Gainium`);
+            const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName, 'cancel');
+            log(`🧹 External close cleanup: ${bot.botName} — ${restResult.closed} deal(s) canceled on Gainium`);
           } catch (cleanErr) {
             log(`🧹 External close cleanup error for ${bot.botName}: ${cleanErr.message}`);
           }
         }
 
         delete ACTIVE_BOTS[uuid];
+        GHOST_PROBE.delete(uuid);
         sendTelegramAlert(
-          `🧹 External close detected: ${bot.botName}
-
-` +
-          `Position was closed outside the relay (Binance app, manual close, or liquidation).
-` +
-          `Gainium deal cleaned up. ${base} is now available for re-entry on next signal.
-
-` +
+          `🧹 External close detected: ${bot.botName}\n\n` +
+          `Position was closed outside the relay (Binance app, manual close, or liquidation).\n` +
+          `Gainium deal cleaned up. ${base} is now available for re-entry on next signal.\n\n` +
           `${istTimestamp()}`
         ).catch(() => {});
         continue;
@@ -1435,6 +1494,7 @@ async function runRevalidation() {
     // Refresh activeUUIDs after cleanup
     activeUUIDs = Object.keys(ACTIVE_BOTS);
   }
+
 
   for (const uuid of activeUUIDs) {
     const bot = ACTIVE_BOTS[uuid];
