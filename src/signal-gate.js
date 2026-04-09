@@ -292,6 +292,100 @@ async function fetchCandles(pairInfo, interval, limit) {
 }
 
 /**
+ * v3.9.8: Multi-source live spot price — never depends on a single provider.
+ * Tries multiple sources in parallel, returns the fastest successful response.
+ * This is the CRITICAL price feed for drawdown protection and profit shield.
+ *
+ * Sources: Bybit (public, no geo-block), CryptoCompare (cloud-friendly),
+ *          Binance Data Vision (public read-only), Binance Futures (may geo-block).
+ *
+ * @param {string} symbol — e.g. 'SOLUSDT'
+ * @returns {number|null} — live price or null if ALL sources fail
+ */
+async function getSpotPriceMultiSource(symbol) {
+  const pairInfo = Object.values(PAIR_TO_SYMBOL).find(p => p.symbol === symbol);
+  const base = pairInfo ? pairInfo.base : symbol.replace('USDT', '');
+  const timeout = 4000;
+
+  const sources = [
+    // Bybit — public, no geo-block, fast
+    async () => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeout);
+      try {
+        const url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`Bybit ${res.status}`);
+        const json = await res.json();
+        if (json.retCode !== 0) throw new Error(`Bybit: ${json.retMsg}`);
+        const price = parseFloat(json.result.list[0]?.lastPrice);
+        if (isNaN(price) || price <= 0) throw new Error('Bybit: invalid price');
+        return { price, source: 'Bybit' };
+      } catch (err) { clearTimeout(t); throw err; }
+    },
+    // CryptoCompare — cloud-friendly, no geo-block
+    async () => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeout);
+      try {
+        const apiKey = process.env.CRYPTOCOMPARE_API_KEY || '';
+        const keyParam = apiKey ? `&api_key=${apiKey}` : '';
+        const url = `https://min-api.cryptocompare.com/data/price?fsym=${base}&tsyms=USDT${keyParam}`;
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`CryptoCompare ${res.status}`);
+        const json = await res.json();
+        const price = parseFloat(json.USDT);
+        if (isNaN(price) || price <= 0) throw new Error('CryptoCompare: invalid price');
+        return { price, source: 'CryptoCompare' };
+      } catch (err) { clearTimeout(t); throw err; }
+    },
+    // Binance Futures public ticker (no API key needed, but may geo-block)
+    async () => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeout);
+      try {
+        const url = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`Binance-Futures ${res.status}`);
+        const json = await res.json();
+        const price = parseFloat(json.price);
+        if (isNaN(price) || price <= 0) throw new Error('Binance-Futures: invalid price');
+        return { price, source: 'Binance-Futures' };
+      } catch (err) { clearTimeout(t); throw err; }
+    },
+    // Binance Data Vision (public read-only, different CDN)
+    async () => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeout);
+      try {
+        const url = `https://data-api.binance.vision/api/v3/ticker/price?symbol=${symbol}`;
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`Binance-Data ${res.status}`);
+        const json = await res.json();
+        const price = parseFloat(json.price);
+        if (isNaN(price) || price <= 0) throw new Error('Binance-Data: invalid price');
+        return { price, source: 'Binance-Data' };
+      } catch (err) { clearTimeout(t); throw err; }
+    },
+  ];
+
+  // Race all sources — first success wins
+  try {
+    const result = await Promise.any(sources.map(fn => fn()));
+    console.log(`[SPOT PRICE] ${symbol}: $${result.price.toFixed(2)} via ${result.source}`);
+    return result.price;
+  } catch (err) {
+    // All sources failed
+    console.log(`[SPOT PRICE] ${symbol}: ALL SOURCES FAILED — ${err.errors?.map(e => e.message).join('; ') || err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetch whale positions from Hyperliquid (v3.2.0).
  * Queries the clearinghouseState endpoint for each tracked wallet.
  * Returns an array of { label, coin, direction, size, leverage, unrealizedPnl, roe }.
@@ -553,7 +647,7 @@ async function validateSignal(pair, direction) {
     // v3.5.0: Use LIVE spot price for gate decisions, not stale candle close.
     // Daily candle close can be up to 24 hours old — useless for real-time gating.
     // Falls back to candle close if spot fetch fails.
-    const spotPrice = await binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null);
+    const spotPrice = await getSpotPriceMultiSource(pairInfo.symbol);
     const currentPrice = spotPrice || candleClose;
 
     // Calculate 1h EMA 9 and EMA 21 (short-term trend)
@@ -849,7 +943,7 @@ async function revalidateSignal(pair, direction) {
     const [dailyCandles, fourHourCandles, spotPrice] = await Promise.all([
       fetchCandles(pairInfo, CONFIG.trendEma.timeframe, CONFIG.trendEma.candlesNeeded),
       fetchCandles(pairInfo, CONFIG.shortTermEma.timeframe, CONFIG.shortTermEma.candlesNeeded),
-      binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null),
+      getSpotPriceMultiSource(pairInfo.symbol),
     ]);
 
     const fourHourCloses = fourHourCandles.map(c => c.close);
@@ -1031,7 +1125,7 @@ async function getCrossoverProximity() {
       }
 
       const closes = candles.map(c => c.close);
-      const spotPrice = await binanceApi.getSpotPrice(pairInfo.symbol).catch(() => null);
+      const spotPrice = await getSpotPriceMultiSource(pairInfo.symbol);
       const currentPrice = spotPrice || closes[closes.length - 1];
 
       // Calculate EMA9 and EMA21 at multiple points to get convergence rate
@@ -1124,4 +1218,4 @@ async function getCrossoverProximity() {
   return results;
 }
 
-module.exports = { validateSignal, revalidateSignal, getConfig, getCrossoverProximity, CONFIG };
+module.exports = { validateSignal, revalidateSignal, getConfig, getCrossoverProximity, getSpotPriceMultiSource, CONFIG };

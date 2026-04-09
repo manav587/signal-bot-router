@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.7';
+const VERSION = '3.9.8';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -2426,9 +2426,13 @@ async function handleTelegramCommand(text, chatId) {
       const result = await binanceApi.testConnection();
       let lines = ['🔍 <b>Binance API Diagnostic</b>\n'];
       lines.push(`Key: ${result.keyPrefix}`);
-      lines.push(`Proxy: ${binanceApi.isProxyConfigured() ? '✅ Cloudflare Worker' : '❌ Direct (geo-blocked from US)'}`);
-      lines.push(`HTTP: ${result.status}`);
-      lines.push(`OK: ${result.ok}`);
+      lines.push(`Region: Singapore`);
+      lines.push(`Signed API: HTTP ${result.status} ${result.ok ? '✅' : '❌'}`);
+
+      // v3.9.8: Test multi-source live price feed (the critical safety feed)
+      const testSymbol = 'BTCUSDT';
+      const livePrice = await signalGate.getSpotPriceMultiSource(testSymbol);
+      lines.push(`Live price feed: ${livePrice ? `✅ BTC $${livePrice.toFixed(2)}` : '❌ ALL SOURCES FAILED'}`);
 
       if (!result.ok) {
         // Show the error — this is what we need to debug
