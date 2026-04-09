@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.0.0';
+const VERSION = '4.0.1';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1359,6 +1359,7 @@ const REVAL_GRACE_PERIOD_MS = 3 * 60 * 1000; // 3 minutes
 const REVAL_MAX_UNDERWATER_MS = 2 * 60 * 60 * 1000; // 2 hours (was 12h)
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" if 0.1%+ against entry
+const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite crossover probability > 80%
 let revalRunning = false;
 
 // v3.9.3: Ghost deal detection — track PnL across reval cycles.
@@ -1600,7 +1601,46 @@ async function runRevalidation() {
                 // Relay's external gates provide safety — stop bot if gates fail.
                 const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
                 if (fullGate.allowed) {
-                  // External gates pass — ASAP will re-open after 5-min cooldown
+                  // v4.0.1: Proximity gate — even if EMAs still aligned, block re-entry
+                  // when the opposite crossover is imminent (>80% probability).
+                  // This prevents the SL→cooldown→re-enter→SL churn loop.
+                  let proximityBlocked = false;
+                  try {
+                    const proximity = await signalGate.getCrossoverProximity();
+                    const pairProx = proximity[bot.pair];
+                    if (pairProx && !pairProx.error && pairProx.probability >= PROXIMITY_BLOCK_THRESHOLD) {
+                      // Crossover is imminent — the "nextSignal" is the OPPOSITE direction
+                      // If bot is LONG and nextSignal says SHORT is coming, block re-entry
+                      const oppositeDirection = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
+                      if (pairProx.nextSignal && pairProx.nextSignal.toUpperCase().includes(oppositeDirection)) {
+                        proximityBlocked = true;
+                        log(`🛑 Proximity block: ${bot.botName} — ${pairProx.probability}% chance of ${pairProx.nextSignal}, blocking ASAP re-entry`);
+                      }
+                    }
+                  } catch (proxErr) {
+                    log(`⚠️ Proximity check failed for ${bot.botName}: ${proxErr.message} — allowing re-entry (fail-open)`);
+                  }
+
+                  if (proximityBlocked) {
+                    // Stop the bot to prevent ASAP re-entry into an imminent reversal
+                    log(`🔄 Re-entry: ${bot.botName} deal closed, gates pass BUT proximity block active — stopping bot`);
+                    tradeJournal.recordExit({ botUuid: uuid, exitPrice: fullGate.data?.currentPrice || bot.entryPrice, exitReason: 'proximity-block' });
+                    try {
+                      await sendAction({ action: 'stopBot', uuid });
+                    } catch (stopErr) {
+                      log(`🔄 Proximity block: stopBot failed for ${bot.botName}: ${stopErr.message}`);
+                    }
+                    delete ACTIVE_BOTS[uuid];
+                    delete LAST_DIRECTION[bot.pair];
+                    sendTelegramAlert(
+                      `🛑 ${bot.botName} stopped — crossover imminent\n\n` +
+                      `Deal closed (TP/SL), and the EMAs technically still support ${bot.direction}.\n` +
+                      `But the opposite crossover is 80+% likely — re-entering now would risk another stop loss.\n\n` +
+                      `Bot stopped to avoid churn. Will re-enter when the next clear TradingView signal arrives.\n\n` +
+                      `${istTimestamp()}`
+                    ).catch(() => {});
+                  } else {
+                  // External gates pass + no proximity block — ASAP will re-open after 5-min cooldown
                   bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
                   log(`🔄 Re-entry: ${bot.botName} deal closed, external gates PASS — ASAP will re-enter after cooldown @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
                   // Only send Telegram once per hour per bot (not every 2 min)
@@ -1617,6 +1657,7 @@ async function runRevalidation() {
                       `${istTimestamp()}`
                     ).catch(() => {});
                   }
+                  } // end else (no proximity block)
                 } else {
                   // External gates fail — stop bot before ASAP reopens
                   log(`🔄 Re-entry: ${bot.botName} deal closed, external gates FAILED — stopping bot`);
