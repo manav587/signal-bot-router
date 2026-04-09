@@ -523,10 +523,6 @@ async function getExchangePositionMap() {
 }
 
 
-  log(`getExchangePositionMap: ${map.size} active position(s)${map.size > 0 ? ' — ' + [...map.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
-  return map;
-}
-
 function isConfigured() {
   return API_KEY.length > 0 && API_SECRET.length > 0;
 }
