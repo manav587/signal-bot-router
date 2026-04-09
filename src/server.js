@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.5';
+const VERSION = '3.9.6';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1374,8 +1374,8 @@ let revalRunning = false;
 // consecutive cycles, the Gainium deal is likely a ghost (Binance position closed
 // externally but Gainium still shows deal "open"). Cancel the deal so the v3.9.2
 // cross-check can detect the mismatch and clean up.
-const GHOST_STALE_CYCLES = 15; // 15 x 2min = 30 minutes of frozen PnL -> ghost alert (alert-only, no auto-cancel)
-const GHOST_PROBE = new Map(); // uuid -> { pnl: number, staleCount: number }
+const GHOST_STALE_CYCLES = 15; // 15 × 2min = 30 minutes of frozen PnL → ghost alert (alert-only, no auto-cancel)
+const GHOST_PROBE = new Map(); // uuid → { pnl: number, staleCount: number }
 
 async function runRevalidation() {
   if (revalRunning) return; // prevent overlapping runs
@@ -1421,11 +1421,11 @@ async function runRevalidation() {
         // PnL unchanged from last cycle
         probe.staleCount++;
         if (probe.staleCount >= GHOST_STALE_CYCLES) {
-          // v3.9.4: ALERT ONLY -- do NOT auto-cancel.
-          // Gainium API returns cached PnL that can be stale for real positions too.
+          // v3.9.4: ALERT ONLY — do NOT auto-cancel.
+          // Gainium's API returns cached PnL that can be stale for real positions too.
           // False positives at 3 cycles (v3.9.3) canceled real ETH/BTC deals.
-          // Now: alert at 30 min, let operator decide via /kill or manual close.
-          log(`👻 Ghost probe: ${bot.botName} PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} cycles (${probe.staleCount * 2} min) -- ALERT ONLY`);
+          // Now: alert at 30 min, let operator decide via /kill or manual Gainium close.
+          log(`👻 Ghost probe: ${bot.botName} PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} cycles (${probe.staleCount * 2} min) — ALERT ONLY`);
           sendTelegramAlert(
             `👻 Possible ghost deal: ${bot.botName}\n\n` +
             `PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} reval cycles (${probe.staleCount * 2} min).\n` +
@@ -1433,7 +1433,7 @@ async function runRevalidation() {
             `If you closed this position manually, use /kill ${bot.pair.replace('USDT', '').replace('/USDT', '')} to clean up.\n\n` +
             `${istTimestamp()}`
           ).catch(() => {});
-          // Reset counter so we dont spam alerts every cycle -- re-alert after another 30 min
+          // Reset counter so we don't spam alerts every cycle — re-alert after another 30 min
           GHOST_PROBE.set(uuid, { pnl: currentPnl, staleCount: 0 });
         }
       } else {
@@ -1487,7 +1487,6 @@ async function runRevalidation() {
     // Refresh activeUUIDs after cleanup
     activeUUIDs = Object.keys(ACTIVE_BOTS);
   }
-
 
   for (const uuid of activeUUIDs) {
     const bot = ACTIVE_BOTS[uuid];
@@ -2247,11 +2246,11 @@ setTimeout(runSelfHeal, 30 * 1000);
 
 // ── v3.9.1: Crossover Proximity Auto-Alert ──────────────────────────────
 // Checks every 15 min if any pair's EMA9/EMA21 gap is narrowing fast.
-// Sends Telegram alert when probability hits threshold.
-const PROXIMITY_ALERT_INTERVAL = 15 * 60 * 1000;
-const PROXIMITY_ALERT_THRESHOLD = 60;
-let lastProximityAlert = {};
-const PROXIMITY_ALERT_COOLDOWN = 60 * 60 * 1000;
+// Sends Telegram alert when probability hits threshold — wake-up call.
+const PROXIMITY_ALERT_INTERVAL = 15 * 60 * 1000; // 15 minutes
+const PROXIMITY_ALERT_THRESHOLD = 60; // probability % to trigger alert
+let lastProximityAlert = {}; // pair → timestamp, prevent spam (1h cooldown per pair)
+const PROXIMITY_ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hour per pair
 
 async function checkCrossoverProximity() {
   if (PAUSED) return;
@@ -2261,6 +2260,7 @@ async function checkCrossoverProximity() {
       if (d.error || !d.converging) continue;
       if (d.probability < PROXIMITY_ALERT_THRESHOLD) continue;
 
+      // Cooldown: don't spam the same pair
       const lastAlert = lastProximityAlert[pair];
       if (lastAlert && (Date.now() - lastAlert) < PROXIMITY_ALERT_COOLDOWN) continue;
 
@@ -2293,6 +2293,7 @@ async function checkCrossoverProximity() {
 }
 
 setInterval(checkCrossoverProximity, PROXIMITY_ALERT_INTERVAL);
+// First check after 2 minutes
 setTimeout(checkCrossoverProximity, 2 * 60 * 1000);
 
 // ── Daily P&L Summary (v3.6.0) ─────────────────────────────────────────

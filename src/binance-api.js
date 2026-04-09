@@ -79,7 +79,10 @@ async function getOpenPositions(symbol) {
     if (!res.ok) {
       const text = await res.text();
       log(`getOpenPositions error (${res.status}): ${text.substring(0, 300)}`);
-      return [];
+      // v3.9.6: THROW on API errors so callers know the data is unreliable.
+      // Returning [] caused getExchangePositionMap to think "no positions exist",
+      // which triggered false external-close detection and canceled real deals.
+      throw new Error(`Binance API ${res.status}: ${text.substring(0, 200)}`);
     }
 
     const positions = await res.json();

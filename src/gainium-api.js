@@ -471,9 +471,10 @@ async function listAllOpenDeals() {
  * v3.9.5: When BINANCE_PROXY_URL is set, uses REAL Binance position data
  * via Cloudflare Worker proxy (bypasses US geo-block). This is ground truth.
  *
- * Fallback: Gainium's open deals (stale/cached -- cannot detect external closes).
+ * Fallback: Gainium's open deals (stale/cached — cannot detect external closes).
  *
  * @returns {Map<string, { symbol, side, size, entryPrice, markPrice, pnl, leverage, marginType, notional, source }>}
+ *          Key = base asset (e.g. 'SOL'), Value = position details. Only non-zero positions.
  */
 async function getExchangePositionMap() {
   // v3.9.5: Prefer real Binance data when proxy is available
@@ -481,15 +482,19 @@ async function getExchangePositionMap() {
   if (binanceApi.isProxyConfigured() && binanceApi.isConfigured()) {
     try {
       const binanceMap = await binanceApi.getPositionMap();
-      if (binanceMap.size >= 0) {
-        for (const [key, val] of binanceMap) {
-          val.source = 'binance';
-          val.positionAmt = val.side === 'SHORT' ? -val.size : val.size;
-        }
-        log(`getExchangePositionMap: ${binanceMap.size} position(s) from BINANCE (live)${binanceMap.size > 0 ? ' -- ' + [...binanceMap.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
-        return binanceMap;
+      // v3.9.6: getPositionMap now THROWS on API errors (451, timeout, etc.)
+      // If we reach here, the API call succeeded — trust the data.
+      for (const [key, val] of binanceMap) {
+        val.source = 'binance';
+        val.positionAmt = val.side === 'SHORT' ? -val.size : val.size;
       }
+      log(`getExchangePositionMap: ${binanceMap.size} position(s) from BINANCE (live)${binanceMap.size > 0 ? ' — ' + [...binanceMap.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
+      return binanceMap;
     } catch (err) {
+      // v3.9.6: Binance failed — fall back to Gainium deals.
+      // This is SAFE: Gainium deals are stale but never cause false "external close"
+      // because the cross-check only fires when a tracked bot has NO matching deal,
+      // and Gainium deals persist even if the Binance position is gone.
       log(`getExchangePositionMap: Binance proxy failed (${err.message}), falling back to Gainium deals`);
     }
   }
@@ -518,7 +523,7 @@ async function getExchangePositionMap() {
     });
   }
 
-  log(`getExchangePositionMap: ${map.size} active position(s) from GAINIUM (fallback)${map.size > 0 ? ' -- ' + [...map.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
+  log(`getExchangePositionMap: ${map.size} active position(s) from GAINIUM (fallback)${map.size > 0 ? ' — ' + [...map.entries()].map(([k, v]) => `${k} ${v.side} $${v.pnl.toFixed(2)}`).join(', ') : ''}`);
   return map;
 }
 
