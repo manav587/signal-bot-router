@@ -9,8 +9,8 @@
  *
  * Security: requires X-Proxy-Token header matching the PROXY_TOKEN secret.
  *
- * Deploy: Cloudflare Dashboard -> Workers -> Create -> paste this code
- * Set secret: Settings -> Variables -> PROXY_TOKEN = (generate a random string)
+ * Deploy: Cloudflare Dashboard → Workers → Create → paste this code
+ * Set secret: Settings → Variables → PROXY_TOKEN = (generate a random string)
  *
  * Relay config: set BINANCE_PROXY_URL=https://your-worker.workers.dev in Render env vars
  */
@@ -21,14 +21,15 @@ export default {
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
-          'Access-Control-Allow-Origin': '*',          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'X-MBX-APIKEY, X-Proxy-Token, Content-Type',
           'Access-Control-Max-Age': '86400',
         },
       });
     }
 
-    // Auth check
+    // Auth check — reject requests without valid proxy token
     const proxyToken = request.headers.get('X-Proxy-Token');
     if (!env.PROXY_TOKEN || proxyToken !== env.PROXY_TOKEN) {
       return new Response(JSON.stringify({ error: 'Unauthorized' }), {
@@ -44,9 +45,11 @@ export default {
         headers: { 'Content-Type': 'application/json' },
       });
     }
+
     // Forward to Binance Futures API
     const binanceUrl = `https://fapi.binance.com${url.pathname}${url.search}`;
 
+    // Copy relevant headers (API key, content type)
     const forwardHeaders = new Headers();
     const apiKey = request.headers.get('X-MBX-APIKEY');
     if (apiKey) forwardHeaders.set('X-MBX-APIKEY', apiKey);
