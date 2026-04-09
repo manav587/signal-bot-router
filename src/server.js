@@ -705,7 +705,7 @@ async function processActions(actions, requestId, isRetry = false, context = {})
   // After TP/SL, ASAP re-enters after 5-min cooldown (Gainium-side).
   // Relay safety layers prevent churning:
   //   - 5-min cooldown between deals (Gainium-side, longer than 2-min reval)
-  //   - 2-min revalidation with 4% drawdown kill (relay-side)
+  //   - 2-min revalidation with 0.8% drawdown kill (relay-side)
   //   - Bot stopped if external gates fail while deal is closed (pre-re-entry)
 
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
@@ -1360,6 +1360,7 @@ const REVAL_GRACE_PERIOD_MS = 3 * 60 * 1000; // 3 minutes
 // Strong trend exception still applies but with shorter leash.
 const REVAL_MAX_UNDERWATER_MS = 2 * 60 * 60 * 1000; // 2 hours (was 12h)
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
+const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" if 0.1%+ against entry
 let revalRunning = false;
 
 // v3.9.3: Ghost deal detection — track PnL across reval cycles.
@@ -1514,7 +1515,7 @@ async function runRevalidation() {
       // v3.8.2: Trend-aware time stop — learned from copy trader analysis.
       // Old: flat time stop killed positions when EMAs still confirmed the direction.
       // New: if EMA spread is strong (≥ 0.5%), trust the trend — no time stop.
-      // The 2% drawdown hard stop is the real safety net.
+      // The 0.8% drawdown hard stop is the real safety net.
       // Only time-stop when trend is weak (thin EMA spread) AND underwater too long.
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
@@ -2322,21 +2323,21 @@ async function handleTelegramCommand(text, chatId) {
         const entry = deal.avgPrice || 0;
         const pnl = deal.stats?.unrealizedProfit || 0;
         const margin = deal.usage?.currentUsd || deal.cost || 0;
-        // Price deviation % (what TP is measured against)
-        const pctPrice = margin > 0 ? ((pnl / (margin * 5)) * 100).toFixed(1) : '0.0';
+        // v4.0.0: Price deviation % at 10x leverage
+        const pctPrice = margin > 0 ? ((pnl / (margin * 10)) * 100).toFixed(2) : '0.00';
         totalProfit += pnl;
 
         const dir = botInfo.name.includes('Short') ? 'SHORT' : 'LONG';
-        const bar = buildProgressBar(parseFloat(pctPrice), 5);
 
         const pctFloat = parseFloat(pctPrice);
-        const shieldStatus = pctFloat >= 2.0 ? '✅' : `${(2.0 - pctFloat).toFixed(1)}% away`;
-        const movingSLStatus = pctFloat >= 2.5 ? '✅ Active' : `${(2.5 - pctFloat).toFixed(1)}% away`;
-        const toTP = (5.0 - pctFloat).toFixed(1);
+        // v4.0.0: Updated thresholds to match scalp mode parameters
+        const shieldStatus = pctFloat >= REVAL_PROFIT_SHIELD_PCT ? '✅' : `${(REVAL_PROFIT_SHIELD_PCT - pctFloat).toFixed(2)}% away`;
+        const movingSLStatus = pctFloat >= 0.4 ? '✅ Active' : `${(0.4 - pctFloat).toFixed(2)}% away`;
+        const toTP = (0.8 - pctFloat).toFixed(2);
 
         lines.push(`<b>${pair} ${dir}</b>`);
         lines.push(`  Entry: $${entry}  |  P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pctPrice}%)`);
-        lines.push(`  ${buildProgressBar(pctFloat, 5)} → 5% TP (${toTP}% to go)`);
+        lines.push(`  ${buildProgressBar(pctFloat, 0.8)} → 0.8% TP (${toTP}% to go)`);
         lines.push(`  Profit Shield: ${shieldStatus}  |  Moving SL: ${movingSLStatus}`);
         lines.push('');
       }
