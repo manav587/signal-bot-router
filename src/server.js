@@ -1339,10 +1339,8 @@ app.post('/webhook', (req, res) => {
 // and Gate 4 (RSI direction). If conditions have changed, stop the bot.
 // FAIL-CLOSED: If data fetch fails, stop the bot.
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
-// v3.6.2: Drawdown limit — was 4% (set in v3.4.0 for DCA room). But at 5x leverage
-// a 4% price move = 20% ROI loss. Binance position history showed positions bleeding
-// 2.4-3.7% (12-19% ROI) for hours without triggering the hard stop.
 // v4.0.0 SCALP MODE: Tight parameters for fast-cycling $5-10 scalps.
+// History: was 4% (v3.4.0) → 3.5% → 2.0% (v3.8.3) → now 0.8%.
 // Gainium SL is 0.5% — relay drawdown at 0.8% is the backup safety net.
 // At 10x leverage, 0.8% price = 8% ROI loss (hard cap).
 // No DCA orders, so no safety order room needed.
@@ -1475,6 +1473,14 @@ async function runRevalidation() {
         log(`🔄 Reval: ${bot.botName} no entry price — using spot $${effectiveEntry.toFixed(2)} as baseline for drawdown protection`);
       }
 
+      // v4.0.0: Guard against zero/undefined entry price before any division.
+      // Without this, effectiveEntry=0 causes Infinity in profit shield (holds losers)
+      // and NaN in drawdown check (disables safety). Skip this bot until entry is known.
+      if (!effectiveEntry || effectiveEntry <= 0) {
+        log(`⚠️ Reval: ${bot.botName} — no valid entry price (${effectiveEntry}), skipping safety checks this cycle`);
+        continue;
+      }
+
       // v3.2.3: Profit shield — if the deal is significantly in profit,
       // don't flip on a marginal EMA cross.
       if (!result.allowed && effectiveEntry && result.data.currentPrice) {
@@ -1493,9 +1499,8 @@ async function runRevalidation() {
         }
       }
 
-      // v3.6.2: Price drawdown check — was 4%, now 2% to account for 5x leverage.
-      // At 5x, a 2% price move = 10% ROI loss. Previously positions bled 3-3.7%
-      // (15-19% ROI) without triggering the 4% hard stop.
+      // v4.0.0: Price drawdown check — 0.8% at 10x = 8% ROI loss hard cap.
+      // Gainium SL at 0.5% should trigger first; this is the relay-side backup.
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
 

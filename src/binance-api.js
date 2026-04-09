@@ -92,7 +92,10 @@ async function getOpenPositions(symbol) {
     return open;
   } catch (err) {
     log(`getOpenPositions error: ${err.message}`);
-    return [];
+    // v4.0.0: RE-THROW so callers know the API failed.
+    // The old `return []` silently swallowed errors, defeating the v3.9.6 fix.
+    // getExchangePositionMap() catches this and falls back to Gainium deals.
+    throw err;
   }
 }
 

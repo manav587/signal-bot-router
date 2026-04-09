@@ -950,8 +950,16 @@ async function revalidateSignal(pair, direction) {
     const dailyCloses = dailyCandles.map(c => c.close);
 
     // v3.5.0: Use live spot price, fall back to 1H candle close
-    const candlePrice = fourHourCloses[fourHourCloses.length - 1];
+    const candlePrice = fourHourCloses.length > 0 ? fourHourCloses[fourHourCloses.length - 1] : undefined;
     const currentPrice = spotPrice || candlePrice;
+
+    // v4.0.0: If no valid price source exists, fail-closed — don't make gating
+    // decisions on undefined/NaN data. This prevents NaN propagation through
+    // EMA calculations and corrupted drawdown checks in server.js.
+    if (currentPrice === undefined || currentPrice === null || isNaN(currentPrice)) {
+      console.log(`[REVAL] ${pair} ${direction}: No valid price source — fail-closed`);
+      return { allowed: false, reason: 'No valid price source (spot + candles failed)', data };
+    }
 
     // Gate 1: Daily EMA50 (v3.5.0 — now checked during revalidation too)
     const ema50 = calculateEMA(dailyCloses, CONFIG.trendEma.period);
@@ -978,8 +986,8 @@ async function revalidateSignal(pair, direction) {
     data.currentPrice = currentPrice;
     data.spotPrice = spotPrice;
     data.ema50 = ema50;
-    data.ema9_4h = ema9;
-    data.ema21_4h = ema21;
+    data.ema9_1h = ema9;   // v4.0.0: renamed from ema9_4h (migrated to 1H in v3.7.0)
+    data.ema21_1h = ema21; // v4.0.0: renamed from ema21_4h
     data.shortTermTrend = (ema9 && ema21) ? (ema9 > ema21 ? 'BULLISH' : 'BEARISH') : 'UNKNOWN';
     data.rsi14 = rsi14;
     data.rsiDirection = rsiDirection;

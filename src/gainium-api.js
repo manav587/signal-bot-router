@@ -255,7 +255,7 @@ async function verifyAndForceClose(botUuid, botMongoId, botName, maxRetries = 3)
     }
 
     // Wait for Binance to process the close
-    log(`[${botName}] Waiting 5s for Binance to settle after force-close...`);
+    log(`[${botName}] Waiting 10s for Binance to settle after force-close...`);
     await new Promise(r => setTimeout(r, 10000));
   }
 
