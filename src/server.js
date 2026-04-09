@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.8';
+const VERSION = '4.0.0';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1342,30 +1342,23 @@ const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
 // v3.6.2: Drawdown limit — was 4% (set in v3.4.0 for DCA room). But at 5x leverage
 // a 4% price move = 20% ROI loss. Binance position history showed positions bleeding
 // 2.4-3.7% (12-19% ROI) for hours without triggering the hard stop.
-// v3.8.3: 3.5% → 2.0% for 10x leverage. At 10x, 2% price = 20% ROI loss.
-// Was 3.5% when running 5x (= 17.5% ROI). Now all bots on 10x, so tighten
-// to keep same ~20% ROI pain level. Gainium SL backstop also tightened 8% → 5%.
-// Safety orders room: 0.3% step × 2 orders = 0.6%, well within 2%.
-const REVAL_MAX_DRAWDOWN_PCT = 2.0;
-// v3.2.3: Profit protection — don't flip a deal that's significantly in profit
-// unless the EMA spread is convincingly wide. If a deal is up > this threshold,
-// the revalidation result is overridden to "allowed" with a log note.
-const REVAL_PROFIT_SHIELD_PCT = 2.0;   // Skip flip if deal is > 2% in profit
-// v3.6.2: Grace period — reverted from 20min back to 5min.
-// v3.6.1 extended to 20min based on theory that reval was cutting winners short.
-// Binance data showed the opposite: reval wasn't cutting ANYTHING. Positions sat
-// underwater 10-30 hours with no intervention. 5 min = enough for Gainium deal
-// creation + first safety order, then full reval protection kicks in.
-const REVAL_GRACE_PERIOD_MS = 20 * 60 * 1000; // 20 minutes (v3.7.0: was 5min) // 5 minutes
-// v3.8.2: Trend-aware time stop — learned from copy trader analysis.
-// Old: flat 4h/8h time stop killed ETH SHORT at 0.13% against entry while
-// 1H EMAs still confirmed bearish. Copy trader held 4 days through 4.3% adverse
-// and recovered because the trend was right.
-//
-// New logic: EMA spread determines patience.
-//   Strong trend (spread ≥ 0.5%): NO time stop — trust the trend. 2% drawdown is safety net.
-//   Weak trend (spread < 0.5%):   12h time stop — trend is thin, don't overstay.
-const REVAL_MAX_UNDERWATER_MS = 12 * 60 * 60 * 1000; // 12 hours — only used when trend is weak
+// v4.0.0 SCALP MODE: Tight parameters for fast-cycling $5-10 scalps.
+// Gainium SL is 0.5% — relay drawdown at 0.8% is the backup safety net.
+// At 10x leverage, 0.8% price = 8% ROI loss (hard cap).
+// No DCA orders, so no safety order room needed.
+const REVAL_MAX_DRAWDOWN_PCT = 0.8;
+// v4.0.0: Profit shield lowered to match scalp TP (0.8%).
+// With 0.8% TP + 0.3% trailing, positions close fast. Shield at 0.5%
+// still protects a winning trade from being flipped by a brief EMA wobble.
+const REVAL_PROFIT_SHIELD_PCT = 0.5;
+// v4.0.0: Grace period tightened for scalp mode.
+// Scalp entries fill instantly (market orders). 3 min is plenty for
+// Gainium deal creation, then full reval protection kicks in.
+const REVAL_GRACE_PERIOD_MS = 3 * 60 * 1000; // 3 minutes
+// v4.0.0: Max underwater tightened for scalp mode.
+// No scalp should sit underwater for 2 hours. If it does, the trade thesis is wrong.
+// Strong trend exception still applies but with shorter leash.
+const REVAL_MAX_UNDERWATER_MS = 2 * 60 * 60 * 1000; // 2 hours (was 12h)
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 let revalRunning = false;
 
