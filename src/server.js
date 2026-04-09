@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '3.9.3';
+const VERSION = '3.9.4';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1374,7 +1374,7 @@ let revalRunning = false;
 // consecutive cycles, the Gainium deal is likely a ghost (Binance position closed
 // externally but Gainium still shows deal "open"). Cancel the deal so the v3.9.2
 // cross-check can detect the mismatch and clean up.
-const GHOST_STALE_CYCLES = 3; // 3 x 2min = 6 minutes of frozen PnL -> ghost probe
+const GHOST_STALE_CYCLES = 15; // 15 x 2min = 30 minutes of frozen PnL -> ghost alert (alert-only, no auto-cancel)
 const GHOST_PROBE = new Map(); // uuid -> { pnl: number, staleCount: number }
 
 async function runRevalidation() {
@@ -1421,27 +1421,20 @@ async function runRevalidation() {
         // PnL unchanged from last cycle
         probe.staleCount++;
         if (probe.staleCount >= GHOST_STALE_CYCLES) {
-          log(`👻 Ghost probe: ${bot.botName} PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} cycles — canceling Gainium deal`);
-          const botInfo = BOT_MAP[uuid];
-          if (botInfo) {
-            try {
-              const cancelResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName, 'cancel');
-              log(`👻 Ghost cancel: ${bot.botName} — ${cancelResult.closed} deal(s) canceled`);
-              sendTelegramAlert(
-                `👻 Ghost deal detected: ${bot.botName}\n\n` +
-                `PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} reval cycles (${probe.staleCount * 2} min).\n` +
-                `Gainium deal canceled. If Binance position is truly gone, cleanup will follow in next cycle.\n\n` +
-                `${istTimestamp()}`
-              ).catch(() => {});
-            } catch (err) {
-              log(`👻 Ghost cancel error for ${bot.botName}: ${err.message}`);
-            }
-          }
-          GHOST_PROBE.delete(uuid);
-          // Don't delete from ACTIVE_BOTS here — let the cross-check below handle
-          // it on the NEXT cycle once the Gainium deal is gone.
-          // If the position was real (rare false positive in perfectly flat market),
-          // the deal cancel closed it cleanly and the relay will stop tracking.
+          // v3.9.4: ALERT ONLY -- do NOT auto-cancel.
+          // Gainium API returns cached PnL that can be stale for real positions too.
+          // False positives at 3 cycles (v3.9.3) canceled real ETH/BTC deals.
+          // Now: alert at 30 min, let operator decide via /kill or manual close.
+          log(`👻 Ghost probe: ${bot.botName} PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} cycles (${probe.staleCount * 2} min) -- ALERT ONLY`);
+          sendTelegramAlert(
+            `👻 Possible ghost deal: ${bot.botName}\n\n` +
+            `PnL frozen at $${currentPnl.toFixed(4)} for ${probe.staleCount} reval cycles (${probe.staleCount * 2} min).\n` +
+            `This MAY be a ghost deal (position closed on Binance but Gainium deal still open).\n` +
+            `If you closed this position manually, use /kill ${bot.pair.replace('USDT', '').replace('/USDT', '')} to clean up.\n\n` +
+            `${istTimestamp()}`
+          ).catch(() => {});
+          // Reset counter so we dont spam alerts every cycle -- re-alert after another 30 min
+          GHOST_PROBE.set(uuid, { pnl: currentPnl, staleCount: 0 });
         }
       } else {
         // PnL changed — position is alive, reset probe
