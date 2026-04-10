@@ -776,6 +776,16 @@ async function processActions(actions, requestId, isRetry = false, context = {})
 
     log(`[${requestId}]   ${i + 1}/${actions.length}: ${actionName} → ${shortUuid}...`);
 
+    // v4.0.4: Ensure bot is "open" on Gainium before sending startBot webhook.
+    // Gainium silently ignores webhooks when bot status is "closed".
+    if (actionName === 'startBot' && BOT_MAP[uuid]) {
+      const botInfo = BOT_MAP[uuid];
+      const ensureResult = await gainiumApi.ensureBotOpen(botInfo.mongoId, botInfo.name);
+      if (!ensureResult.wasOpen) {
+        log(`[${requestId}]   🔧 ${botInfo.name} was closed — started via REST API before webhook`);
+      }
+    }
+
     try {
       const result = await sendAction(action);
       log(`[${requestId}]   ✓ ${actionName} returned ${result.status}`);

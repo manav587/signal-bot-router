@@ -529,6 +529,65 @@ function isConfigured() {
   return API_KEY.length > 0 && API_SECRET.length > 0;
 }
 
+// ── v4.0.4: Ensure bot is in "open" state before webhook dispatch ───────
+// Gainium ignores webhook startBot/stopBot when bot status is "closed".
+// This function checks status and starts the bot via REST API if needed.
+
+async function ensureBotOpen(botMongoId, botName) {
+  const endpoint = `/api/bots/dca/${botMongoId}?fields=status`;
+  const url = `${BASE_URL}${endpoint}`;
+  const method = 'GET';
+  const headers = authHeaders(method, endpoint);
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
+    const res = await fetch(url, { method, headers, signal: controller.signal });
+    clearTimeout(timeout);
+
+    const json = await res.json();
+    if (json.status !== 'OK' || !json.data) {
+      log(`ensureBotOpen [${botName}]: could not fetch status — ${JSON.stringify(json).substring(0, 200)}`);
+      return { wasOpen: true, error: null }; // Assume open, don't block
+    }
+
+    const botStatus = json.data.status;
+    if (botStatus === 'open') {
+      return { wasOpen: true, error: null };
+    }
+
+    // Bot is closed — start it via REST API
+    log(`ensureBotOpen [${botName}]: bot is "${botStatus}" — starting via REST API`);
+    const startEndpoint = `/api/bots/dca/${botMongoId}/start`;
+    const startUrl = `${BASE_URL}${startEndpoint}`;
+    const startMethod = 'POST';
+    const startHeaders = authHeaders(startMethod, startEndpoint);
+
+    const startController = new AbortController();
+    const startTimeout = setTimeout(() => startController.abort(), 8000);
+
+    const startRes = await fetch(startUrl, {
+      method: startMethod,
+      headers: startHeaders,
+      signal: startController.signal,
+    });
+    clearTimeout(startTimeout);
+
+    const startJson = await startRes.json();
+    if (startJson.status === 'OK') {
+      log(`ensureBotOpen [${botName}]: ✅ bot started successfully (was "${botStatus}")`);
+      return { wasOpen: false, error: null };
+    } else {
+      log(`ensureBotOpen [${botName}]: ⚠ start failed — ${JSON.stringify(startJson).substring(0, 200)}`);
+      return { wasOpen: false, error: startJson.reason || 'start failed' };
+    }
+  } catch (err) {
+    log(`ensureBotOpen [${botName}]: error — ${err.message}`);
+    return { wasOpen: true, error: null }; // Assume open, don't block the trade
+  }
+}
+
 module.exports = {
   isConfigured,
   getBotDeals,
@@ -539,4 +598,5 @@ module.exports = {
   closeDealsViaApi,
   verifyAndForceClose,
   getExchangePositionMap,
+  ensureBotOpen,
 };
