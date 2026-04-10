@@ -80,6 +80,7 @@ async function sendTelegramAlert(message) {
 let PAUSED = false;
 let PAUSED_AT = null;    // ISO timestamp of when pause was activated
 let PAUSED_SIGNALS = 0;  // Count of signals received while paused
+let lastProcessedTelegramUpdate = null; // v4.0.1: Deduplicate Telegram webhook retries
 
 // ── Strategy Toggle (v2.2.0) ────────────────────────────────────────────
 // Switch between signal sources. Only one active at a time.
@@ -2595,18 +2596,31 @@ function buildProgressBar(currentPct, targetPct) {
 }
 
 app.post('/telegram', async (req, res) => {
+  // v4.0.1: Respond to Telegram IMMEDIATELY to prevent retry loops
+  // Telegram retries webhook deliveries if it doesn't get a timely 200,
+  // which caused /kill to be replayed endlessly after a slow response or restart.
+  res.sendStatus(200);
+
   try {
     const update = req.body;
     const message = update?.message;
     if (!message || !message.text || !message.chat?.id) {
-      return res.sendStatus(200); // Ignore non-text updates
+      return; // Ignore non-text updates
     }
+
+    // v4.0.1: Deduplicate — ignore updates we've already processed
+    const updateId = update.update_id;
+    if (updateId && lastProcessedTelegramUpdate === updateId) {
+      log(`⚠ Duplicate Telegram update ${updateId} — skipping`);
+      return;
+    }
+    lastProcessedTelegramUpdate = updateId;
 
     // Security: only respond to the configured chat ID
     const incomingChatId = String(message.chat.id);
     if (incomingChatId !== TELEGRAM_CHAT_ID) {
       log(`⚠ Telegram command from unauthorized chat: ${incomingChatId}`);
-      return res.sendStatus(200);
+      return;
     }
 
     const reply = await handleTelegramCommand(message.text, incomingChatId);
@@ -2625,7 +2639,6 @@ app.post('/telegram', async (req, res) => {
   } catch (err) {
     log(`Telegram command handler error: ${err.message}`);
   }
-  res.sendStatus(200);
 });
 
 // ── Register Telegram Webhook on startup ─────────────────────────────────
