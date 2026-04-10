@@ -46,6 +46,22 @@ export default {
       });
     }
 
+    // IP check — discover this Worker's outbound IP for Binance API key whitelisting
+    if (url.pathname === '/ip') {
+      try {
+        const ipRes = await fetch('https://api.ipify.org?format=json');
+        const ipData = await ipRes.json();
+        return new Response(JSON.stringify({ ip: ipData.ip, region: request.cf?.colo || 'unknown' }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     // Forward to Binance Futures API
     const binanceUrl = `https://fapi.binance.com${url.pathname}${url.search}`;
 
