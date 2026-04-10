@@ -8,6 +8,8 @@
  * v1.8.0: Added Gate 5 — Smart Money filter using Binance Futures top trader
  *         long/short position ratio. Blocks trades when whale positioning
  *         strongly disagrees with signal direction.
+ *         v4.0.4: Demoted to advisory-only. Whale positions (multi-day swings)
+ *         have no correlation with 1H signal timeframe. Still logged, never blocks.
  *
  * v1.7.0: Added 4H EMA 9/21 short-term trend filter and RSI direction check.
  *         Fixes timeframe mismatch where daily trend was bearish but intraday
@@ -686,8 +688,8 @@ async function validateSignal(pair, direction) {
     // Was blocking from v3.4.0–v3.6.2, but in range-bound markets it creates
     // dead zones where BOTH directions are gated (Gate 1 blocks longs while
     // Gate 2 blocks shorts). BTC sat completely frozen for days.
-    // Demoted to advisory — Gate 2 (1H EMA) + Gate 3 (RSI) + Gate 5 (whales)
-    // still provide directional filtering. Gate 1 data is logged for review.
+    // Demoted to advisory — Gate 2 (1H EMA) + Gate 3 (RSI) provide directional
+    // filtering. Gate 1 + Gate 5 (whales) are advisory-only. Data is logged for review.
     if (ema50 !== null) {
       const g1WouldBlock =
         (direction === 'LONG' && currentPrice < ema50) ||
@@ -846,8 +848,13 @@ async function validateSignal(pair, direction) {
     data.whaleGate.result = gatePassed ? 'PASS' : 'BLOCK';
     data.whaleGate.reason = gateReason;
 
+    // v4.0.4: Gate 5 demoted to advisory-only. Whale positions are on different
+    // timeframes (multi-day/week swings) and have no correlation with 1H signals.
+    // Still logged for visibility via /status and /whales, but never blocks trades.
     if (!gatePassed) {
-      return { allowed: false, reason: gateReason, data };
+      console.log(`[GATE 5 ADVISORY] Would have blocked: ${gateReason}`);
+      data.whaleGate.result = 'ADVISORY-BLOCK';
+      // Do NOT return — allow trade to proceed.
     }
 
     // Binance L/S ratio — advisory fallback (logged, not blocking)

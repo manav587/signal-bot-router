@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.0.3';
+const VERSION = '4.0.4';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -872,7 +872,7 @@ app.get('/', (req, res) => {
     strategy: { mode: STRATEGY_MODE, changedAt: STRATEGY_CHANGED_AT, fundingPollerActive: !!FUNDING_POLL_TIMER },
     lastDirections: LAST_DIRECTION,
     activeBots: ACTIVE_BOTS,
-    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50 — ADVISORY) + Gate 2 (1H EMA 9/21) + Gate 3 (1H RSI 35/65) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
+    revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50 — ADVISORY) + Gate 2 (1H EMA 9/21) + Gate 3 (1H RSI 35/65) + Gate 5 (whales — ADVISORY) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     consecutiveLossBreaker: { maxLosses: MAX_CONSECUTIVE_LOSSES, parkMs: LOSS_PARK_MS, state: CONSECUTIVE_LOSSES },
