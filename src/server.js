@@ -112,6 +112,50 @@ const SELF_HEAL_COOLDOWNS = {};
 const SELF_HEAL_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (circuit breaker handles real churn)
 const SELF_HEAL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — only recover pairs active within this window
 
+
+// ── Consecutive Loss Breaker (v4.0.1) ──────────────────────────────────
+// Tracks SL hits per pair. After 3 consecutive losses, park the pair for 30 min.
+// Prevents the bleed loop where ASAP keeps re-entering a dropping market.
+// Key = pair name (e.g. 'ETH'), Value = { count, parkedUntil }
+const CONSECUTIVE_LOSSES = {};
+const MAX_CONSECUTIVE_LOSSES = 3;
+const LOSS_PARK_MS = 30 * 60 * 1000; // 30 minutes
+
+function recordDealClose(pair, isLoss) {
+  if (!CONSECUTIVE_LOSSES[pair]) CONSECUTIVE_LOSSES[pair] = { count: 0, parkedUntil: null };
+  if (isLoss) {
+    CONSECUTIVE_LOSSES[pair].count++;
+    log(`📉 ${pair}: consecutive loss #${CONSECUTIVE_LOSSES[pair].count}`);
+    if (CONSECUTIVE_LOSSES[pair].count >= MAX_CONSECUTIVE_LOSSES) {
+      CONSECUTIVE_LOSSES[pair].parkedUntil = Date.now() + LOSS_PARK_MS;
+      const resumeTime = new Date(CONSECUTIVE_LOSSES[pair].parkedUntil).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+      log(`🅿️ ${pair}: PARKED for 30 min after ${CONSECUTIVE_LOSSES[pair].count} consecutive losses (until ${resumeTime} IST)`);
+      return true; // signal that pair should be parked
+    }
+  } else {
+    if (CONSECUTIVE_LOSSES[pair]?.count > 0) {
+      log(`✅ ${pair}: win — resetting consecutive loss counter (was ${CONSECUTIVE_LOSSES[pair].count})`);
+    }
+    CONSECUTIVE_LOSSES[pair].count = 0;
+    CONSECUTIVE_LOSSES[pair].parkedUntil = null;
+  }
+  return false; // not parked
+}
+
+function isPairParked(pair) {
+  const info = CONSECUTIVE_LOSSES[pair];
+  if (!info || !info.parkedUntil) return false;
+  if (Date.now() >= info.parkedUntil) {
+    // Park expired — reset
+    log(`🅿️ ${pair}: park expired, pair available for re-entry`);
+    info.parkedUntil = null;
+    info.count = 0;
+    return false;
+  }
+  return true;
+}
+
+
 // ── Cold-Start Mode (v3.8.0) ─────────────────────────────────────────────
 // On fresh startup with no active positions, self-heal skips all pairs because
 // LAST_ACTIVE is empty ("never started by this relay instance"). Cold-start mode
@@ -828,6 +872,8 @@ app.get('/', (req, res) => {
     revalidation: { intervalMs: REVAL_INTERVAL, mode: 'fail-closed', checks: 'Gate 1 (daily EMA50 — ADVISORY) + Gate 2 (1H EMA 9/21) + Gate 3 (1H RSI 35/65) + price drawdown + gated re-entry', maxDrawdownPct: REVAL_MAX_DRAWDOWN_PCT, autoFlip: true, flipCooldownMs: FLIP_COOLDOWN_MS, minEmaSpreadPct: signalGate.CONFIG.shortTermEma.minRevalSpreadPct, profitShieldPct: REVAL_PROFIT_SHIELD_PCT, gracePeriodMs: REVAL_GRACE_PERIOD_MS, maxUnderwaterMs: REVAL_MAX_UNDERWATER_MS },
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
+    consecutiveLossBreaker: { maxLosses: MAX_CONSECUTIVE_LOSSES, parkMs: LOSS_PARK_MS, state: CONSECUTIVE_LOSSES },
+
     flipCooldowns: FLIP_COOLDOWN,
     recoveryLocks: RECOVERY_LOCK,
     gatePending: GATE_PENDING,
@@ -1600,6 +1646,38 @@ async function runRevalidation() {
                 // Deal closed (TP/SL). ASAP will auto-open next deal after cooldown.
                 // Relay's external gates provide safety — stop bot if gates fail.
                 const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
+
+                // v4.0.1: Consecutive loss breaker — detect win/loss and park if needed
+                const currentPrice = fullGate.data?.currentPrice || 0;
+                const isLoss = bot.entryPrice && currentPrice
+                  ? (bot.direction === 'LONG' ? currentPrice < bot.entryPrice : currentPrice > bot.entryPrice)
+                  : false;
+                const shouldPark = recordDealClose(bot.pair, isLoss);
+
+                if (shouldPark || isPairParked(bot.pair)) {
+                  // Too many consecutive losses — stop the bot and park the pair
+                  log(`🅿️ ${bot.botName}: consecutive loss limit reached — stopping bot and parking ${bot.pair} for 30 min`);
+                  try {
+                    await sendAction({ action: 'stopBot', uuid });
+                  } catch (stopErr) {
+                    log(`🅿️ Park: stopBot failed for ${bot.botName}: ${stopErr.message}`);
+                  }
+                  delete ACTIVE_BOTS[uuid];
+                  delete LAST_DIRECTION[bot.pair];
+                  const lossInfo = CONSECUTIVE_LOSSES[bot.pair];
+                  const resumeIST = lossInfo?.parkedUntil ? new Date(lossInfo.parkedUntil).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) : '?';
+                  sendTelegramAlert(
+                    `🅿️ ${bot.botName} PARKED — ${lossInfo?.count || '?'} consecutive losses\n\n` +
+                    `${bot.pair} has hit the stop loss ${lossInfo?.count || '?'} times in a row. ` +
+                    `To prevent further bleeding, this pair is parked for 30 minutes.\n\n` +
+                    `Resumes at: ${resumeIST} IST\n` +
+                    `The pair will re-enter only if a valid TradingView signal arrives after the park expires.\n\n` +
+                    `${istTimestamp()}`
+                  ).catch(() => {});
+                  continue; // skip to next bot in revalidation
+                }
+
+
                 if (fullGate.allowed) {
                   // External gates pass — ASAP will re-open after 5-min cooldown
                   bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
@@ -1822,6 +1900,7 @@ async function runRevalidation() {
         alertMsg += `\n\n${istTimestamp()}`;
 
         sendTelegramAlert(alertMsg).catch(() => {});
+        }
       }
     } catch (err) {
       log(`🔄 Reval error for ${bot.botName}: ${err.message}`);
@@ -1921,6 +2000,41 @@ async function runSelfHeal() {
         };
         LAST_ACTIVE[base] = Date.now();
         LAST_DIRECTION[base] = pos.side;
+
+        // v4.0.1: Immediate gate-check on reconciled positions
+        // If the deal entered without relay approval (ASAP race condition),
+        // validate it now and close if gates fail (e.g. whale consensus block).
+        let reconcileGatePassed = true;
+        try {
+          const reconcileGate = await signalGate.validateSignal(base, pos.side);
+          if (!reconcileGate.allowed) {
+            reconcileGatePassed = false;
+            log(`🚫 Reconcile gate-check FAILED for ${base} ${pos.side}: ${reconcileGate.reason}`);
+            // Also check if pair is parked from consecutive losses
+            if (isPairParked(base)) {
+              log(`🚫 ${base} is also parked from consecutive losses — closing immediately`);
+            }
+            try {
+              await sendAction({ action: 'closeAllDeals', uuid: matchBot.uuid });
+              await sendAction({ action: 'stopBot', uuid: matchBot.uuid });
+            } catch (closeErr) {
+              log(`🚫 Reconcile gate-check: close/stop failed: ${closeErr.message}`);
+            }
+            delete ACTIVE_BOTS[matchBot.uuid];
+            sendTelegramAlert(
+              `🚫 Reconciled ${base} ${pos.side} CLOSED — gates failed\n\n` +
+              `Found an untracked ${pos.side} position on Binance. Gate-check rejected it:\n` +
+              `${reconcileGate.reason}\n\n` +
+              `Entry: $${pos.entryPrice?.toFixed(2) || '?'} | PnL: $${pos.pnl?.toFixed(2) || '?'}\n` +
+              `Position closed and bot stopped.\n\n` +
+              `${istTimestamp()}`
+            ).catch(() => {});
+          }
+        } catch (gateErr) {
+          log(`⚠️ Reconcile gate-check failed for ${base}: ${gateErr.message} — keeping position (fail-open)`);
+        }
+
+        if (reconcileGatePassed) {
 
         sendTelegramAlert(
           hasOpposite
