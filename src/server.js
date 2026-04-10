@@ -10,15 +10,14 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.0.2';
+const VERSION = '4.0.3';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
 // The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
 // UUID is what TradingView sends; Mongo ID is what the Gainium REST API uses.
-// V3.1 bots — startCondition: ASAP, gated by relay webhook start/stop
-// TechnicalIndicators tested 2-4 Apr 2026 but Gainium never evaluated them.
-// ASAP + 5-min cooldown + 2-min revalidation = controlled re-entry without churning.
+// V3.1 bots — startCondition: TechnicalIndicators (1H EMA + RSI), gated by relay webhook start/stop.
+// Switched from ASAP to TechnicalIndicators on 9 Apr 2026 to eliminate race condition.
 const BOT_MAP = {
   '61a66c9f-7463-46db-a72f-2ef39565bc20': { mongoId: '69ce1dc4228af151def7f93e', name: 'SOL Long v2' },
   '3af77f4f-73a7-45c1-a0fd-b7c3ce9f16ee': { mongoId: '69ce1dc6228af151def7f97b', name: 'SOL Short v2' },
@@ -1004,6 +1003,7 @@ app.get('/test-binance', async (req, res) => {
   // 3. Test direct Binance (authenticated — positionRisk)
   if (binanceApi.isConfigured()) {
     try {
+      // Temporarily test direct (bypass proxy)
       const crypto = require('crypto');
       const key = process.env.BINANCE_API_KEY;
       const secret = process.env.BINANCE_API_SECRET;
@@ -1552,14 +1552,6 @@ const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" 
 const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite crossover probability > 80%
 let revalRunning = false;
 
-// v3.9.3: Ghost deal detection — track PnL across reval cycles.
-// If a tracked bot's PnL from Gainium is exactly unchanged for GHOST_STALE_CYCLES
-// consecutive cycles, the Gainium deal is likely a ghost (Binance position closed
-// externally but Gainium still shows deal "open"). Cancel the deal so the v3.9.2
-// cross-check can detect the mismatch and clean up.
-const GHOST_STALE_CYCLES = 15; // 15 × 2min = 30 minutes of frozen PnL → ghost alert (alert-only, no auto-cancel)
-const GHOST_PROBE = new Map(); // uuid → { pnl: number, staleCount: number }
-
 async function runRevalidation() {
   if (revalRunning) return; // prevent overlapping runs
   revalRunning = true;
@@ -1581,16 +1573,11 @@ async function runRevalidation() {
     }
   }
 
-  // v3.9.6: Ghost probe DISABLED — requires real Binance position data to work.
-  // Gainium API returns heavily cached PnL (stale for 1-2+ hours even on real positions),
-  // so PnL staleness is NOT a reliable ghost indicator. Every alert was a false positive.
-  // Re-enable when Render moves to Frankfurt (direct Binance API access) or proxy works.
-  // Original code: v3.9.3 (auto-cancel, too aggressive) → v3.9.4 (alert-only, still noisy).
-
-  // v3.9.2: Cross-check tracked bots against Gainium position map.
-  // If Gainium has no deal for a tracked bot (deal was canceled/closed/expired),
-  // the position is gone. Clean up relay tracking immediately.
-  // v3.9.3: Uses 'cancel' closeType — ghost deals have no Binance position to market-close.
+  // v3.9.2 / v4.0.3: Cross-check tracked bots against exchange position map.
+  // With direct Binance API (v4.0.3), this is ground truth — no heuristics needed.
+  // If Binance has no position for a tracked bot, it's a ghost. Clean up immediately.
+  // (Ghost Probe PnL-staleness heuristic removed in v4.0.3 — redundant now that
+  // Binance is queried directly every 2 min.)
   if (cachedPosMap) {
     for (const uuid of activeUUIDs) {
       const bot = ACTIVE_BOTS[uuid];
@@ -1613,7 +1600,6 @@ async function runRevalidation() {
         }
 
         delete ACTIVE_BOTS[uuid];
-        GHOST_PROBE.delete(uuid);
         sendTelegramAlert(
           `🧹 External close detected: ${bot.botName}\n\n` +
           `Position was closed outside the relay (Binance app, manual close, or liquidation).\n` +
@@ -2386,95 +2372,10 @@ async function runSelfHeal() {
         }
 
         // Both bots are closed with 0 deals — pair is orphaned (or cold start)
-        // v3.8.5: Self-heal and cold-start no longer auto-start bots on orphaned pairs.
-        // Phase 0 (exchange reconciliation) handles re-tracking existing Binance positions.
-        // New positions are ONLY opened by TradingView webhook signals through the gates.
-        log(`🩺 Self-heal: ${pair} — both bots closed, 0 deals. Waiting for TradingView signal (v3.8.5: webhook-only entry).`);
+        // v3.8.5: No auto-restart. Phase 0 handles re-tracking existing Binance positions.
+        // New positions ONLY opened by TradingView webhook signals through the gates.
+        log(`🩺 Self-heal: ${pair} — both bots closed, 0 deals. Waiting for TradingView signal.`);
         continue;
-
-        // ── DISABLED (v3.8.5): orphaned pair auto-restart ──────────────
-        // Kept for reference but unreachable. Phase 0 covers crash recovery.
-
-        // v3.5.0: Prefer the last known direction (if available) — avoids
-        // always defaulting to LONG when both directions pass gates.
-        const lastDir = LAST_DIRECTION[pair];
-        const dirOrder = lastDir === 'SHORT' ? ['SHORT', 'LONG'] : ['LONG', 'SHORT'];
-
-        let bestDirection = null;
-        let bestGateResult = null;
-
-        for (const dir of dirOrder) {
-          try {
-            const gateResult = await signalGate.validateSignal(pair, dir);
-            if (gateResult.allowed) {
-              bestDirection = dir;
-              bestGateResult = gateResult;
-              break;
-            }
-          } catch (gateErr) {
-            log(`🩺 Self-heal: ${pair} ${dir} gate error: ${gateErr.message}`);
-          }
-        }
-
-        if (!bestDirection) {
-          log(`${scanLabel}: ${pair} — neither direction passes signal gate. Will retry next cycle.`);
-          const alertType = COLD_START_MODE ? 'cold-start-blocked' : 'self-heal-blocked';
-          if (canSendTelegramAlert(pair, alertType)) {
-            markTelegramAlertSent(pair, alertType);
-            const header = COLD_START_MODE ? '🧭 Cold-start scan' : '🩺 Self-heal';
-            sendTelegramAlert(
-              `${header}: ${pair} — no clear direction\n\n` +
-              `Both ${pair} bots are stopped with no deals. The system checked if it should enter, but neither LONG nor SHORT passed the 1H signal gate checks.\n\n` +
-              `Will keep checking every 5 minutes until a clear direction emerges, or the next TradingView signal arrives.\n\n` +
-              `${istTimestamp()}`
-            ).catch(() => {});
-          }
-          continue;
-        }
-
-        // Found a valid direction — start the bot
-        const targetBot = bestDirection === 'LONG' ? longBot : shortBot;
-        const origin = (COLD_START_MODE && !lastActive) ? 'cold-start' : 'self-heal';
-        log(`${scanLabel}: ${pair} → starting ${targetBot.name} (${bestDirection})`);
-
-        try {
-          await sendAction({ action: 'startBot', uuid: targetBot.uuid });
-
-          // Track in ACTIVE_BOTS
-          ACTIVE_BOTS[targetBot.uuid] = {
-            pair,
-            direction: bestDirection,
-            botName: targetBot.name,
-            startedAt: new Date().toISOString(),
-            entryPrice: bestGateResult.data?.currentPrice || null,
-            origin,
-          };
-          tradeJournal.recordEntry({ pair, direction: bestDirection, botName: targetBot.name, botUuid: targetBot.uuid, entryPrice: bestGateResult.data?.currentPrice, origin, gateData: bestGateResult.data });
-          LAST_ACTIVE[pair] = Date.now();
-          SELF_HEAL_COOLDOWNS[pair] = Date.now();
-          LAST_DIRECTION[pair] = bestDirection;
-
-          log(`${scanLabel}: ✅ ${targetBot.name} started successfully`);
-          const header = origin === 'cold-start'
-            ? `🧭 Cold-start: ${targetBot.name} entered\n\nSystem detected an existing ${bestDirection} trend on ${pair} at startup. All 1H signal gates passed — entering position:`
-            : `🩺 Self-heal: ${targetBot.name} restarted\n\nBoth ${pair} bots were stopped with no active deals (orphaned pair). Confirmed ${bestDirection} is the correct direction:`;
-          sendTelegramAlert(
-            `${header}\n\n` +
-            `• 1H trend: ${bestGateResult.data?.shortTermTrend || '?'}\n` +
-            `• RSI(14): ${bestGateResult.data?.rsi14 || '?'} ${bestGateResult.data?.rsiDirection || ''}\n` +
-            `• Price: $${bestGateResult.data?.currentPrice?.toFixed(2) || '?'}\n\n` +
-            `A new deal will open automatically via ASAP start.\n\n` +
-            `${istTimestamp()}`
-          ).catch(() => {});
-        } catch (startErr) {
-          log(`${scanLabel}: ❌ startBot failed for ${targetBot.name}: ${startErr.message}`);
-          sendTelegramAlert(
-            `${scanLabel} FAILED: ${targetBot.name}\n\n` +
-            `Tried to start ${targetBot.name} but the webhook failed: ${startErr.message}\n\n` +
-            `Will retry next cycle.\n\n` +
-            `${istTimestamp()}`
-          ).catch(() => {});
-        }
       } catch (pairErr) {
         log(`🩺 Self-heal: error processing ${pair}: ${pairErr.message}`);
       }
@@ -3125,6 +3026,39 @@ app.listen(PORT, async () => {
   log(`   Gate 1 (Daily EMA50): ADVISORY (demoted v3.6.3 — logged, not blocking)`);
   log(`   Periodic re-validation: every ${REVAL_INTERVAL / 1000}s (fail-closed, ${REVAL_GRACE_PERIOD_MS / 60000}min grace, ${REVAL_MAX_DRAWDOWN_PCT}% drawdown limit, ${REVAL_MAX_UNDERWATER_MS / (60 * 60 * 1000)}h max underwater, ${signalGate.CONFIG.shortTermEma.minRevalSpreadPct}% EMA spread)`);
   log(`   Known bots: ${Object.keys(BOT_MAP).length}`);
+
+  // v4.0.3: Check outbound IP on startup — alert if it changed (Binance whitelist may need updating)
+  try {
+    const ipRes = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) });
+    const ipData = await ipRes.json();
+    const currentIp = ipData.ip;
+    log(`🌐 Outbound IP: ${currentIp}`);
+
+    // Test Binance auth to verify the IP is whitelisted
+    if (binanceApi.isConfigured()) {
+      try {
+        await binanceApi.getPositionMap();
+        log(`✅ Binance API: direct access confirmed from ${currentIp}`);
+      } catch (binErr) {
+        const msg = binErr.message || '';
+        if (msg.includes('401') || msg.includes('-2015') || msg.includes('Invalid API-key')) {
+          log(`🚨 Binance API: REJECTED from IP ${currentIp} — whitelist may need updating`);
+          sendTelegramAlert(
+            `🚨 Binance API access FAILED after deploy\n\n` +
+            `Server outbound IP: <b>${currentIp}</b>\n` +
+            `Error: ${msg.substring(0, 200)}\n\n` +
+            `The IP may have changed. Update the Binance API key whitelist to include this IP.\n` +
+            `Ghost detection will fall back to Gainium (stale) until this is fixed.\n\n` +
+            `${istTimestamp()}`
+          ).catch(() => {});
+        } else {
+          log(`⚠ Binance API: non-auth error — ${msg.substring(0, 200)}`);
+        }
+      }
+    }
+  } catch (ipErr) {
+    log(`⚠ IP check failed: ${ipErr.message}`);
+  }
 
   // v3.2.8: Recover active state BEFORE revalidation or self-heal run
   await recoverActiveState();
