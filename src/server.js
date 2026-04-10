@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.0.0';
+const VERSION = '4.0.2';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -82,6 +82,12 @@ let PAUSED_AT = null;    // ISO timestamp of when pause was activated
 let PAUSED_SIGNALS = 0;  // Count of signals received while paused
 let lastProcessedTelegramUpdate = null; // v4.0.1: Deduplicate Telegram webhook retries
 
+// ── v4.0.2: Kill switch spam prevention ────────────────────────────────
+const KILL_SWITCH_LAST_ALERT = {};  // { uuid: timestamp } — cooldown per bot
+const KILL_SWITCH_COOLDOWN_MS = 5 * 60 * 1000; // 5 min between kill switch alerts per bot
+let PAUSED_ALERT_LAST = 0;  // timestamp of last "system is paused" Telegram alert
+const PAUSED_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // max 1 paused alert per 5 min
+
 // ── Strategy Toggle (v2.2.0) ────────────────────────────────────────────
 // Switch between signal sources. Only one active at a time.
 //   'crossover' = TradingView EMA crossover alerts (default, current system)
@@ -111,7 +117,6 @@ const LAST_ACTIVE = {};
 const SELF_HEAL_COOLDOWNS = {};
 const SELF_HEAL_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (circuit breaker handles real churn)
 const SELF_HEAL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — only recover pairs active within this window
-
 
 // ── Consecutive Loss Breaker (v4.0.1) ──────────────────────────────────
 // Tracks SL hits per pair. After 3 consecutive losses, park the pair for 30 min.
@@ -154,7 +159,6 @@ function isPairParked(pair) {
   }
   return true;
 }
-
 
 // ── Cold-Start Mode (v3.8.0) ─────────────────────────────────────────────
 // On fresh startup with no active positions, self-heal skips all pairs because
@@ -873,7 +877,6 @@ app.get('/', (req, res) => {
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     consecutiveLossBreaker: { maxLosses: MAX_CONSECUTIVE_LOSSES, parkMs: LOSS_PARK_MS, state: CONSECUTIVE_LOSSES },
-
     flipCooldowns: FLIP_COOLDOWN,
     recoveryLocks: RECOVERY_LOCK,
     gatePending: GATE_PENDING,
@@ -1169,15 +1172,54 @@ app.post('/webhook', (req, res) => {
   const hasStartBot = actions.some(a => a.action === 'startBot');
   const stopActions = actions.filter(a => a.action === 'stopBot');
   if (!hasStartBot && stopActions.length > 0) {
+    // v4.0.1: When paused, still clean up ACTIVE_BOTS but skip forwarding to Gainium
+    // (bots are already stopped, no need to spam Telegram with repeated kill switch messages)
+    if (PAUSED) {
+      for (const sa of stopActions) {
+        if (sa.uuid && ACTIVE_BOTS[sa.uuid]) {
+          const bot = ACTIVE_BOTS[sa.uuid];
+          log(`[${requestId}] ⏸️ Bare stopBot while paused — removing ${bot.botName} from ACTIVE_BOTS (no Gainium forward)`);
+          delete ACTIVE_BOTS[sa.uuid];
+          delete LAST_DIRECTION[bot.pair];
+        }
+      }
+      log(`[${requestId}] ⏸️ Kill switch received while paused — logged only, not forwarded`);
+      return;
+    }
+    // v4.0.2: Track whether any bot was actually active — skip Gainium + Telegram if nothing to do
+    let hadActiveBots = false;
     for (const sa of stopActions) {
       if (sa.uuid && ACTIVE_BOTS[sa.uuid]) {
+        hadActiveBots = true;
         const bot = ACTIVE_BOTS[sa.uuid];
         log(`[${requestId}] 🛑 Bare stopBot — removing ${bot.botName} from ACTIVE_BOTS`);
         delete ACTIVE_BOTS[sa.uuid];
         delete LAST_DIRECTION[bot.pair];
       }
     }
-    // Forward actions to Gainium (closeAllDeals + stopBot) then return
+
+    // v4.0.2: If no bots were active, check kill switch cooldown before forwarding
+    if (!hadActiveBots) {
+      const now = Date.now();
+      const allOnCooldown = stopActions.every(sa => {
+        const last = KILL_SWITCH_LAST_ALERT[sa.uuid];
+        return last && (now - last) < KILL_SWITCH_COOLDOWN_MS;
+      });
+      if (allOnCooldown) {
+        log(`[${requestId}] 🔇 Kill switch suppressed — bots already stopped, cooldown active`);
+        return;
+      }
+      // Update cooldown timestamps
+      for (const sa of stopActions) KILL_SWITCH_LAST_ALERT[sa.uuid] = now;
+      // Still forward to Gainium (belt-and-suspenders) but suppress Telegram
+      Promise.all(actions.map(action => sendAction(action).catch(() => {}))).then(() => {
+        log(`[${requestId}] 🔇 Kill switch forwarded to Gainium (no Telegram — bots were already stopped)`);
+      });
+      return;
+    }
+
+    // Bots WERE active — forward and alert normally
+    for (const sa of stopActions) KILL_SWITCH_LAST_ALERT[sa.uuid] = Date.now();
     processActions(actions, requestId, false, {}).catch(err => {
       log(`[${requestId}] ❌ Bare stopBot error: ${err.message}`);
     });
@@ -1200,11 +1242,18 @@ app.post('/webhook', (req, res) => {
   if (PAUSED) {
     PAUSED_SIGNALS++;
     log(`[${requestId}] ⏸️ PAUSED — signal logged but NOT executed: ${summary}`);
-    sendTelegramAlert(
-      `⏸️ Signal received but system is paused\n\n` +
-      `TradingView sent a signal for ${botNames.join(', ')}, but the system is paused so no trade was placed. This is signal #${PAUSED_SIGNALS} since the pause.\n\n` +
-      `${istTimestamp()}`
-    ).catch(() => {});
+    // v4.0.2: Rate-limit "system is paused" Telegram alerts — max 1 per 5 min
+    const now = Date.now();
+    if (now - PAUSED_ALERT_LAST >= PAUSED_ALERT_COOLDOWN_MS) {
+      PAUSED_ALERT_LAST = now;
+      sendTelegramAlert(
+        `⏸️ Signal received but system is paused\n\n` +
+        `TradingView sent a signal for ${botNames.join(', ')}, but the system is paused so no trade was placed. This is signal #${PAUSED_SIGNALS} since the pause.\n\n` +
+        `${istTimestamp()}`
+      ).catch(() => {});
+    } else {
+      log(`[${requestId}] 🔇 Paused alert suppressed — cooldown active (signal #${PAUSED_SIGNALS})`);
+    }
     return;
   }
 
@@ -1406,6 +1455,7 @@ const REVAL_GRACE_PERIOD_MS = 3 * 60 * 1000; // 3 minutes
 const REVAL_MAX_UNDERWATER_MS = 2 * 60 * 60 * 1000; // 2 hours (was 12h)
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" if 0.1%+ against entry
+const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite crossover probability > 80%
 let revalRunning = false;
 
 // v3.9.3: Ghost deal detection — track PnL across reval cycles.
@@ -1645,9 +1695,9 @@ async function runRevalidation() {
               if (deals && deals.active === 0) {
                 // Deal closed (TP/SL). ASAP will auto-open next deal after cooldown.
                 // Relay's external gates provide safety — stop bot if gates fail.
-                const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
 
                 // v4.0.1: Consecutive loss breaker — detect win/loss and park if needed
+                const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
                 const currentPrice = fullGate.data?.currentPrice || 0;
                 const isLoss = bot.entryPrice && currentPrice
                   ? (bot.direction === 'LONG' ? currentPrice < bot.entryPrice : currentPrice > bot.entryPrice)
@@ -1677,9 +1727,47 @@ async function runRevalidation() {
                   continue; // skip to next bot in revalidation
                 }
 
-
                 if (fullGate.allowed) {
-                  // External gates pass — ASAP will re-open after 5-min cooldown
+                  // v4.0.1: Proximity gate — even if EMAs still aligned, block re-entry
+                  // when the opposite crossover is imminent (>80% probability).
+                  // This prevents the SL→cooldown→re-enter→SL churn loop.
+                  let proximityBlocked = false;
+                  try {
+                    const proximity = await signalGate.getCrossoverProximity();
+                    const pairProx = proximity[bot.pair];
+                    if (pairProx && !pairProx.error && pairProx.probability >= PROXIMITY_BLOCK_THRESHOLD) {
+                      // Crossover is imminent — the "nextSignal" is the OPPOSITE direction
+                      // If bot is LONG and nextSignal says SHORT is coming, block re-entry
+                      const oppositeDirection = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
+                      if (pairProx.nextSignal && pairProx.nextSignal.toUpperCase().includes(oppositeDirection)) {
+                        proximityBlocked = true;
+                        log(`🛑 Proximity block: ${bot.botName} — ${pairProx.probability}% chance of ${pairProx.nextSignal}, blocking ASAP re-entry`);
+                      }
+                    }
+                  } catch (proxErr) {
+                    log(`⚠️ Proximity check failed for ${bot.botName}: ${proxErr.message} — allowing re-entry (fail-open)`);
+                  }
+
+                  if (proximityBlocked) {
+                    // Stop the bot to prevent ASAP re-entry into an imminent reversal
+                    log(`🔄 Re-entry: ${bot.botName} deal closed, gates pass BUT proximity block active — stopping bot`);
+                    tradeJournal.recordExit({ botUuid: uuid, exitPrice: fullGate.data?.currentPrice || bot.entryPrice, exitReason: 'proximity-block' });
+                    try {
+                      await sendAction({ action: 'stopBot', uuid });
+                    } catch (stopErr) {
+                      log(`🔄 Proximity block: stopBot failed for ${bot.botName}: ${stopErr.message}`);
+                    }
+                    delete ACTIVE_BOTS[uuid];
+                    delete LAST_DIRECTION[bot.pair];
+                    sendTelegramAlert(
+                      `🛑 ${bot.botName} stopped — crossover imminent\n\n` +
+                      `Deal closed (TP/SL), and the EMAs technically still support ${bot.direction}.\n` +
+                      `But the opposite crossover is 80+% likely — re-entering now would risk another stop loss.\n\n` +
+                      `Bot stopped to avoid churn. Will re-enter when the next clear TradingView signal arrives.\n\n` +
+                      `${istTimestamp()}`
+                    ).catch(() => {});
+                  } else {
+                  // External gates pass + no proximity block — ASAP will re-open after 5-min cooldown
                   bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
                   log(`🔄 Re-entry: ${bot.botName} deal closed, external gates PASS — ASAP will re-enter after cooldown @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
                   // Only send Telegram once per hour per bot (not every 2 min)
@@ -1696,6 +1784,7 @@ async function runRevalidation() {
                       `${istTimestamp()}`
                     ).catch(() => {});
                   }
+                  } // end else (no proximity block)
                 } else {
                   // External gates fail — stop bot before ASAP reopens
                   log(`🔄 Re-entry: ${bot.botName} deal closed, external gates FAILED — stopping bot`);
@@ -1900,7 +1989,6 @@ async function runRevalidation() {
         alertMsg += `\n\n${istTimestamp()}`;
 
         sendTelegramAlert(alertMsg).catch(() => {});
-        }
       }
     } catch (err) {
       log(`🔄 Reval error for ${bot.botName}: ${err.message}`);
@@ -2035,7 +2123,6 @@ async function runSelfHeal() {
         }
 
         if (reconcileGatePassed) {
-
         sendTelegramAlert(
           hasOpposite
             ? `🚨 Direction mismatch fixed: ${base}\n\n` +
@@ -2045,9 +2132,11 @@ async function runSelfHeal() {
             : `🔍 Exchange reconciliation: ${base} ${pos.side}\n\n` +
               `Found a ${pos.side} position on Binance for ${base} that the relay didn't know about.\n` +
               `Entry: $${pos.entryPrice?.toFixed(2) || '?'} | PnL: $${pos.pnl?.toFixed(2) || '?'}\n\n` +
+              `Gate-check: PASSED ✅ — position validated against all gates.\n` +
               `Now tracked with full drawdown + revalidation protection.\n\n` +
               `${istTimestamp()}`
         ).catch(() => {});
+        }
       }
 
       // B) Relay tracks a position but Binance is flat → stale tracking
@@ -2665,6 +2754,7 @@ async function handleTelegramCommand(text, chatId) {
     const skipped = PAUSED_SIGNALS;
     PAUSED_SIGNALS = 0;
     PAUSED_AT = null;
+    PAUSED_ALERT_LAST = 0; // v4.0.2: Reset paused alert cooldown
     log('▶️ RESUMED via Telegram command');
     return `▶️ <b>Relay RESUMED</b>\n\n${skipped} signal(s) were skipped while paused.\nNow processing incoming TradingView signals.\n\n${istTimestamp()} IST`;
   }
