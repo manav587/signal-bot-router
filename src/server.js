@@ -1249,6 +1249,98 @@ app.get('/test-reconcile/:pair', async (req, res) => {
   });
 });
 
+// ── v4.0.5: Manual test endpoint — cold-start a single direction ──────────
+// POST /test/:pair/:direction  (e.g. POST /test/ETH/LONG)
+// Bypasses closeAllDeals verification and duplicate detection.
+// Still runs gate validation, ensureBotOpen, and tracks in ACTIVE_BOTS.
+// For manual testing from a clean state — does NOT touch the production crossover flow.
+app.post('/test/:pair/:direction', async (req, res) => {
+  const requestId = 'T-' + Math.random().toString(36).substring(2, 8);
+  const pair = req.params.pair.toUpperCase();
+  const direction = req.params.direction.toUpperCase();
+
+  if (!['LONG', 'SHORT'].includes(direction)) {
+    return res.status(400).json({ error: 'Direction must be LONG or SHORT' });
+  }
+
+  if (PAUSED) {
+    return res.status(200).json({ error: 'System is paused', requestId });
+  }
+
+  const bot = findBot(pair, direction);
+  if (!bot) {
+    return res.status(400).json({ error: `No bot found for ${pair} ${direction}`, requestId });
+  }
+
+  log(`[${requestId}] 🧪 TEST: ${pair} ${direction} via ${bot.name}`);
+
+  let gateResult;
+  try {
+    gateResult = await signalGate.validateSignal(pair, direction);
+  } catch (err) {
+    return res.status(500).json({ error: `Gate error: ${err.message}`, requestId });
+  }
+
+  if (!gateResult.allowed) {
+    return res.status(200).json({
+      requestId,
+      status: 'gated',
+      reason: gateResult.reason,
+      data: gateResult.data,
+    });
+  }
+
+  log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
+
+  if (gainiumApi.isConfigured()) {
+    const ensureResult = await gainiumApi.ensureBotOpen(bot.mongoId, bot.name);
+    if (!ensureResult.wasOpen) {
+      log(`[${requestId}] 🔧 ${bot.name} was closed — started via REST API before webhook`);
+    }
+  }
+
+  try {
+    const result = await sendAction({ action: 'startBot', uuid: bot.uuid });
+    log(`[${requestId}] ✓ startBot returned ${result.status}`);
+  } catch (err) {
+    log(`[${requestId}] ✗ startBot FAILED: ${err.message}`);
+    return res.status(500).json({ error: `startBot failed: ${err.message}`, requestId });
+  }
+
+  ACTIVE_BOTS[bot.uuid] = {
+    pair: pair + 'USDT',
+    direction,
+    botName: bot.name,
+    startedAt: new Date().toISOString(),
+    entryPrice: gateResult.data.currentPrice || null,
+    origin: 'test',
+  };
+  LAST_DIRECTION[pair] = direction;
+  log(`[${requestId}] 📋 Tracking: ${bot.name} (${pair} ${direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
+
+  sendTelegramAlert(
+    `🧪 TEST trade opened\n\n` +
+    `Signal: Manual test (v4.0.5)\n` +
+    `Going ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}.\n\n` +
+    `✅ Gate passed: ${gateResult.reason}\n` +
+    `Bot: ${bot.name}\n` +
+    `Grace period: ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)} min\n\n` +
+    `${istTimestamp()}`
+  ).catch(() => {});
+
+  res.json({
+    requestId,
+    status: 'test-started',
+    bot: bot.name,
+    pair,
+    direction,
+    entryPrice: gateResult.data.currentPrice,
+    gateResult: gateResult.reason,
+    gracePeriodMin: Math.round(REVAL_GRACE_PERIOD_MS / 60000),
+    message: `Waiting for TechnicalIndicators to evaluate on next 1H candle close`,
+  });
+});
+
 // Main webhook endpoint — TradingView sends alerts here
 app.post('/webhook', (req, res) => {
   // Generate a short request ID for log correlation
