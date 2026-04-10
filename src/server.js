@@ -978,6 +978,7 @@ app.get('/test-binance', async (req, res) => {
   // 1. Check what's configured
   results.config = {
     apiKeySet: !!process.env.BINANCE_API_KEY,
+    apiKeyPrefix: process.env.BINANCE_API_KEY ? process.env.BINANCE_API_KEY.substring(0, 8) + '...' : 'N/A',
     apiSecretSet: !!process.env.BINANCE_API_SECRET,
     proxyUrl: process.env.BINANCE_PROXY_URL || '(not set — using direct)',
     proxyTokenSet: !!process.env.BINANCE_PROXY_TOKEN,
