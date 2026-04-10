@@ -971,6 +971,99 @@ app.get('/strategy/funding', (req, res) => {
   res.json({ status: 'switched to funding', mode: STRATEGY_MODE });
 });
 
+// v4.0.2: Test Binance API — direct vs proxy connectivity check
+app.get('/test-binance', async (req, res) => {
+  const results = { timestamp: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) };
+
+  // 1. Check what's configured
+  results.config = {
+    apiKeySet: !!process.env.BINANCE_API_KEY,
+    apiSecretSet: !!process.env.BINANCE_API_SECRET,
+    proxyUrl: process.env.BINANCE_PROXY_URL || '(not set — using direct)',
+    proxyTokenSet: !!process.env.BINANCE_PROXY_TOKEN,
+  };
+
+  // 2. Test direct Binance (public endpoint, no auth)
+  try {
+    const start = Date.now();
+    const directRes = await fetch('https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT', {
+      signal: AbortSignal.timeout(10000),
+    });
+    const directData = await directRes.json();
+    results.direct = {
+      ok: directRes.ok,
+      status: directRes.status,
+      latencyMs: Date.now() - start,
+      btcPrice: directData.price,
+    };
+  } catch (err) {
+    results.direct = { ok: false, error: err.message };
+  }
+
+  // 3. Test direct Binance (authenticated — positionRisk)
+  if (binanceApi.isConfigured()) {
+    try {
+      const crypto = require('crypto');
+      const key = process.env.BINANCE_API_KEY;
+      const secret = process.env.BINANCE_API_SECRET;
+      const params = `timestamp=${Date.now()}&recvWindow=5000`;
+      const sig = crypto.createHmac('sha256', secret).update(params).digest('hex');
+      const url = `https://fapi.binance.com/fapi/v2/positionRisk?${params}&signature=${sig}`;
+
+      const start = Date.now();
+      const authRes = await fetch(url, {
+        headers: { 'X-MBX-APIKEY': key },
+        signal: AbortSignal.timeout(10000),
+      });
+      const text = await authRes.text();
+      let parsed;
+      try { parsed = JSON.parse(text); } catch { parsed = text; }
+
+      results.directAuth = {
+        ok: authRes.ok,
+        status: authRes.status,
+        latencyMs: Date.now() - start,
+        body: authRes.ok
+          ? `${Array.isArray(parsed) ? parsed.length : 0} symbols, ${Array.isArray(parsed) ? parsed.filter(p => parseFloat(p.positionAmt) !== 0).length : '?'} open positions`
+          : (typeof parsed === 'object' ? parsed : text.substring(0, 300)),
+      };
+    } catch (err) {
+      results.directAuth = { ok: false, error: err.message };
+    }
+  } else {
+    results.directAuth = { skipped: true, reason: 'BINANCE_API_KEY/SECRET not set' };
+  }
+
+  // 4. Test via proxy (if configured)
+  if (process.env.BINANCE_PROXY_URL) {
+    try {
+      const start = Date.now();
+      const testResult = await binanceApi.testConnection();
+      results.proxy = {
+        ...testResult,
+        latencyMs: Date.now() - start,
+      };
+    } catch (err) {
+      results.proxy = { ok: false, error: err.message };
+    }
+  } else {
+    results.proxy = { skipped: true, reason: 'BINANCE_PROXY_URL not set' };
+  }
+
+  // 5. Get server's own outbound IP
+  try {
+    const ipRes = await fetch('https://api.ipify.org?format=json', {
+      signal: AbortSignal.timeout(5000),
+    });
+    const ipData = await ipRes.json();
+    results.serverOutboundIp = ipData.ip;
+  } catch (err) {
+    results.serverOutboundIp = `error: ${err.message}`;
+  }
+
+  res.json(results);
+});
+
 // Test endpoint — signal gate test (v1.7.0)
 // Returns what the gate would decide for each pair + direction
 app.get('/test-gate/:pair', async (req, res) => {
