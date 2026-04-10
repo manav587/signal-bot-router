@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.0.4';
+const VERSION = '4.0.5';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1549,10 +1549,13 @@ const REVAL_MAX_DRAWDOWN_PCT = 0.8;
 // With 0.8% TP + 0.3% trailing, positions close fast. Shield at 0.5%
 // still protects a winning trade from being flipped by a brief EMA wobble.
 const REVAL_PROFIT_SHIELD_PCT = 0.5;
-// v4.0.0: Grace period tightened for scalp mode.
-// Scalp entries fill instantly (market orders). 3 min is plenty for
-// Gainium deal creation, then full reval protection kicks in.
-const REVAL_GRACE_PERIOD_MS = 3 * 60 * 1000; // 3 minutes
+// v4.0.4: Grace period extended for TechnicalIndicators bots.
+// TechnicalIndicators waits for the NEXT 1H candle close before opening a deal.
+// This can take up to 60 minutes after webhook startBot.
+// During this window, Binance has no position yet — reval must NOT clean up
+// the ACTIVE_BOTS entry or the relay loses tracking before the deal materializes.
+// 65 min covers the worst case (signal at :01 → next candle at :00 = 59 min + buffer).
+const REVAL_GRACE_PERIOD_MS = 65 * 60 * 1000; // 65 minutes (TechnicalIndicators candle wait)
 // v4.0.0: Max underwater tightened for scalp mode.
 // No scalp should sit underwater for 2 hours. If it does, the trade thesis is wrong.
 // Strong trend exception still applies but with shorter leash.
@@ -1597,6 +1600,15 @@ async function runRevalidation() {
       const pos = cachedPosMap.get(base);
 
       if (!pos || (pos.positionAmt !== undefined && parseFloat(pos.positionAmt) === 0)) {
+        // v4.0.4: Don't clean up bots still within grace period.
+        // TechnicalIndicators waits for the next 1H candle close before opening a deal.
+        // During that window (up to 60 min), Binance has no position — that's expected,
+        // NOT an external close. Only clean up after grace period expires.
+        const botAgeMs = Date.now() - new Date(bot.startedAt).getTime();
+        if (botAgeMs < REVAL_GRACE_PERIOD_MS) {
+          log(`🔄 Reval: ${bot.botName} has no Binance position but is within grace period (${Math.round(botAgeMs / 1000)}s old, grace=${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min). Waiting for TechnicalIndicators deal.`);
+          continue;
+        }
         log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but no ${base} position in Gainium. Cleaning up.`);
 
         const botInfo = BOT_MAP[uuid];
