@@ -1771,8 +1771,15 @@ async function runRevalidation() {
         const botInfo = BOT_MAP[uuid];
         if (botInfo) {
           try {
+            // v4.1.1: Cancel deals AND stop bot to force Gainium to fully close.
+            // Gainium cancel is async ("scheduled to be closed") — stopping the bot
+            // ensures all deals are terminated before we attempt re-entry.
             const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName, 'cancel');
             log(`🧹 External close cleanup: ${bot.botName} — ${restResult.closed} deal(s) canceled on Gainium`);
+            await sendAction({ action: 'stopBot', uuid });
+            log(`🧹 External close cleanup: ${bot.botName} stopped`);
+            // Wait for Gainium to process the cancel + stop before re-entry
+            await new Promise(resolve => setTimeout(resolve, 3000));
           } catch (cleanErr) {
             log(`🧹 External close cleanup error for ${bot.botName}: ${cleanErr.message}`);
           }
