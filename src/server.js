@@ -1680,7 +1680,11 @@ const REVAL_MAX_DRAWDOWN_PCT = 0.8;
 // v4.0.0: Profit shield lowered to match scalp TP (0.8%).
 // With 0.8% TP + 0.3% trailing, positions close fast. Shield at 0.5%
 // still protects a winning trade from being flipped by a brief EMA wobble.
-const REVAL_PROFIT_SHIELD_PCT = 0.5;
+// v4.1.0: Profit shield DISABLED — let reval exit winners when gates fail.
+// Enables "relay race" pattern: each direction captures its leg, hands off to next.
+// In chop: auto-scalps alternating directions. In trend: gates pass, reval doesn't trigger.
+// Set to Infinity to disable (code stays intact for re-enable).
+const REVAL_PROFIT_SHIELD_PCT = Infinity;
 // v4.0.4: Grace period extended for TechnicalIndicators bots.
 // TechnicalIndicators waits for the NEXT 1H candle close before opening a deal.
 // This can take up to 60 minutes after webhook startBot.
