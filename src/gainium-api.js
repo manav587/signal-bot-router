@@ -442,10 +442,10 @@ async function closeDealsViaApi(botMongoId, botName, closeType = 'closeByMarket'
  * @returns {{ success: boolean, dealId: string|null, error: string|null }}
  */
 async function createDeal(botMongoId, botName) {
-  const endpoint = `/api/deals`;
+  const endpoint = `/api/deals/dca`;
   const url = `${BASE_URL}${endpoint}`;
   const method = 'POST';
-  const body = JSON.stringify({ botId: botMongoId, dealType: 'dca' });
+  const body = JSON.stringify({ botId: botMongoId });
   const headers = authHeaders(method, endpoint, body);
 
   try {
