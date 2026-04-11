@@ -442,41 +442,58 @@ async function closeDealsViaApi(botMongoId, botName, closeType = 'closeByMarket'
  * @returns {{ success: boolean, dealId: string|null, error: string|null }}
  */
 async function createDeal(botMongoId, botName) {
+  const MAX_RETRIES = 3;
   const endpoint = `/api/v2/deals/dca/${botMongoId}/start`;
   const url = `${BASE_URL}${endpoint}`;
   const method = 'POST';
   const body = '';  // V2: botId is in URL path, no body needed
-  const headers = authHeaders(method, endpoint, body);
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const headers = authHeaders(method, endpoint, body);
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
 
-    const res = await fetch(url, { method, headers, signal: controller.signal });
-    clearTimeout(timeout);
+      const res = await fetch(url, { method, headers, signal: controller.signal });
+      clearTimeout(timeout);
 
-    const contentType = res.headers.get('content-type') || '';
-    let json = {};
-    if (contentType.includes('application/json')) {
-      json = await res.json();
-    } else {
-      const text = await res.text();
-      log(`createDeal [${botName}]: non-JSON response (${res.status}): ${text.substring(0, 200)}`);
-      return { success: false, dealId: null, error: `Non-JSON response: ${res.status}` };
+      const contentType = res.headers.get('content-type') || '';
+      let json = {};
+      if (contentType.includes('application/json')) {
+        json = await res.json();
+      } else {
+        const text = await res.text();
+        log(`createDeal [${botName}]: non-JSON response (${res.status}): ${text.substring(0, 200)} [attempt ${attempt}/${MAX_RETRIES}]`);
+        if (attempt < MAX_RETRIES && res.status >= 500) {
+          await new Promise(r => setTimeout(r, 2000 * attempt));
+          continue;
+        }
+        return { success: false, dealId: null, error: `Non-JSON response: ${res.status}` };
+      }
+
+      if (res.ok && (json.status === 'OK' || json.data)) {
+        const dealId = json.data?._id || json.data?.id || 'unknown';
+        log(`createDeal [${botName}]: ✅ Deal created successfully (dealId: ${dealId})${attempt > 1 ? ` [attempt ${attempt}]` : ''}`);
+        return { success: true, dealId, error: null };
+      }
+
+      const reason = json.reason || json.message || json.error || `HTTP ${res.status}`;
+      if (attempt < MAX_RETRIES && res.status >= 500) {
+        log(`createDeal [${botName}]: ⚠️ Server error — ${reason} [attempt ${attempt}/${MAX_RETRIES}, retrying in ${2 * attempt}s]`);
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+        continue;
+      }
+      log(`createDeal [${botName}]: ❌ Failed — ${reason}`);
+      return { success: false, dealId: null, error: reason };
+    } catch (err) {
+      if (attempt < MAX_RETRIES) {
+        log(`createDeal [${botName}]: ⚠️ ${err.message} [attempt ${attempt}/${MAX_RETRIES}, retrying in ${2 * attempt}s]`);
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+        continue;
+      }
+      log(`createDeal [${botName}]: ❌ Error after ${MAX_RETRIES} attempts — ${err.message}`);
+      return { success: false, dealId: null, error: err.message };
     }
-
-    if (res.ok && (json.status === 'OK' || json.data)) {
-      const dealId = json.data?._id || json.data?.id || 'unknown';
-      log(`createDeal [${botName}]: ✅ Deal created successfully (dealId: ${dealId})`);
-      return { success: true, dealId, error: null };
-    }
-
-    const reason = json.reason || json.message || json.error || `HTTP ${res.status}`;
-    log(`createDeal [${botName}]: ❌ Failed — ${reason}`);
-    return { success: false, dealId: null, error: reason };
-  } catch (err) {
-    log(`createDeal [${botName}]: ❌ Error — ${err.message}`);
-    return { success: false, dealId: null, error: err.message };
   }
 }
 

@@ -207,7 +207,10 @@ const GATE_PENDING = {};
 const FLIP_COOLDOWN = {};
 // v4.1.0: Reduced from 10min to 2min for relay-race scalping.
 // Just enough to prevent double-flip in same reval cycle.
-const FLIP_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+// v4.1.0: Reduced from 10min to 90s for relay-race scalping.
+// Must be LESS than reval interval (2min) to avoid cooldown-reval sync issue.
+// At 90s, cooldown expires before next reval cycle — no wasted cycles.
+const FLIP_COOLDOWN_MS = 90 * 1000; // 90 seconds
 
 function isFlipOnCooldown(pair) {
   const lastFlip = FLIP_COOLDOWN[pair];
@@ -2136,6 +2139,8 @@ async function runRevalidation() {
           price: result.data.currentPrice || null,
         };
 
+        // v4.1.0: Set GATE_PENDING to prevent concurrent TradingView signal dispatch
+        GATE_PENDING[bot.pair] = { direction: oppositeDir, timestamp: Date.now() };
         try {
           const processResult = await processActions(revalActions, revalRequestId, false, revalContext);
 
@@ -2198,6 +2203,10 @@ async function runRevalidation() {
           if (flipResult && flipResult.reason === 'pending') {
             flipResult = { flipped: false, reason: `processActions error: ${processErr.message}` };
           }
+        } finally {
+          // v4.1.0: Always clear GATE_PENDING after reval auto-flip completes
+          // Prevents stale lock if processActions throws or takes unexpected path
+          delete GATE_PENDING[bot.pair];
         }
 
         // Alert to Telegram (includes flip result)
