@@ -10,14 +10,15 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.0.5';
+const VERSION = '4.1.0';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
 // The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
 // UUID is what TradingView sends; Mongo ID is what the Gainium REST API uses.
-// V3.1 bots — startCondition: TechnicalIndicators (1H EMA + RSI), gated by relay webhook start/stop.
-// Switched from ASAP to TechnicalIndicators on 9 Apr 2026 to eliminate race condition.
+// V4.1 bots — startCondition: Manual, relay creates deals via REST API after startBot.
+// History: ASAP (v3.0) → TechnicalIndicators (v3.1, 9 Apr) → Manual (v4.1, 11 Apr).
+// Manual + createDeal eliminates the TechnicalIndicators candle-wait ghost trade problem.
 const BOT_MAP = {
   '61a66c9f-7463-46db-a72f-2ef39565bc20': { mongoId: '69ce1dc4228af151def7f93e', name: 'SOL Long v2' },
   '3af77f4f-73a7-45c1-a0fd-b7c3ce9f16ee': { mongoId: '69ce1dc6228af151def7f97b', name: 'SOL Short v2' },
@@ -748,13 +749,10 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false, context = {}) {
-  // v3.1.1: Bots use startCondition=ASAP, controlled by relay webhook start/stop.
-  // Webhook startBot activates the bot; ASAP opens a deal immediately.
-  // After TP/SL, ASAP re-enters after 5-min cooldown (Gainium-side).
-  // Relay safety layers prevent churning:
-  //   - 5-min cooldown between deals (Gainium-side, longer than 2-min reval)
-  //   - 2-min revalidation with 0.8% drawdown kill (relay-side)
-  //   - Bot stopped if external gates fail while deal is closed (pre-re-entry)
+  // v4.1.0: Bots use startCondition=Manual, relay creates deals via REST API.
+  // Webhook startBot activates the bot; createDeal opens a deal immediately.
+  // After TP/SL, bot sits idle (Manual = no auto-restart) until next crossover signal.
+  // This eliminates both: TechnicalIndicators candle-wait AND ASAP churning.
 
   log(`[${requestId}] Processing ${actions.length} action(s)${isRetry ? ' (deferred retry)' : ''}...`);
 
@@ -792,6 +790,30 @@ async function processActions(actions, requestId, isRetry = false, context = {})
     } catch (err) {
       log(`[${requestId}]   ✗ ${actionName} FAILED after retry: ${err.name === 'AbortError' ? 'timeout' : err.message}`);
       // Continue with remaining actions — don't let one failure block the rest
+    }
+
+    // v4.1.0: After startBot, create a deal via REST API.
+    // Bots use Manual start condition — startBot activates the bot but doesn't
+    // open a deal. We force-create one via the REST API to eliminate the
+    // TechnicalIndicators candle-wait ghost trade problem.
+    if (actionName === 'startBot' && BOT_MAP[uuid] && gainiumApi.isConfigured()) {
+      const botInfo = BOT_MAP[uuid];
+      // Brief pause to let Gainium register the bot as "open" before creating a deal
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const dealResult = await gainiumApi.createDeal(botInfo.mongoId, botInfo.name);
+      if (dealResult.success) {
+        log(`[${requestId}]   🎯 Deal created on ${botInfo.name} via REST API (dealId: ${dealResult.dealId})`);
+      } else {
+        log(`[${requestId}]   ❌ createDeal FAILED on ${botInfo.name}: ${dealResult.error}`);
+        // Send Telegram alert — deal creation failure is critical
+        sendTelegramAlert(
+          `⚠️ Deal creation failed\n\n` +
+          `Bot ${botInfo.name} was started but no deal was created.\n` +
+          `Error: ${dealResult.error}\n\n` +
+          `The bot is active but has NO position on Binance.\n` +
+          `${istTimestamp()}`
+        ).catch(() => {});
+      }
     }
 
     // v1.2.0: After closeAllDeals, run verification before proceeding
@@ -1249,7 +1271,7 @@ app.get('/test-reconcile/:pair', async (req, res) => {
   });
 });
 
-// ── v4.0.5: Manual test endpoint — cold-start a single direction ──────────
+// ── v4.1.0: Manual test endpoint — cold-start a single direction ──────────
 // POST /test/:pair/:direction  (e.g. POST /test/ETH/LONG)
 // Bypasses closeAllDeals verification and duplicate detection.
 // Still runs gate validation, ensureBotOpen, and tracks in ACTIVE_BOTS.
@@ -1299,6 +1321,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
     }
   }
 
+  // Send startBot webhook to Gainium (no closeAllDeals needed)
   try {
     const result = await sendAction({ action: 'startBot', uuid: bot.uuid });
     log(`[${requestId}] ✓ startBot returned ${result.status}`);
@@ -1307,6 +1330,20 @@ app.post('/test/:pair/:direction', async (req, res) => {
     return res.status(500).json({ error: `startBot failed: ${err.message}`, requestId });
   }
 
+  // v4.1.0: Create deal via REST API (Manual start condition — no auto-deal)
+  let dealCreated = false;
+  if (gainiumApi.isConfigured()) {
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Let Gainium register bot as open
+    const dealResult = await gainiumApi.createDeal(bot.mongoId, bot.name);
+    dealCreated = dealResult.success;
+    if (dealResult.success) {
+      log(`[${requestId}] 🎯 Deal created on ${bot.name} (dealId: ${dealResult.dealId})`);
+    } else {
+      log(`[${requestId}] ❌ createDeal FAILED on ${bot.name}: ${dealResult.error}`);
+    }
+  }
+
+  // Track in ACTIVE_BOTS + LAST_DIRECTION
   ACTIVE_BOTS[bot.uuid] = {
     pair: pair + 'USDT',
     direction,
@@ -1318,26 +1355,29 @@ app.post('/test/:pair/:direction', async (req, res) => {
   LAST_DIRECTION[pair] = direction;
   log(`[${requestId}] 📋 Tracking: ${bot.name} (${pair} ${direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
 
+  // Telegram alert
   sendTelegramAlert(
     `🧪 TEST trade opened\n\n` +
-    `Signal: Manual test (v4.0.5)\n` +
+    `Signal: Manual test (v4.1.0)\n` +
     `Going ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}.\n\n` +
     `✅ Gate passed: ${gateResult.reason}\n` +
-    `Bot: ${bot.name}\n` +
-    `Grace period: ${Math.round(REVAL_GRACE_PERIOD_MS / 60000)} min\n\n` +
+    `🎯 Deal created: ${dealCreated ? 'YES' : 'NO — check Gainium'}\n` +
+    `Bot: ${bot.name}\n\n` +
     `${istTimestamp()}`
   ).catch(() => {});
 
   res.json({
     requestId,
-    status: 'test-started',
+    status: dealCreated ? 'test-deal-opened' : 'test-started-no-deal',
     bot: bot.name,
     pair,
     direction,
     entryPrice: gateResult.data.currentPrice,
     gateResult: gateResult.reason,
-    gracePeriodMin: Math.round(REVAL_GRACE_PERIOD_MS / 60000),
-    message: `Waiting for TechnicalIndicators to evaluate on next 1H candle close`,
+    dealCreated,
+    message: dealCreated
+      ? `Deal opened immediately on ${bot.name}`
+      : `Bot started but deal creation failed — check Gainium`,
   });
 });
 
@@ -1647,7 +1687,10 @@ const REVAL_PROFIT_SHIELD_PCT = 0.5;
 // During this window, Binance has no position yet — reval must NOT clean up
 // the ACTIVE_BOTS entry or the relay loses tracking before the deal materializes.
 // 65 min covers the worst case (signal at :01 → next candle at :00 = 59 min + buffer).
-const REVAL_GRACE_PERIOD_MS = 65 * 60 * 1000; // 65 minutes (TechnicalIndicators candle wait)
+// v4.1.0: Grace period reduced from 65min → 5min.
+// With Manual + createDeal, deals open within seconds (no candle wait).
+// 5 min covers edge cases: API latency, Gainium processing, Binance settlement.
+const REVAL_GRACE_PERIOD_MS = 5 * 60 * 1000; // 5 minutes (deal creation + Binance settlement)
 // v4.0.0: Max underwater tightened for scalp mode.
 // No scalp should sit underwater for 2 hours. If it does, the trade thesis is wrong.
 // Strong trend exception still applies but with shorter leash.
@@ -1698,7 +1741,7 @@ async function runRevalidation() {
         // NOT an external close. Only clean up after grace period expires.
         const botAgeMs = Date.now() - new Date(bot.startedAt).getTime();
         if (botAgeMs < REVAL_GRACE_PERIOD_MS) {
-          log(`🔄 Reval: ${bot.botName} has no Binance position but is within grace period (${Math.round(botAgeMs / 1000)}s old, grace=${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min). Waiting for TechnicalIndicators deal.`);
+          log(`🔄 Reval: ${bot.botName} has no Binance position but is within grace period (${Math.round(botAgeMs / 1000)}s old, grace=${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min). Waiting for deal creation.`);
           continue;
         }
         log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but no ${base} position in Gainium. Cleaning up.`);

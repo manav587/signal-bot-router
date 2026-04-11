@@ -426,6 +426,60 @@ async function closeDealsViaApi(botMongoId, botName, closeType = 'closeByMarket'
   }
 }
 
+// ── v4.1.0: Create Deal via REST API ────────────────────────────────────
+// Bots now use startCondition=Manual. startBot activates the bot but does
+// NOT open a deal. We force-create one via the REST API immediately after.
+// This eliminates the TechnicalIndicators candle-wait gap that caused
+// ghost trades (relay reports success, but no Binance position).
+
+/**
+ * Create a new deal on a bot via the REST API.
+ * This is the critical fix: with Manual start condition, the bot won't
+ * auto-open deals — we must explicitly create one.
+ *
+ * @param {string} botMongoId — MongoDB ObjectId of the bot
+ * @param {string} botName    — Human-readable name (for logging)
+ * @returns {{ success: boolean, dealId: string|null, error: string|null }}
+ */
+async function createDeal(botMongoId, botName) {
+  const endpoint = `/api/deals`;
+  const url = `${BASE_URL}${endpoint}`;
+  const method = 'POST';
+  const body = JSON.stringify({ botId: botMongoId, dealType: 'dca' });
+  const headers = authHeaders(method, endpoint, body);
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const res = await fetch(url, { method, headers, body, signal: controller.signal });
+    clearTimeout(timeout);
+
+    const contentType = res.headers.get('content-type') || '';
+    let json = {};
+    if (contentType.includes('application/json')) {
+      json = await res.json();
+    } else {
+      const text = await res.text();
+      log(`createDeal [${botName}]: non-JSON response (${res.status}): ${text.substring(0, 200)}`);
+      return { success: false, dealId: null, error: `Non-JSON response: ${res.status}` };
+    }
+
+    if (res.ok && (json.status === 'OK' || json.data)) {
+      const dealId = json.data?._id || json.data?.id || 'unknown';
+      log(`createDeal [${botName}]: ✅ Deal created successfully (dealId: ${dealId})`);
+      return { success: true, dealId, error: null };
+    }
+
+    const reason = json.reason || json.message || json.error || `HTTP ${res.status}`;
+    log(`createDeal [${botName}]: ❌ Failed — ${reason}`);
+    return { success: false, dealId: null, error: reason };
+  } catch (err) {
+    log(`createDeal [${botName}]: ❌ Error — ${err.message}`);
+    return { success: false, dealId: null, error: err.message };
+  }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /**
@@ -599,4 +653,5 @@ module.exports = {
   verifyAndForceClose,
   getExchangePositionMap,
   ensureBotOpen,
+  createDeal,
 };
