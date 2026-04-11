@@ -1779,12 +1779,89 @@ async function runRevalidation() {
         }
 
         delete ACTIVE_BOTS[uuid];
-        sendTelegramAlert(
-          `🧹 External close detected: ${bot.botName}\n\n` +
-          `Position was closed outside the relay (Binance app, manual close, or liquidation).\n` +
-          `Gainium deal cleaned up. ${base} is now available for re-entry on next signal.\n\n` +
-          `${istTimestamp()}`
-        ).catch(() => {});
+        delete LAST_DIRECTION[bot.pair];
+
+        // v4.1.1: Relay race re-entry — don't go flat, check Gate 2 and re-enter
+        // the direction the market supports right now.
+        try {
+          log(`🔄 External close: checking Gate 2 for ${base} re-entry...`);
+          const [longGate, shortGate] = await Promise.all([
+            signalGate.validateSignal(base, 'LONG'),
+            signalGate.validateSignal(base, 'SHORT'),
+          ]);
+
+          let reentryDir = null;
+          let reentryGate = null;
+          if (longGate.allowed && !shortGate.allowed) {
+            reentryDir = 'LONG';
+            reentryGate = longGate;
+          } else if (shortGate.allowed && !longGate.allowed) {
+            reentryDir = 'SHORT';
+            reentryGate = shortGate;
+          } else if (longGate.allowed && shortGate.allowed) {
+            // Both pass — use 1H trend as tiebreaker
+            const trend = longGate.data?.shortTermTrend || shortGate.data?.shortTermTrend;
+            reentryDir = trend === 'BEARISH' ? 'SHORT' : 'LONG';
+            reentryGate = reentryDir === 'LONG' ? longGate : shortGate;
+            log(`🔄 External close: both directions pass — using 1H trend (${trend}) → ${reentryDir}`);
+          }
+
+          if (reentryDir) {
+            const reentryBot = findBot(base, reentryDir);
+            if (reentryBot && !isFlipOnCooldown(base)) {
+              log(`🔄 External close → re-entry: ${reentryBot.name} (${reentryDir}) — gates pass, entering`);
+              const reentryActions = [{ action: 'startBot', uuid: reentryBot.uuid }];
+              const reentryReqId = `reentry-${base}-${Date.now()}`;
+              const reentryCtx = { pair: base, direction: reentryDir, price: reentryGate.data?.currentPrice || null };
+
+              GATE_PENDING[base] = { direction: reentryDir, timestamp: Date.now() };
+              try {
+                await processActions(reentryActions, reentryReqId, false, reentryCtx);
+                ACTIVE_BOTS[reentryBot.uuid] = {
+                  pair: base,
+                  direction: reentryDir,
+                  botName: reentryBot.name,
+                  startedAt: new Date().toISOString(),
+                  entryPrice: reentryGate.data?.currentPrice || null,
+                  origin: 'relay-reentry',
+                };
+                LAST_ACTIVE[base] = Date.now();
+                LAST_DIRECTION[base] = reentryDir;
+                tradeJournal.recordEntry({ pair: base, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: reentryGate.data?.currentPrice, origin: 'relay-reentry', gateData: reentryGate.data });
+
+                sendTelegramAlert(
+                  `🔄 Relay re-entry: ${reentryBot.name}\n\n` +
+                  `Previous position closed (SL/TP/manual). Gate 2 supports ${reentryDir} — re-entering immediately.\n` +
+                  `Entry: ~$${reentryGate.data?.currentPrice?.toFixed(2) || '?'}\n` +
+                  `1H trend: ${reentryGate.data?.shortTermTrend || '?'}\n\n` +
+                  `${istTimestamp()}`
+                ).catch(() => {});
+              } finally {
+                delete GATE_PENDING[base];
+              }
+            } else if (!reentryBot) {
+              log(`🔄 External close: no ${reentryDir} bot found for ${base} — staying flat`);
+              sendTelegramAlert(
+                `🧹 External close: ${bot.botName}\n\nPosition closed. No ${reentryDir} bot available for re-entry.\n\n${istTimestamp()}`
+              ).catch(() => {});
+            } else {
+              log(`🔄 External close: ${base} on flip cooldown — skipping re-entry`);
+              sendTelegramAlert(
+                `🧹 External close: ${bot.botName}\n\nPosition closed. Flip cooldown active — will re-enter on next reval cycle.\n\n${istTimestamp()}`
+              ).catch(() => {});
+            }
+          } else {
+            log(`🔄 External close: no direction passes Gate 2 for ${base} — staying flat`);
+            sendTelegramAlert(
+              `🧹 External close: ${bot.botName}\n\nPosition closed. No direction supported by Gate 2 right now — waiting for next signal.\n\n${istTimestamp()}`
+            ).catch(() => {});
+          }
+        } catch (reentryErr) {
+          log(`🔄 External close re-entry error for ${base}: ${reentryErr.message}`);
+          sendTelegramAlert(
+            `🧹 External close: ${bot.botName}\n\nPosition closed. Re-entry check failed: ${reentryErr.message}\nWaiting for next signal.\n\n${istTimestamp()}`
+          ).catch(() => {});
+        }
         continue;
       }
     }
@@ -1952,115 +2029,88 @@ async function runRevalidation() {
               }
 
               if (deals && deals.active === 0) {
-                // Deal closed (TP/SL). ASAP will auto-open next deal after cooldown.
-                // Relay's external gates provide safety — stop bot if gates fail.
+                // v4.1.1: Deal closed (TP/SL). Relay race re-entry — don't go flat.
+                // With Manual start, there's no ASAP to re-open. We must explicitly
+                // check Gate 2 and re-enter the direction the market supports.
+                log(`🔄 Deal closed: ${bot.botName} — checking Gate 2 for re-entry`);
 
-                // v4.0.1: Consecutive loss breaker — detect win/loss and park if needed
-                const fullGate = await signalGate.validateSignal(bot.pair, bot.direction);
-                const currentPrice = fullGate.data?.currentPrice || 0;
+                // Record win/loss for tracking (consecutive loss breaker is disabled but tracking continues)
+                const currentPrice = result.data?.currentPrice || 0;
                 const isLoss = bot.entryPrice && currentPrice
                   ? (bot.direction === 'LONG' ? currentPrice < bot.entryPrice : currentPrice > bot.entryPrice)
                   : false;
-                const shouldPark = recordDealClose(bot.pair, isLoss);
+                recordDealClose(bot.pair, isLoss);
+                tradeJournal.recordExit({ botUuid: uuid, exitPrice: currentPrice || bot.entryPrice, exitReason: isLoss ? 'sl' : 'tp' });
 
-                if (shouldPark || isPairParked(bot.pair)) {
-                  // Too many consecutive losses — stop the bot and park the pair
-                  log(`🅿️ ${bot.botName}: consecutive loss limit reached — stopping bot and parking ${bot.pair} for 30 min`);
-                  try {
-                    await sendAction({ action: 'stopBot', uuid });
-                  } catch (stopErr) {
-                    log(`🅿️ Park: stopBot failed for ${bot.botName}: ${stopErr.message}`);
-                  }
-                  delete ACTIVE_BOTS[uuid];
-                  delete LAST_DIRECTION[bot.pair];
-                  const lossInfo = CONSECUTIVE_LOSSES[bot.pair];
-                  const resumeIST = lossInfo?.parkedUntil ? new Date(lossInfo.parkedUntil).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false }) : '?';
-                  sendTelegramAlert(
-                    `🅿️ ${bot.botName} PARKED — ${lossInfo?.count || '?'} consecutive losses\n\n` +
-                    `${bot.pair} has hit the stop loss ${lossInfo?.count || '?'} times in a row. ` +
-                    `To prevent further bleeding, this pair is parked for 30 minutes.\n\n` +
-                    `Resumes at: ${resumeIST} IST\n` +
-                    `The pair will re-enter only if a valid TradingView signal arrives after the park expires.\n\n` +
-                    `${istTimestamp()}`
-                  ).catch(() => {});
-                  continue; // skip to next bot in revalidation
+                // Check both directions — enter whichever Gate 2 supports
+                const [longGate, shortGate] = await Promise.all([
+                  signalGate.validateSignal(bot.pair, 'LONG'),
+                  signalGate.validateSignal(bot.pair, 'SHORT'),
+                ]);
+
+                let reentryDir = null;
+                let reentryGate = null;
+                if (longGate.allowed && !shortGate.allowed) {
+                  reentryDir = 'LONG';
+                  reentryGate = longGate;
+                } else if (shortGate.allowed && !longGate.allowed) {
+                  reentryDir = 'SHORT';
+                  reentryGate = shortGate;
+                } else if (longGate.allowed && shortGate.allowed) {
+                  const trend = longGate.data?.shortTermTrend || shortGate.data?.shortTermTrend;
+                  reentryDir = trend === 'BEARISH' ? 'SHORT' : 'LONG';
+                  reentryGate = reentryDir === 'LONG' ? longGate : shortGate;
                 }
 
-                if (fullGate.allowed) {
-                  // v4.0.1: Proximity gate — even if EMAs still aligned, block re-entry
-                  // when the opposite crossover is imminent (>80% probability).
-                  // This prevents the SL→cooldown→re-enter→SL churn loop.
-                  let proximityBlocked = false;
-                  try {
-                    const proximity = await signalGate.getCrossoverProximity();
-                    const pairProx = proximity[bot.pair];
-                    if (pairProx && !pairProx.error && pairProx.probability >= PROXIMITY_BLOCK_THRESHOLD) {
-                      // Crossover is imminent — the "nextSignal" is the OPPOSITE direction
-                      // If bot is LONG and nextSignal says SHORT is coming, block re-entry
-                      const oppositeDirection = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
-                      if (pairProx.nextSignal && pairProx.nextSignal.toUpperCase().includes(oppositeDirection)) {
-                        proximityBlocked = true;
-                        log(`🛑 Proximity block: ${bot.botName} — ${pairProx.probability}% chance of ${pairProx.nextSignal}, blocking ASAP re-entry`);
-                      }
+                if (reentryDir) {
+                  const reentryBot = findBot(bot.pair, reentryDir);
+                  if (reentryBot) {
+                    // Stop the old bot first if we're changing direction
+                    if (reentryDir !== bot.direction) {
+                      try { await sendAction({ action: 'stopBot', uuid }); } catch (e) {}
                     }
-                  } catch (proxErr) {
-                    log(`⚠️ Proximity check failed for ${bot.botName}: ${proxErr.message} — allowing re-entry (fail-open)`);
-                  }
+                    log(`🔄 Deal closed → re-entry: ${reentryBot.name} (${reentryDir})`);
+                    const reentryActions = [{ action: 'startBot', uuid: reentryBot.uuid }];
+                    const reentryReqId = `reentry-${bot.pair}-${Date.now()}`;
+                    const reentryCtx = { pair: bot.pair, direction: reentryDir, price: reentryGate.data?.currentPrice || null };
 
-                  if (proximityBlocked) {
-                    // Stop the bot to prevent ASAP re-entry into an imminent reversal
-                    log(`🔄 Re-entry: ${bot.botName} deal closed, gates pass BUT proximity block active — stopping bot`);
-                    tradeJournal.recordExit({ botUuid: uuid, exitPrice: fullGate.data?.currentPrice || bot.entryPrice, exitReason: 'proximity-block' });
+                    GATE_PENDING[bot.pair] = { direction: reentryDir, timestamp: Date.now() };
                     try {
-                      await sendAction({ action: 'stopBot', uuid });
-                    } catch (stopErr) {
-                      log(`🔄 Proximity block: stopBot failed for ${bot.botName}: ${stopErr.message}`);
+                      delete ACTIVE_BOTS[uuid];
+                      await processActions(reentryActions, reentryReqId, false, reentryCtx);
+                      ACTIVE_BOTS[reentryBot.uuid] = {
+                        pair: bot.pair,
+                        direction: reentryDir,
+                        botName: reentryBot.name,
+                        startedAt: new Date().toISOString(),
+                        entryPrice: reentryGate.data?.currentPrice || null,
+                        origin: 'relay-reentry',
+                      };
+                      LAST_ACTIVE[bot.pair] = Date.now();
+                      LAST_DIRECTION[bot.pair] = reentryDir;
+                      tradeJournal.recordEntry({ pair: bot.pair, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: reentryGate.data?.currentPrice, origin: 'relay-reentry', gateData: reentryGate.data });
+
+                      const action = reentryDir === bot.direction ? 're-entering same direction' : `flipping to ${reentryDir}`;
+                      sendTelegramAlert(
+                        `🔄 Deal closed → ${action}: ${reentryBot.name}\n\n` +
+                        `Previous: ${bot.botName} (${isLoss ? 'SL hit' : 'TP hit'})\n` +
+                        `Gate 2 supports ${reentryDir} — ${action}.\n` +
+                        `Entry: ~$${reentryGate.data?.currentPrice?.toFixed(2) || '?'}\n` +
+                        `1H trend: ${reentryGate.data?.shortTermTrend || '?'}\n\n` +
+                        `${istTimestamp()}`
+                      ).catch(() => {});
+                    } finally {
+                      delete GATE_PENDING[bot.pair];
                     }
-                    delete ACTIVE_BOTS[uuid];
-                    delete LAST_DIRECTION[bot.pair];
-                    sendTelegramAlert(
-                      `🛑 ${bot.botName} stopped — crossover imminent\n\n` +
-                      `Deal closed (TP/SL), and the EMAs technically still support ${bot.direction}.\n` +
-                      `But the opposite crossover is 80+% likely — re-entering now would risk another stop loss.\n\n` +
-                      `Bot stopped to avoid churn. Will re-enter when the next clear TradingView signal arrives.\n\n` +
-                      `${istTimestamp()}`
-                    ).catch(() => {});
-                  } else {
-                  // External gates pass + no proximity block — ASAP will re-open after 5-min cooldown
-                  bot.entryPrice = fullGate.data.currentPrice || bot.entryPrice;
-                  log(`🔄 Re-entry: ${bot.botName} deal closed, external gates PASS — ASAP will re-enter after cooldown @ ~$${bot.entryPrice?.toFixed(2) || '?'}`);
-                  // Only send Telegram once per hour per bot (not every 2 min)
-                  if (canSendTelegramAlert(uuid, 'gated-reentry')) {
-                    markTelegramAlertSent(uuid, 'gated-reentry');
-                    sendTelegramAlert(
-                      `🔄 Deal closed — re-entering\n\n` +
-                      `Signal: 1H EMA 9/21\n` +
-                      `${bot.botName} took profit or hit stop loss. The market still supports a ${bot.direction} on ${bot.pair}:\n\n` +
-                      `• 1H EMAs (9 vs 21): ${fullGate.data.shortTermTrend || '?'} — moving averages still aligned\n` +
-                      `• RSI(14): ${fullGate.data.rsi14 || '?'} — momentum in range\n` +
-                      `• Price: $${fullGate.data.currentPrice?.toFixed(2) || '?'}\n\n` +
-                      `A new deal will open automatically after the 5-minute cooldown.\n\n` +
-                      `${istTimestamp()}`
-                    ).catch(() => {});
                   }
-                  } // end else (no proximity block)
                 } else {
-                  // External gates fail — stop bot before ASAP reopens
-                  log(`🔄 Re-entry: ${bot.botName} deal closed, external gates FAILED — stopping bot`);
-                  tradeJournal.recordExit({ botUuid: uuid, exitPrice: fullGate.data?.currentPrice || result.data.currentPrice, exitReason: 'gate-stop' });
-                  try {
-                    await sendAction({ action: 'stopBot', uuid });
-                  } catch (stopErr) {
-                    log(`🔄 Re-entry: stopBot failed for ${bot.botName}: ${stopErr.message}`);
-                  }
+                  // Neither direction passes — go flat
+                  log(`🔄 Deal closed: ${bot.botName} — no direction passes Gate 2, going flat`);
+                  try { await sendAction({ action: 'stopBot', uuid }); } catch (e) {}
                   delete ACTIVE_BOTS[uuid];
                   delete LAST_DIRECTION[bot.pair];
                   sendTelegramAlert(
-                    `⏹️ ${bot.botName} stopped — market shifted\n\n` +
-                    `The deal closed, but the market no longer supports a ${bot.direction}:\n` +
-                    `${fullGate.reason}\n\n` +
-                    `The bot has been paused to avoid opening a new deal into a bad setup. It will wait for the next TradingView crossover signal to re-enter.\n\n` +
-                    `${istTimestamp()}`
+                    `⏹️ ${bot.botName} deal closed\n\nNeither direction passes Gate 2 — waiting for next signal.\n\n${istTimestamp()}`
                   ).catch(() => {});
                 }
               }
