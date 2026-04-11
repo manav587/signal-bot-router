@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.1.0';
+const VERSION = '4.1.1';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -123,8 +123,13 @@ const SELF_HEAL_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours — only recover pai
 // Prevents the bleed loop where ASAP keeps re-entering a dropping market.
 // Key = pair name (e.g. 'ETH'), Value = { count, parkedUntil }
 const CONSECUTIVE_LOSSES = {};
-const MAX_CONSECUTIVE_LOSSES = 3;
-const LOSS_PARK_MS = 30 * 60 * 1000; // 30 minutes
+// v4.1.1: Consecutive loss breaker DISABLED — relay race accepts small losses
+// as the cost of catching the big move. Parking after losses means missing
+// the trend reversal that pays for all of them.
+// Set to Infinity to disable (code stays intact for re-enable).
+// Was: 3 losses → park 30min (v4.0.1)
+const MAX_CONSECUTIVE_LOSSES = Infinity;
+const LOSS_PARK_MS = 30 * 60 * 1000; // kept for reference
 
 function recordDealClose(pair, isLoss) {
   if (!CONSECUTIVE_LOSSES[pair]) CONSECUTIVE_LOSSES[pair] = { count: 0, parkedUntil: null };
@@ -244,10 +249,13 @@ function isRecoveryLocked(pair) {
 // rapid flip-flopping on the faster timeframe.
 // Key = pair name, Value = { flips: [timestamps], parkedUntil: ISO | null }
 const CIRCUIT_BREAKER = {};
-// v4.1.0: Loosened for relay-race scalping — allow more handoffs before parking.
-const CB_FLIP_THRESHOLD = 5;    // was 2 — relay race needs room for consecutive flips
-const CB_WINDOW_MS = 30 * 60 * 1000;   // 30-minute window (was 15)
-const CB_PARK_MS = 15 * 60 * 1000;     // 15-minute park (was 30) — shorter recovery
+// v4.1.1: Circuit breaker DISABLED — relay race trusts every EMA-confirmed flip.
+// If gates pass, the flip is valid. Parking means missing the next leg.
+// Set threshold to Infinity to disable (code stays intact for re-enable).
+// Was: 5 flips/30min → park 15min (v4.1.0)
+const CB_FLIP_THRESHOLD = Infinity;
+const CB_WINDOW_MS = 30 * 60 * 1000;   // kept for reference
+const CB_PARK_MS = 15 * 60 * 1000;     // kept for reference
 
 function recordFlip(pair) {
   if (!CIRCUIT_BREAKER[pair]) {
@@ -1679,10 +1687,12 @@ app.post('/webhook', (req, res) => {
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
 // v4.0.0 SCALP MODE: Tight parameters for fast-cycling $5-10 scalps.
 // History: was 4% (v3.4.0) → 3.5% → 2.0% (v3.8.3) → now 0.8%.
-// Gainium SL is 0.5% — relay drawdown at 0.8% is the backup safety net.
-// At 10x leverage, 0.8% price = 8% ROI loss (hard cap).
-// No DCA orders, so no safety order room needed.
-const REVAL_MAX_DRAWDOWN_PCT = 0.8;
+// v4.1.1: Drawdown stop DISABLED — Gainium bot-level SL on Binance is the hard floor.
+// Relay race trusts the trend signal (Gate 2 EMA). If EMA supports direction,
+// temporary drawdown is noise. Gainium SL catches catastrophic moves.
+// Set to Infinity to disable (code stays intact for re-enable).
+// Was: 0.8% (relay drawdown at 0.8% = 8% ROI at 10x)
+const REVAL_MAX_DRAWDOWN_PCT = Infinity;
 // v4.0.0: Profit shield lowered to match scalp TP (0.8%).
 // With 0.8% TP + 0.3% trailing, positions close fast. Shield at 0.5%
 // still protects a winning trade from being flipped by a brief EMA wobble.
@@ -1701,10 +1711,12 @@ const REVAL_PROFIT_SHIELD_PCT = Infinity;
 // With Manual + createDeal, deals open within seconds (no candle wait).
 // 5 min covers edge cases: API latency, Gainium processing, Binance settlement.
 const REVAL_GRACE_PERIOD_MS = 5 * 60 * 1000; // 5 minutes (deal creation + Binance settlement)
-// v4.0.0: Max underwater tightened for scalp mode.
-// No scalp should sit underwater for 2 hours. If it does, the trade thesis is wrong.
-// Strong trend exception still applies but with shorter leash.
-const REVAL_MAX_UNDERWATER_MS = 2 * 60 * 60 * 1000; // 2 hours (was 12h)
+// v4.1.1: Time stop DISABLED — relay race trusts the EMA signal.
+// If the trend still supports the position, elapsed time is irrelevant.
+// The trend will either flip (reval exits naturally) or it won't (position is valid).
+// Set to Infinity to disable (code stays intact for re-enable).
+// Was: 2 hours (v4.0.0 scalp mode)
+const REVAL_MAX_UNDERWATER_MS = Infinity;
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" if 0.1%+ against entry
 const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite crossover probability > 80%

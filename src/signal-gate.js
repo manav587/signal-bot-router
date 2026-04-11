@@ -723,22 +723,21 @@ async function validateSignal(pair, direction) {
       }
     }
 
-    // ── Gate 3: RSI level confirmation ─────────────────────────────────
+    // ── Gate 3: RSI level confirmation → ADVISORY v4.1.1 ────────────────
+    // v4.1.1: Demoted from BLOCKING to ADVISORY on both entry and reval paths.
+    // Relay race needs consistent gating — if reval doesn't block on RSI,
+    // entry can't either, or flips pass reval but fail entry on the other side.
     if (rsi14 !== null) {
-      if (direction === 'LONG' && rsi14 < CONFIG.rsi.longMinimum) {
-        return {
-          allowed: false,
-          reason: `RSI FILTER: RSI(14) = ${rsi14} < ${CONFIG.rsi.longMinimum} — weak momentum, bullish signal rejected`,
-          data,
-        };
-      }
-      if (direction === 'SHORT' && rsi14 > CONFIG.rsi.shortMaximum) {
-        return {
-          allowed: false,
-          reason: `RSI FILTER: RSI(14) = ${rsi14} > ${CONFIG.rsi.shortMaximum} — strong momentum, bearish signal rejected`,
-          data,
-        };
-      }
+      const g3WouldBlock =
+        (direction === 'LONG' && rsi14 < CONFIG.rsi.longMinimum) ||
+        (direction === 'SHORT' && rsi14 > CONFIG.rsi.shortMaximum);
+      data.gate3Entry = {
+        wouldBlock: g3WouldBlock,
+        mode: 'advisory',
+        detail: g3WouldBlock
+          ? `RSI(14) = ${rsi14} — would have blocked ${direction} (advisory)`
+          : `RSI(14) = ${rsi14} — aligned with ${direction}`,
+      };
     }
 
     // ── Gate 4: RSI direction confirmation (ADVISORY ONLY) ─────────────
@@ -1044,24 +1043,19 @@ async function revalidateSignal(pair, direction) {
       }
     }
 
-    // ── Gate 3 (reval): RSI level — v3.5.0 ──
-    // If RSI has moved to extreme territory, close the position.
-    // Same thresholds as entry: LONG requires RSI > 30, SHORT requires RSI < 70.
+    // ── Gate 3 (reval): RSI level — v3.5.0 → ADVISORY v4.1.1 ──
+    // v4.1.1: Demoted from BLOCKING to ADVISORY for relay race simplification.
+    // RSI was blocking valid flips — EMA cross says flip, RSI says "not yet" → missed leg.
+    // In relay race, the EMA cross IS the signal. RSI data logged for review only.
     if (rsi14 !== null) {
-      const g3Failed =
+      const g3WouldFail =
         (direction === 'LONG' && rsi14 < CONFIG.rsi.longMinimum) ||
         (direction === 'SHORT' && rsi14 > CONFIG.rsi.shortMaximum);
       data.gate3Reval = {
-        failed: g3Failed,
-        detail: `RSI(14) = ${rsi14.toFixed(1)} — ${g3Failed ? 'EXTREME' : 'in range'}`,
+        wouldFail: g3WouldFail,
+        mode: 'advisory',
+        detail: `RSI(14) = ${rsi14.toFixed(1)} — ${g3WouldFail ? 'EXTREME (advisory)' : 'in range'}`,
       };
-      if (g3Failed) {
-        return {
-          allowed: false,
-          reason: `REVALIDATION — RSI EXTREME: RSI(14) = ${rsi14.toFixed(1)} — ${direction === 'LONG' ? `below ${CONFIG.rsi.longMinimum} (oversold)` : `above ${CONFIG.rsi.shortMaximum} (overbought)`}`,
-          data,
-        };
-      }
     }
 
     // Gate 4 (RSI direction) remains advisory
@@ -1102,7 +1096,7 @@ function getConfig() {
   return {
     trendEma: `${CONFIG.trendEma.period}-period EMA on ${CONFIG.trendEma.timeframe} (ADVISORY — demoted v3.6.3, was blocking v3.4.0–v3.6.2)`,
     shortTermEma: `EMA ${CONFIG.shortTermEma.fast}/${CONFIG.shortTermEma.slow} on ${CONFIG.shortTermEma.timeframe} (BLOCKING — v3.7.0: migrated from 4H to 1H) (BLOCKING — must agree with trade direction)`,
-    rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (BLOCKING — LONG > ${CONFIG.rsi.longMinimum}, SHORT < ${CONFIG.rsi.shortMaximum})`,
+    rsi: `${CONFIG.rsi.period}-period RSI on ${CONFIG.rsi.timeframe} (ADVISORY v4.1.1 — was BLOCKING, demoted for relay race)`,
     rsiDirection: `RSI slope over ${CONFIG.rsi.slopeCandles} candles (ADVISORY — logged only)`,
     smartMoney: `Binance top trader L/S ratio on ${CONFIG.smartMoney.period} (ADVISORY — fallback)`,
     whaleGate: {
