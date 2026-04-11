@@ -442,17 +442,17 @@ async function closeDealsViaApi(botMongoId, botName, closeType = 'closeByMarket'
  * @returns {{ success: boolean, dealId: string|null, error: string|null }}
  */
 async function createDeal(botMongoId, botName) {
-  const endpoint = `/api/deals/dca`;
+  const endpoint = `/api/v2/deals/dca/${botMongoId}/start`;
   const url = `${BASE_URL}${endpoint}`;
   const method = 'POST';
-  const body = JSON.stringify({ botId: botMongoId });
+  const body = '';  // V2: botId is in URL path, no body needed
   const headers = authHeaders(method, endpoint, body);
 
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
 
-    const res = await fetch(url, { method, headers, body, signal: controller.signal });
+    const res = await fetch(url, { method, headers, signal: controller.signal });
     clearTimeout(timeout);
 
     const contentType = res.headers.get('content-type') || '';
