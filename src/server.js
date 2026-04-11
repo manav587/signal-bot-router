@@ -205,7 +205,9 @@ const GATE_PENDING = {};
 // TradingView signals still pass — only relay-initiated auto-flips are throttled.
 // Key = pair name, Value = ISO timestamp of last auto-flip
 const FLIP_COOLDOWN = {};
-const FLIP_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+// v4.1.0: Reduced from 10min to 2min for relay-race scalping.
+// Just enough to prevent double-flip in same reval cycle.
+const FLIP_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 
 function isFlipOnCooldown(pair) {
   const lastFlip = FLIP_COOLDOWN[pair];
@@ -239,9 +241,10 @@ function isRecoveryLocked(pair) {
 // rapid flip-flopping on the faster timeframe.
 // Key = pair name, Value = { flips: [timestamps], parkedUntil: ISO | null }
 const CIRCUIT_BREAKER = {};
-const CB_FLIP_THRESHOLD = 2;    // v3.7.0: was 3 — tighter for 1H signals
-const CB_WINDOW_MS = 15 * 60 * 1000;   // 15-minute window
-const CB_PARK_MS = 30 * 60 * 1000;     // 30-minute park duration
+// v4.1.0: Loosened for relay-race scalping — allow more handoffs before parking.
+const CB_FLIP_THRESHOLD = 5;    // was 2 — relay race needs room for consecutive flips
+const CB_WINDOW_MS = 30 * 60 * 1000;   // 30-minute window (was 15)
+const CB_PARK_MS = 15 * 60 * 1000;     // 15-minute park (was 30) — shorter recovery
 
 function recordFlip(pair) {
   if (!CIRCUIT_BREAKER[pair]) {
