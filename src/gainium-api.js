@@ -449,6 +449,7 @@ async function createDeal(botMongoId, botName) {
   const body = '';  // V2: botId is in URL path, no body needed
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    // Re-generate auth headers each attempt (timestamp changes)
     const headers = authHeaders(method, endpoint, body);
     try {
       const controller = new AbortController();
@@ -478,6 +479,7 @@ async function createDeal(botMongoId, botName) {
       }
 
       const reason = json.reason || json.message || json.error || `HTTP ${res.status}`;
+      // Retry on server errors (5xx), not on client errors (4xx)
       if (attempt < MAX_RETRIES && res.status >= 500) {
         log(`createDeal [${botName}]: ⚠️ Server error — ${reason} [attempt ${attempt}/${MAX_RETRIES}, retrying in ${2 * attempt}s]`);
         await new Promise(r => setTimeout(r, 2000 * attempt));

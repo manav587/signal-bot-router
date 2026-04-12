@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.1.1';
+const VERSION = '4.2.0';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -210,8 +210,6 @@ const GATE_PENDING = {};
 // TradingView signals still pass — only relay-initiated auto-flips are throttled.
 // Key = pair name, Value = ISO timestamp of last auto-flip
 const FLIP_COOLDOWN = {};
-// v4.1.0: Reduced from 10min to 2min for relay-race scalping.
-// Just enough to prevent double-flip in same reval cycle.
 // v4.1.0: Reduced from 10min to 90s for relay-race scalping.
 // Must be LESS than reval interval (2min) to avoid cooldown-reval sync issue.
 // At 90s, cooldown expires before next reval cycle — no wasted cycles.
@@ -431,6 +429,7 @@ async function runFundingCheck() {
         startedAt: new Date().toISOString(),
         entryPrice: result.data.markPrice || null,
         origin: 'funding',
+        peakProfitUsd: 0,
       };
       LAST_ACTIVE[pair] = Date.now();
       // v3.6.0: Don't delete old bot from tracking until processActions confirms
@@ -1285,7 +1284,7 @@ app.get('/test-reconcile/:pair', async (req, res) => {
   });
 });
 
-// ── v4.1.0: Manual test endpoint — cold-start a single direction ──────────
+// ── v4.0.5: Manual test endpoint — cold-start a single direction ──────────
 // POST /test/:pair/:direction  (e.g. POST /test/ETH/LONG)
 // Bypasses closeAllDeals verification and duplicate detection.
 // Still runs gate validation, ensureBotOpen, and tracks in ACTIVE_BOTS.
@@ -1303,6 +1302,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
     return res.status(200).json({ error: 'System is paused', requestId });
   }
 
+  // Find the bot for this pair + direction
   const bot = findBot(pair, direction);
   if (!bot) {
     return res.status(400).json({ error: `No bot found for ${pair} ${direction}`, requestId });
@@ -1310,6 +1310,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
 
   log(`[${requestId}] 🧪 TEST: ${pair} ${direction} via ${bot.name}`);
 
+  // Run gate validation (still want to verify gates work)
   let gateResult;
   try {
     gateResult = await signalGate.validateSignal(pair, direction);
@@ -1328,6 +1329,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
 
   log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
 
+  // ensureBotOpen — same as production flow
   if (gainiumApi.isConfigured()) {
     const ensureResult = await gainiumApi.ensureBotOpen(bot.mongoId, bot.name);
     if (!ensureResult.wasOpen) {
@@ -1365,6 +1367,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
     startedAt: new Date().toISOString(),
     entryPrice: gateResult.data.currentPrice || null,
     origin: 'test',
+    peakProfitUsd: 0,
   };
   LAST_DIRECTION[pair] = direction;
   log(`[${requestId}] 📋 Tracking: ${bot.name} (${pair} ${direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
@@ -1624,6 +1627,7 @@ app.post('/webhook', (req, res) => {
           startedAt: existing?.startedAt || new Date().toISOString(),
           entryPrice: existing?.entryPrice || gateResult.data.currentPrice || null,
           origin: 'signal',
+          peakProfitUsd: existing?.peakProfitUsd || 0,
         };
         LAST_ACTIVE[signal.pair] = Date.now();
         log(`[${requestId}] 📋 Tracking active bot: ${signal.botName} (${signal.pair} ${signal.direction}) @ $${gateResult.data.currentPrice?.toFixed(2) || '?'}`);
@@ -1720,6 +1724,28 @@ const REVAL_MAX_UNDERWATER_MS = Infinity;
 const REVAL_STRONG_TREND_SPREAD_PCT = 0.5; // EMA spread above this = strong trend, skip time stop
 const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" if 0.1%+ against entry
 const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite crossover probability > 80%
+
+// ── v4.2.0: RELAY-CONTROLLED EXIT ─────────────────────────────────────
+// The relay takes profit itself instead of depending on Gainium's trailing TP.
+// When unrealized P&L >= threshold, relay closes the deal via API and re-enters.
+// Gainium trailing TP was set to 1.5% PRICE move — at 10x that requires $30 profit,
+// which was unreachable for our scalp-sized moves (0.6-1.2% price, $11-23 at peak).
+// trailingLevel = 0 on ALL deals — Gainium's trailing TP never once activated.
+// Root cause: tpPerc is a PRICE percentage, not deal ROI. 1.5% at 10x is 15% ROI.
+// Fix: relay monitors Binance P&L every 2 minutes and closes at $8 profit.
+const RELAY_TP_ENABLED = true;
+const RELAY_TP_PROFIT_USD = 8; // Close deal when unrealized profit >= $8
+const RELAY_TP_POSITION_SIZE = 2000; // Notional position size (base order)
+
+// ── v4.2.0: SL=FLIP DIRECTION LOGIC ──────────────────────────────────
+// Relay race baton pass rules:
+//   SL hit → flip to opposite direction (market said this direction is wrong)
+//   TP hit → re-enter same direction (trend is working, get back in)
+// No Gate 2 check at baton pass. The exit type IS the direction signal.
+// Gate 2 (1H EMA 9/21) is the starting gun only — picks initial direction.
+// Once the race is running, exits decide next direction.
+const SL_FLIP_ENABLED = true;
+
 let revalRunning = false;
 
 async function runRevalidation() {
@@ -1788,38 +1814,36 @@ async function runRevalidation() {
         delete ACTIVE_BOTS[uuid];
         delete LAST_DIRECTION[bot.pair];
 
-        // v4.1.1: Relay race re-entry — don't go flat, check Gate 2 and re-enter
-        // the direction the market supports right now.
+        // v4.2.0: External close = SL hit on Binance. Apply SL=flip logic.
+        // The position disappeared from Binance → SL triggered → flip direction.
         try {
-          log(`🔄 External close: checking Gate 2 for ${base} re-entry...`);
-          const [longGate, shortGate] = await Promise.all([
-            signalGate.validateSignal(base, 'LONG'),
-            signalGate.validateSignal(base, 'SHORT'),
-          ]);
-
-          let reentryDir = null;
-          let reentryGate = null;
-          if (longGate.allowed && !shortGate.allowed) {
-            reentryDir = 'LONG';
-            reentryGate = longGate;
-          } else if (shortGate.allowed && !longGate.allowed) {
-            reentryDir = 'SHORT';
-            reentryGate = shortGate;
-          } else if (longGate.allowed && shortGate.allowed) {
-            // Both pass — use 1H trend as tiebreaker
-            const trend = longGate.data?.shortTermTrend || shortGate.data?.shortTermTrend;
-            reentryDir = trend === 'BEARISH' ? 'SHORT' : 'LONG';
-            reentryGate = reentryDir === 'LONG' ? longGate : shortGate;
-            log(`🔄 External close: both directions pass — using 1H trend (${trend}) → ${reentryDir}`);
+          let reentryDir;
+          if (SL_FLIP_ENABLED) {
+            // External close is always an SL (Binance closed it). Flip direction.
+            reentryDir = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
+            log(`🔄 External close SL=FLIP: ${base} was ${bot.direction} → flipping to ${reentryDir}`);
+          } else {
+            // Fallback: check Gate 2
+            log(`🔄 External close: checking Gate 2 for ${base} re-entry...`);
+            const [longGate, shortGate] = await Promise.all([
+              signalGate.validateSignal(base, 'LONG'),
+              signalGate.validateSignal(base, 'SHORT'),
+            ]);
+            if (longGate.allowed && !shortGate.allowed) reentryDir = 'LONG';
+            else if (shortGate.allowed && !longGate.allowed) reentryDir = 'SHORT';
+            else if (longGate.allowed && shortGate.allowed) {
+              const trend = longGate.data?.shortTermTrend || shortGate.data?.shortTermTrend;
+              reentryDir = trend === 'BEARISH' ? 'SHORT' : 'LONG';
+            }
           }
 
           if (reentryDir) {
             const reentryBot = findBot(base, reentryDir);
             if (reentryBot && !isFlipOnCooldown(base)) {
-              log(`🔄 External close → re-entry: ${reentryBot.name} (${reentryDir}) — gates pass, entering`);
+              log(`🔄 External close → baton pass: ${reentryBot.name} (${reentryDir})`);
               const reentryActions = [{ action: 'startBot', uuid: reentryBot.uuid }];
-              const reentryReqId = `reentry-${base}-${Date.now()}`;
-              const reentryCtx = { pair: base, direction: reentryDir, price: reentryGate.data?.currentPrice || null };
+              const reentryReqId = `sl-flip-${base}-${Date.now()}`;
+              const reentryCtx = { pair: base, direction: reentryDir, price: null };
 
               GATE_PENDING[base] = { direction: reentryDir, timestamp: Date.now() };
               try {
@@ -1829,18 +1853,19 @@ async function runRevalidation() {
                   direction: reentryDir,
                   botName: reentryBot.name,
                   startedAt: new Date().toISOString(),
-                  entryPrice: reentryGate.data?.currentPrice || null,
-                  origin: 'relay-reentry',
+                  entryPrice: null, // will be resolved from Binance on next reval
+                  origin: 'sl-flip-external',
+                  peakProfitUsd: 0,
                 };
                 LAST_ACTIVE[base] = Date.now();
                 LAST_DIRECTION[base] = reentryDir;
-                tradeJournal.recordEntry({ pair: base, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: reentryGate.data?.currentPrice, origin: 'relay-reentry', gateData: reentryGate.data });
+                FLIP_COOLDOWN[base] = new Date().toISOString();
+                recordDealClose(base, true); // external close = SL
+                tradeJournal.recordEntry({ pair: base, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: null, origin: 'sl-flip-external' });
 
                 sendTelegramAlert(
-                  `🔄 Relay re-entry: ${reentryBot.name}\n\n` +
-                  `Previous position closed (SL/TP/manual). Gate 2 supports ${reentryDir} — re-entering immediately.\n` +
-                  `Entry: ~$${reentryGate.data?.currentPrice?.toFixed(2) || '?'}\n` +
-                  `1H trend: ${reentryGate.data?.shortTermTrend || '?'}\n\n` +
+                  `🔄 SL=Flip: ${bot.botName} → ${reentryBot.name}\n\n` +
+                  `External close (SL on Binance). Flipping to ${reentryDir}.\n\n` +
                   `${istTimestamp()}`
                 ).catch(() => {});
               } finally {
@@ -1894,16 +1919,102 @@ async function runRevalidation() {
       // v3.5.0: Use DCA-averaged entry price for profit shield + drawdown check.
       // v3.6.0: Uses cached position map (one API call per cycle, not per bot).
       let effectiveEntry = bot.entryPrice;
+      // v4.2.0: Resolve effective entry early so relay TP can use it
       if (cachedPosMap && result.data.currentPrice) {
         const base = bot.pair.replace('USDT', '').replace('/USDT', '');
         const pos = cachedPosMap.get(base);
         if (pos && pos.entryPrice > 0) {
           effectiveEntry = pos.entryPrice;
-          if (effectiveEntry !== bot.entryPrice) {
-            log(`🔄 Reval: ${bot.botName} using DCA avgPrice $${effectiveEntry.toFixed(2)} (signal entry was $${bot.entryPrice?.toFixed(2) || '?'})`);
-          }
         }
       }
+
+      // ── v4.2.0: RELAY-CONTROLLED TP ────────────────────────────────
+      // Check unrealized P&L BEFORE gate revalidation. Capture profit
+      // regardless of what the gates say — $8 in hand beats $0 from
+      // a trailing TP that never fires.
+      if (RELAY_TP_ENABLED && effectiveEntry && effectiveEntry > 0 && result.data.currentPrice) {
+        const currentPrice = result.data.currentPrice;
+        const pctMove = ((currentPrice - effectiveEntry) / effectiveEntry);
+        const unrealizedUsd = bot.direction === 'LONG'
+          ? pctMove * RELAY_TP_POSITION_SIZE
+          : -pctMove * RELAY_TP_POSITION_SIZE;
+
+        // Track peak profit for monitoring
+        if (!bot.peakProfitUsd || unrealizedUsd > bot.peakProfitUsd) {
+          bot.peakProfitUsd = unrealizedUsd;
+        }
+
+        if (unrealizedUsd >= RELAY_TP_PROFIT_USD) {
+          log(`💰 RELAY TP: ${bot.botName} unrealized +$${unrealizedUsd.toFixed(2)} >= $${RELAY_TP_PROFIT_USD} — TAKING PROFIT`);
+          log(`💰 Peak was +$${(bot.peakProfitUsd || unrealizedUsd).toFixed(2)}, entry $${effectiveEntry.toFixed(4)}, now $${currentPrice.toFixed(4)}`);
+
+          // Close the deal via Gainium API
+          const botInfo = BOT_MAP[uuid];
+          if (botInfo && gainiumApi.isConfigured()) {
+            try {
+              const closeResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
+              log(`💰 RELAY TP: closed ${closeResult.closed} deal(s) for ${bot.botName}`);
+
+              // Record the win
+              recordDealClose(bot.pair, false); // false = not a loss
+              tradeJournal.recordExit({ botUuid: uuid, exitPrice: currentPrice, exitReason: 'relay-tp' });
+
+              // Stop the old bot, wait for cleanup
+              await sendAction({ action: 'stopBot', uuid });
+              await new Promise(resolve => setTimeout(resolve, 3000));
+
+              // Re-enter SAME direction (TP = trend is working)
+              const reentryDir = bot.direction;
+              const reentryBot = findBot(bot.pair, reentryDir);
+
+              if (reentryBot) {
+                log(`💰 RELAY TP → re-entry: ${reentryBot.name} (same direction: ${reentryDir})`);
+                const reentryActions = [{ action: 'startBot', uuid: reentryBot.uuid }];
+                const reentryReqId = `relay-tp-${bot.pair}-${Date.now()}`;
+                const reentryCtx = { pair: bot.pair, direction: reentryDir, price: currentPrice };
+
+                GATE_PENDING[bot.pair] = { direction: reentryDir, timestamp: Date.now() };
+                try {
+                  delete ACTIVE_BOTS[uuid];
+                  await processActions(reentryActions, reentryReqId, false, reentryCtx);
+                  ACTIVE_BOTS[reentryBot.uuid] = {
+                    pair: bot.pair,
+                    direction: reentryDir,
+                    botName: reentryBot.name,
+                    startedAt: new Date().toISOString(),
+                    entryPrice: currentPrice,
+                    origin: 'relay-tp-reentry',
+                    peakProfitUsd: 0,
+                  };
+                  LAST_ACTIVE[bot.pair] = Date.now();
+                  LAST_DIRECTION[bot.pair] = reentryDir;
+                  tradeJournal.recordEntry({ pair: bot.pair, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: currentPrice, origin: 'relay-tp-reentry' });
+
+                  sendTelegramAlert(
+                    `💰 Relay TP: ${bot.botName} → +$${unrealizedUsd.toFixed(2)}\n\n` +
+                    `Captured profit at $${currentPrice.toFixed(4)}.\n` +
+                    `Peak was +$${(bot.peakProfitUsd || unrealizedUsd).toFixed(2)}.\n` +
+                    `Re-entering ${reentryDir} (trend working).\n\n` +
+                    `${istTimestamp()}`
+                  ).catch(() => {});
+                } finally {
+                  delete GATE_PENDING[bot.pair];
+                }
+              } else {
+                delete ACTIVE_BOTS[uuid];
+                log(`💰 RELAY TP: no ${reentryDir} bot found for ${bot.pair} — staying flat with profit`);
+              }
+              continue; // Skip normal reval for this bot — already handled
+            } catch (relayTpErr) {
+              log(`💰 RELAY TP ERROR: ${bot.botName} — ${relayTpErr.message}. Falling through to normal reval.`);
+              // Don't continue — fall through to normal reval as safety net
+            }
+          }
+        } else {
+          log(`🔄 Reval: ${bot.botName} P&L: $${unrealizedUsd.toFixed(2)} (peak: $${(bot.peakProfitUsd || 0).toFixed(2)}) — below relay TP threshold $${RELAY_TP_PROFIT_USD}`);
+        }
+      }
+      // v4.2.0: effectiveEntry already resolved above (before relay TP check).
       // v3.6.0: If entry price is still unknown (self-heal retrack, API failure),
       // persist the current spot price as a baseline so drawdown protection
       // activates from this cycle forward.
@@ -2036,37 +2147,40 @@ async function runRevalidation() {
               }
 
               if (deals && deals.active === 0) {
-                // v4.1.1: Deal closed (TP/SL). Relay race re-entry — don't go flat.
-                // With Manual start, there's no ASAP to re-open. We must explicitly
-                // check Gate 2 and re-enter the direction the market supports.
-                log(`🔄 Deal closed: ${bot.botName} — checking Gate 2 for re-entry`);
-
-                // Record win/loss for tracking (consecutive loss breaker is disabled but tracking continues)
-                const currentPrice = result.data?.currentPrice || 0;
+                // v4.2.0: Deal closed (SL hit by Gainium). Relay race baton pass.
+                // SL=flip: market told us this direction is wrong → flip to opposite.
+                // No Gate 2 check — the SL IS the signal.
+                // (Relay TP exits are handled above and won't reach here.)
+                const currentPrice = result.data?.currentPrice || null;
+                const safePrice = currentPrice || bot.entryPrice || null;
                 const isLoss = bot.entryPrice && currentPrice
                   ? (bot.direction === 'LONG' ? currentPrice < bot.entryPrice : currentPrice > bot.entryPrice)
-                  : false;
+                  : true; // If we can't determine, assume loss (safer — triggers flip)
                 recordDealClose(bot.pair, isLoss);
-                tradeJournal.recordExit({ botUuid: uuid, exitPrice: currentPrice || bot.entryPrice, exitReason: isLoss ? 'sl' : 'tp' });
+                tradeJournal.recordExit({ botUuid: uuid, exitPrice: safePrice, exitReason: isLoss ? 'sl' : 'gainium-tp' });
 
-                // Check both directions — enter whichever Gate 2 supports
-                const [longGate, shortGate] = await Promise.all([
-                  signalGate.validateSignal(bot.pair, 'LONG'),
-                  signalGate.validateSignal(bot.pair, 'SHORT'),
-                ]);
-
-                let reentryDir = null;
-                let reentryGate = null;
-                if (longGate.allowed && !shortGate.allowed) {
-                  reentryDir = 'LONG';
-                  reentryGate = longGate;
-                } else if (shortGate.allowed && !longGate.allowed) {
-                  reentryDir = 'SHORT';
-                  reentryGate = shortGate;
-                } else if (longGate.allowed && shortGate.allowed) {
-                  const trend = longGate.data?.shortTermTrend || shortGate.data?.shortTermTrend;
-                  reentryDir = trend === 'BEARISH' ? 'SHORT' : 'LONG';
-                  reentryGate = reentryDir === 'LONG' ? longGate : shortGate;
+                // v4.2.0: SL=flip, TP=continue baton pass logic
+                let reentryDir;
+                if (SL_FLIP_ENABLED && isLoss) {
+                  // SL hit → flip to opposite direction
+                  reentryDir = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
+                  log(`🔄 SL=FLIP: ${bot.botName} SL'd${safePrice ? ` at $${safePrice.toFixed(4)}` : ''} → flipping to ${reentryDir}`);
+                } else if (SL_FLIP_ENABLED && !isLoss) {
+                  // Gainium TP hit (rare — relay TP should catch first) → same direction
+                  reentryDir = bot.direction;
+                  log(`🔄 TP=CONTINUE: ${bot.botName} TP'd${safePrice ? ` at $${safePrice.toFixed(4)}` : ''} → re-entering ${reentryDir}`);
+                } else {
+                  // SL_FLIP disabled — fall back to old Gate 2 logic
+                  const [longGate, shortGate] = await Promise.all([
+                    signalGate.validateSignal(bot.pair, 'LONG'),
+                    signalGate.validateSignal(bot.pair, 'SHORT'),
+                  ]);
+                  if (longGate.allowed && !shortGate.allowed) reentryDir = 'LONG';
+                  else if (shortGate.allowed && !longGate.allowed) reentryDir = 'SHORT';
+                  else if (longGate.allowed && shortGate.allowed) {
+                    const trend = longGate.data?.shortTermTrend || shortGate.data?.shortTermTrend;
+                    reentryDir = trend === 'BEARISH' ? 'SHORT' : 'LONG';
+                  }
                 }
 
                 if (reentryDir) {
@@ -2075,11 +2189,13 @@ async function runRevalidation() {
                     // Stop the old bot first if we're changing direction
                     if (reentryDir !== bot.direction) {
                       try { await sendAction({ action: 'stopBot', uuid }); } catch (e) {}
+                      await new Promise(resolve => setTimeout(resolve, 3000)); // v4.1.1: wait for Gainium cleanup
                     }
-                    log(`🔄 Deal closed → re-entry: ${reentryBot.name} (${reentryDir})`);
+                    const action = reentryDir === bot.direction ? 're-entering same direction' : `FLIPPING to ${reentryDir}`;
+                    log(`🔄 Baton pass → ${action}: ${reentryBot.name}`);
                     const reentryActions = [{ action: 'startBot', uuid: reentryBot.uuid }];
-                    const reentryReqId = `reentry-${bot.pair}-${Date.now()}`;
-                    const reentryCtx = { pair: bot.pair, direction: reentryDir, price: reentryGate.data?.currentPrice || null };
+                    const reentryReqId = `baton-${bot.pair}-${Date.now()}`;
+                    const reentryCtx = { pair: bot.pair, direction: reentryDir, price: currentPrice };
 
                     GATE_PENDING[bot.pair] = { direction: reentryDir, timestamp: Date.now() };
                     try {
@@ -2090,34 +2206,37 @@ async function runRevalidation() {
                         direction: reentryDir,
                         botName: reentryBot.name,
                         startedAt: new Date().toISOString(),
-                        entryPrice: reentryGate.data?.currentPrice || null,
-                        origin: 'relay-reentry',
+                        entryPrice: safePrice, // currentPrice or fallback to bot.entryPrice; resolved from Binance next reval if null
+                        origin: isLoss ? 'sl-flip' : 'tp-continue',
+                        peakProfitUsd: 0,
                       };
                       LAST_ACTIVE[bot.pair] = Date.now();
                       LAST_DIRECTION[bot.pair] = reentryDir;
-                      tradeJournal.recordEntry({ pair: bot.pair, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: reentryGate.data?.currentPrice, origin: 'relay-reentry', gateData: reentryGate.data });
+                      FLIP_COOLDOWN[bot.pair] = new Date().toISOString();
+                      tradeJournal.recordEntry({ pair: bot.pair, direction: reentryDir, botName: reentryBot.name, botUuid: reentryBot.uuid, entryPrice: currentPrice, origin: isLoss ? 'sl-flip' : 'tp-continue' });
 
-                      const action = reentryDir === bot.direction ? 're-entering same direction' : `flipping to ${reentryDir}`;
                       sendTelegramAlert(
-                        `🔄 Deal closed → ${action}: ${reentryBot.name}\n\n` +
-                        `Previous: ${bot.botName} (${isLoss ? 'SL hit' : 'TP hit'})\n` +
-                        `Gate 2 supports ${reentryDir} — ${action}.\n` +
-                        `Entry: ~$${reentryGate.data?.currentPrice?.toFixed(2) || '?'}\n` +
-                        `1H trend: ${reentryGate.data?.shortTermTrend || '?'}\n\n` +
+                        `🔄 Baton pass: ${bot.botName} → ${reentryBot.name}\n\n` +
+                        `${isLoss ? '🔴 SL hit' : '🟢 TP hit'} → ${action}\n` +
+                        `Exit: ${safePrice ? `$${safePrice.toFixed(4)}` : 'unknown'} | Peak P&L: $${(bot.peakProfitUsd || 0).toFixed(2)}\n` +
+                        `New entry: ${reentryDir}\n\n` +
                         `${istTimestamp()}`
                       ).catch(() => {});
                     } finally {
                       delete GATE_PENDING[bot.pair];
                     }
+                  } else {
+                    log(`🔄 Baton pass: no ${reentryDir} bot found for ${bot.pair}`);
+                    delete ACTIVE_BOTS[uuid];
                   }
                 } else {
-                  // Neither direction passes — go flat
-                  log(`🔄 Deal closed: ${bot.botName} — no direction passes Gate 2, going flat`);
+                  // SL_FLIP disabled and no gate passes — go flat
+                  log(`🔄 Deal closed: ${bot.botName} — no re-entry direction, going flat`);
                   try { await sendAction({ action: 'stopBot', uuid }); } catch (e) {}
                   delete ACTIVE_BOTS[uuid];
                   delete LAST_DIRECTION[bot.pair];
                   sendTelegramAlert(
-                    `⏹️ ${bot.botName} deal closed\n\nNeither direction passes Gate 2 — waiting for next signal.\n\n${istTimestamp()}`
+                    `⏹️ ${bot.botName} deal closed — no re-entry direction available.\n\n${istTimestamp()}`
                   ).catch(() => {});
                 }
               }
@@ -2235,6 +2354,7 @@ async function runRevalidation() {
                 startedAt: new Date().toISOString(),
                 entryPrice: result.data.currentPrice || null,
                 origin: 'auto-flip',
+                peakProfitUsd: 0,
               };
               LAST_ACTIVE[bot.pair] = Date.now();
               LAST_DIRECTION[bot.pair] = oppositeDir;
@@ -2273,8 +2393,7 @@ async function runRevalidation() {
             flipResult = { flipped: false, reason: `processActions error: ${processErr.message}` };
           }
         } finally {
-          // v4.1.0: Always clear GATE_PENDING after reval auto-flip completes
-          // Prevents stale lock if processActions throws or takes unexpected path
+          // v4.1.0: Always release GATE_PENDING lock after reval flip attempt
           delete GATE_PENDING[bot.pair];
         }
 
@@ -2407,6 +2526,7 @@ async function runSelfHeal() {
           startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
           entryPrice: pos.entryPrice || null,
           origin: hasOpposite ? 'exchange-reconcile-mismatch' : 'exchange-reconcile',
+          peakProfitUsd: 0,
         };
         LAST_ACTIVE[base] = Date.now();
         LAST_DIRECTION[base] = pos.side;
@@ -2517,6 +2637,7 @@ async function runSelfHeal() {
             startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
             entryPrice: null, // will be fetched by reval's getExchangePositionMap
             origin: 'self-heal-retrack',
+            peakProfitUsd: 0,
           };
           LAST_ACTIVE[pair] = Date.now();
           LAST_DIRECTION[pair] = dir;
@@ -3180,6 +3301,7 @@ async function recoverActiveState() {
         startedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
         entryPrice,
         origin: 'recovery',
+        peakProfitUsd: 0,
       };
       LAST_ACTIVE[pair] = Date.now();
       LAST_DIRECTION[pair] = direction;
