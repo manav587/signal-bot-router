@@ -1734,7 +1734,7 @@ const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite
 // Root cause: tpPerc is a PRICE percentage, not deal ROI. 1.5% at 10x is 15% ROI.
 // Fix: relay monitors Binance P&L every 2 minutes and closes at $8 profit.
 const RELAY_TP_ENABLED = true;
-const RELAY_TP_PROFIT_USD = 8; // Close deal when unrealized profit >= $8
+const RELAY_TP_PROFIT_USD = 10; // Close deal when unrealized profit >= $10
 const RELAY_TP_POSITION_SIZE = 2000; // Notional position size (base order)
 
 // ── v4.2.0: SL=FLIP DIRECTION LOGIC ──────────────────────────────────
