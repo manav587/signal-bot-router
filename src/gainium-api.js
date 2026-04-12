@@ -485,8 +485,16 @@ async function createDeal(botMongoId, botName) {
         await new Promise(r => setTimeout(r, 2000 * attempt));
         continue;
       }
-      log(`createDeal [${botName}]: ❌ Failed — ${reason}`);
-      return { success: false, dealId: null, error: reason };
+      // v4.2.1: Detect deal-limit rejections (maxDealsPerHigherTimeframe etc.)
+      // These are 4xx errors where Gainium refuses to open a new deal because
+      // the per-candle limit has been reached. Flag so the caller can schedule
+      // a delayed retry instead of giving up permanently.
+      const lowerReason = reason.toLowerCase();
+      const isDealLimitReject = res.status >= 400 && res.status < 500 &&
+        (lowerReason.includes('max') || lowerReason.includes('limit') ||
+         lowerReason.includes('deal') || lowerReason.includes('timeframe'));
+      log(`createDeal [${botName}]: ❌ Failed — ${reason}${isDealLimitReject ? ' [DEAL-LIMIT]' : ''}`);
+      return { success: false, dealId: null, error: reason, dealLimitReject: isDealLimitReject };
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         log(`createDeal [${botName}]: ⚠️ ${err.message} [attempt ${attempt}/${MAX_RETRIES}, retrying in ${2 * attempt}s]`);

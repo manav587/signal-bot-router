@@ -813,7 +813,22 @@ async function processActions(actions, requestId, isRetry = false, context = {})
       const botInfo = BOT_MAP[uuid];
       // Brief pause to let Gainium register the bot as "open" before creating a deal
       await new Promise(resolve => setTimeout(resolve, 2000));
-      const dealResult = await gainiumApi.createDeal(botInfo.mongoId, botInfo.name);
+      let dealResult = await gainiumApi.createDeal(botInfo.mongoId, botInfo.name);
+
+      // v4.2.1: If deal creation was rejected due to max-deals-per-timeframe limit,
+      // wait 60s and retry once. The Gainium setting useMaxDealsPerHigherTimeframe=true
+      // with value 1 limits new deals to 1 per candle period. This can't be changed
+      // via API or dashboard (hidden setting). A delayed retry gives the candle time
+      // to advance, or at minimum catches transient rejections.
+      if (!dealResult.success && dealResult.dealLimitReject) {
+        log(`[${requestId}]   ⏳ Deal-limit rejection on ${botInfo.name} — waiting 60s for candle advance, then retrying...`);
+        await new Promise(resolve => setTimeout(resolve, 60000));
+        dealResult = await gainiumApi.createDeal(botInfo.mongoId, botInfo.name);
+        if (dealResult.success) {
+          log(`[${requestId}]   🎯 Deal created on ${botInfo.name} via delayed retry (dealId: ${dealResult.dealId})`);
+        }
+      }
+
       if (dealResult.success) {
         log(`[${requestId}]   🎯 Deal created on ${botInfo.name} via REST API (dealId: ${dealResult.dealId})`);
       } else {
@@ -823,6 +838,7 @@ async function processActions(actions, requestId, isRetry = false, context = {})
           `⚠️ Deal creation failed\n\n` +
           `Bot ${botInfo.name} was started but no deal was created.\n` +
           `Error: ${dealResult.error}\n\n` +
+          `${dealResult.dealLimitReject ? 'Cause: Gainium max-deals-per-timeframe limit (hidden setting, cannot be changed).\n' : ''}` +
           `The bot is active but has NO position on Binance.\n` +
           `${istTimestamp()}`
         ).catch(() => {});
@@ -1350,7 +1366,15 @@ app.post('/test/:pair/:direction', async (req, res) => {
   let dealCreated = false;
   if (gainiumApi.isConfigured()) {
     await new Promise(resolve => setTimeout(resolve, 2000)); // Let Gainium register bot as open
-    const dealResult = await gainiumApi.createDeal(bot.mongoId, bot.name);
+    let dealResult = await gainiumApi.createDeal(bot.mongoId, bot.name);
+
+    // v4.2.1: Delayed retry on deal-limit rejection (maxDealsPerHigherTimeframe)
+    if (!dealResult.success && dealResult.dealLimitReject) {
+      log(`[${requestId}] ⏳ Deal-limit rejection — waiting 60s then retrying...`);
+      await new Promise(resolve => setTimeout(resolve, 60000));
+      dealResult = await gainiumApi.createDeal(bot.mongoId, bot.name);
+    }
+
     dealCreated = dealResult.success;
     if (dealResult.success) {
       log(`[${requestId}] 🎯 Deal created on ${bot.name} (dealId: ${dealResult.dealId})`);
