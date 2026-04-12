@@ -10,7 +10,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.2.0';
+const VERSION = '4.2.1';
 const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
