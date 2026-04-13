@@ -225,7 +225,7 @@ function isFlipOnCooldown(pair) {
 
 // ── Recovery Lock (v3.5.2) ────────────────────────────────────────────
 // After startup recovery, lock recovered pairs for 3 minutes so incoming
-// TradingView signals don't try to flip ghost positions (stale Gainium deals
+// TradingView signals don't try to flip ghost positions (stale deals
 // that no longer have a matching Binance position). Revalidation runs every
 // 2 min and handles cleanup — the lock prevents an alert cascade from
 // signals arriving during recovery before reval has had a chance to verify.
@@ -491,7 +491,7 @@ function stopFundingPoller() {
 }
 
 // ── Deferred Flip Queue (v1.3.0) ─────────────────────────────────────────
-// When a flip aborts due to Gainium outage, queue it for retry.
+// When a flip aborts due to exchange outage, queue it for retry.
 // Retries every 60s for up to 5 minutes, then gives up with a Telegram alert.
 const DEFERRED_QUEUE = []; // { actions, requestId, targetBot, queuedAt, retryCount }
 const DEFERRED_MAX_RETRIES = 5;      // 5 retries × 60s = 5 minutes
@@ -566,7 +566,7 @@ async function processDeferredQueue() {
       sendTelegramAlert(
         `❌ Direction switch failed\n\n` +
         `Couldn't start ${item.targetBot.name} after 5 minutes of retrying. The old position on Binance didn't close in time.\n\n` +
-        `⚠️ Check Gainium manually — you may need to close the stuck position and restart the bot.\n\n` +
+        `⚠️ Check Binance manually — you may need to close the stuck position and restart the bot.\n\n` +
         `${istTimestamp()}`
       ).catch(() => {});
       DEFERRED_QUEUE.splice(i, 1);
@@ -727,7 +727,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
       const pair = targetBot.name.split(' ')[0];
       const exchangePos = exchangeMap.get(pair);
       if (exchangePos) {
-        log(`[${requestId}]   ⚠ EXCHANGE CROSS-CHECK FAIL: Gainium says flat but Binance still shows ${pair} ${exchangePos.side} (entry $${exchangePos.entryPrice?.toFixed(2)}, PnL $${exchangePos.pnl?.toFixed(2)})`);
+        log(`[${requestId}]   ⚠ EXCHANGE CROSS-CHECK FAIL: CCXT says flat but Binance still shows ${pair} ${exchangePos.side} (entry $${exchangePos.entryPrice?.toFixed(2)}, PnL $${exchangePos.pnl?.toFixed(2)})`);
         // Try one more round of force-close
         log(`[${requestId}]   🔁 Attempting extra force-close to sync exchange...`);
         await gainiumApi.forceCloseDeals(targetBot.uuid);
@@ -737,8 +737,8 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
         const stillOpen = recheck.get(pair);
         if (stillOpen) {
           log(`[${requestId}]   🚨 Exchange position STILL OPEN after extra close attempt`);
-          const alertMsg = `🚨 Close verification: Gainium/Binance desync — ${targetBot.name}\n\n` +
-            `Gainium reports 0 active deals but Binance still shows a ${pair} ${stillOpen.side} position.\n` +
+          const alertMsg = `🚨 Close verification: CCXT/Binance desync — ${targetBot.name}\n\n` +
+            `CCXT reports 0 active deals but Binance still shows a ${pair} ${stillOpen.side} position.\n` +
             `Entry: $${stillOpen.entryPrice?.toFixed(2)} | PnL: $${stillOpen.pnl?.toFixed(2)}\n\n` +
             `To prevent position conflicts, the new bot was NOT started.\n` +
             `⚠️ Check Binance manually.\n\n` +
@@ -957,7 +957,7 @@ app.get('/', (req, res) => {
     whaleHealth: tradeJournal.getWhaleWalletStatus(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
     apiConfigured: gainiumApi.isConfigured(),
-    exchangeDataSource: 'gainium',
+    exchangeDataSource: 'ccxt-binanceusdm',
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
 });
@@ -3266,13 +3266,13 @@ async function registerTelegramWebhook() {
 
 async function recoverActiveState() {
   if (!gainiumApi.isConfigured()) {
-    log(`🔄 Startup recovery: skipped — Gainium API not configured`);
+    log(`🔄 Startup recovery: skipped — Binance API not configured`);
     return;
   }
 
   try {
     // Step 1: Query exchange positions via Gainium (Gainium reads Binance directly)
-    log(`🔄 Startup recovery: querying exchange positions via Gainium...`);
+    log(`🔄 Startup recovery: querying Binance positions via CCXT...`);
     let exchangePositions = new Map();
     try {
       exchangePositions = await gainiumApi.getExchangePositionMap();
@@ -3282,7 +3282,7 @@ async function recoverActiveState() {
     }
 
     // Step 2: Query Gainium for bot states
-    log(`🔄 Startup recovery: querying Gainium for active bots...`);
+    log(`🔄 Startup recovery: querying CCXT for active bots...`);
     const botStatuses = await gainiumApi.getAllBotStatuses();
     if (!botStatuses) {
       log(`🔄 Startup recovery: Gainium API call failed — will rely on incoming signals`);
@@ -3402,7 +3402,7 @@ async function recoverActiveState() {
       log(`🔄 Startup recovery: no active bots found — system is flat`);
       sendTelegramAlert(
         `🔄 Startup recovery\n\n` +
-        `Server restarted. No active positions found on Gainium — system is flat.\n\n` +
+        `Server restarted. No active positions found — system is flat.\n\n` +
         `${istTimestamp()}`
       ).catch(() => {});
     }
