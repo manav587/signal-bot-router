@@ -3239,26 +3239,63 @@ app.post('/telegram', async (req, res) => {
   }
 });
 
-// ── Register Telegram Webhook on startup ─────────────────────────────────
-async function registerTelegramWebhook() {
+// ── Telegram Long-Polling (v5.0.5) ───────────────────────────────────────
+// Replaces webhook (requires HTTPS) with getUpdates polling.
+// Commands handled by existing handleTelegramCommand().
+let telegramPollingOffset = 0;
+let telegramPollingActive = false;
+
+async function startTelegramPolling() {
   if (!TELEGRAM_BOT_TOKEN) return;
-  // v5.0: Telegram incoming webhooks require HTTPS - disabled for now
-  // Outgoing alerts (sendTelegram) still work without this
-  return; // TODO: re-enable when HTTPS is set up
-  const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || 'http://45.122.45.55';
-  const webhookUrl = `${webhookBaseUrl}/telegram`;
+
+  // Delete any existing webhook so getUpdates works
   try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: webhookUrl }),
-    });
-    const json = await resp.json();
-    log(`Telegram webhook registered: ${webhookUrl} — ${json.ok ? '✅' : '❌ ' + json.description}`);
+    const delResp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook`, { method: 'POST' });
+    const delJson = await delResp.json();
+    log(`Telegram webhook cleared: ${delJson.ok ? '✅' : '❌ ' + delJson.description}`);
   } catch (err) {
-    log(`Telegram webhook registration failed: ${err.message}`);
+    log(`Telegram webhook delete failed: ${err.message}`);
   }
+
+  telegramPollingActive = true;
+  log(`Telegram long-polling started ✅`);
+
+  (async function pollLoop() {
+    while (telegramPollingActive) {
+      try {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramPollingOffset}&timeout=30&allowed_updates=[message]`;
+        const resp = await fetch(url, { signal: AbortSignal.timeout(35000) });
+        const json = await resp.json();
+
+        if (json.ok && json.result && json.result.length > 0) {
+          for (const update of json.result) {
+            telegramPollingOffset = update.update_id + 1;
+            const message = update?.message;
+            if (!message || !message.text || !message.chat?.id) continue;
+
+            const incomingChatId = String(message.chat.id);
+            if (incomingChatId !== TELEGRAM_CHAT_ID) {
+              log(`⚠ Telegram command from unauthorized chat: ${incomingChatId}`);
+              continue;
+            }
+
+            log(`📱 Telegram command: ${message.text}`);
+            const reply = await handleTelegramCommand(message.text, incomingChatId);
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: incomingChatId, text: reply, parse_mode: 'HTML' }),
+            });
+          }
+        }
+      } catch (err) {
+        if (!err.message?.includes('abort')) {
+          log(`Telegram polling error: ${err.message}`);
+        }
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+  })();
 }
 
 // ── Startup State Recovery (v3.2.8) ─────────────────────────────────────
@@ -3467,5 +3504,5 @@ app.listen(PORT, async () => {
   await recoverActiveState();
 
   // Register Telegram webhook after server is listening
-  registerTelegramWebhook();
+  startTelegramPolling();
 });
