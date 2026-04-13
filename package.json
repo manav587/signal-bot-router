@@ -1,13 +1,14 @@
 {
   "name": "signal-bot-router",
-  "version": "4.0.0",
-  "description": "Webhook relay for TradingView \u2192 Gainium with sequential action execution",
+  "version": "5.0.0",
+  "description": "Webhook relay for TradingView to Binance Futures via CCXT (direct, no Gainium)",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
+    "ccxt": "^4.4.0",
     "express": "^4.21.0",
     "trading-signals": "^7.4.3"
   },

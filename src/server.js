@@ -1,6 +1,7 @@
 const express = require('express');
 const app = express();
-const gainiumApi = require('./gainium-api');
+// v5.0.0: Direct Binance via CCXT — Gainium removed entirely
+const gainiumApi = require('./exchange-api');
 const binanceApi = require('./binance-api');
 const signalGate = require('./signal-gate');
 const fundingStrategy = require('./funding-strategy');
@@ -10,8 +11,9 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '4.2.1';
-const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
+const VERSION = '5.0.0';
+// v5.0.0: Gainium webhook removed — all execution via CCXT direct to Binance
+// const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
 // The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
@@ -617,25 +619,35 @@ function extractActions(body) {
   }
 }
 
-// Send a single action to Gainium's webhook endpoint (10s timeout, 1 retry)
+// v5.0.0: Direct exchange actions — replaces Gainium webhook dispatch.
+// startBot → no-op (ensureBotOpen + createDeal handle everything)
+// stopBot → close position + cancel orders via CCXT
+// closeAllDeals → close position + cancel orders via CCXT
 async function sendAction(action, attempt = 1) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  const actionName = action.action || 'unknown';
+  const uuid = action.uuid || '';
 
   try {
-    const response = await fetch(GAINIUM_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify([action]),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    return { status: response.status, ok: true };
+    if (actionName === 'startBot') {
+      // v5.0.0: startBot is a no-op — ensureBotOpen sets leverage/margin,
+      // createDeal opens the position. No Gainium bot to "start".
+      log(`  [v5] startBot ${uuid.substring(0, 8)} → no-op (CCXT handles via createDeal)`);
+      return { status: 200, ok: true };
+    }
+
+    if (actionName === 'stopBot' || actionName === 'closeAllDeals') {
+      // v5.0.0: Close position directly on Binance via CCXT
+      log(`  [v5] ${actionName} ${uuid.substring(0, 8)} → closing via CCXT`);
+      const closed = await gainiumApi.forceCloseDeals(uuid);
+      return { status: closed ? 200 : 500, ok: closed };
+    }
+
+    // Unknown action — log and return OK
+    log(`  [v5] Unknown action ${actionName} — ignoring`);
+    return { status: 200, ok: true };
   } catch (err) {
-    clearTimeout(timeout);
     if (attempt < 2) {
-      const actionName = action.action || 'unknown';
-      log(`  ⚠ ${actionName} failed (${err.name === 'AbortError' ? 'timeout' : err.message}), retrying in 3s...`);
+      log(`  ⚠ ${actionName} failed (${err.message}), retrying in 3s...`);
       await new Promise(r => setTimeout(r, 3000));
       return sendAction(action, attempt + 1);
     }
@@ -3407,7 +3419,7 @@ app.listen(PORT, async () => {
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
   log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
-  log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set GAINIUM_API_KEY + GAINIUM_API_SECRET)'}`);
+  log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set BINANCE_API_KEY + BINANCE_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
   log(`   Signal timeframe: 1H (v3.7.0 — migrated from 4H for faster entries)`);
   log(`   Cold-start scan: ✅ enabled (v3.8.0 — detects existing trends on startup)`);
