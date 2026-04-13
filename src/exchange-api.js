@@ -23,9 +23,9 @@ const API_SECRET = process.env.BINANCE_API_SECRET || '';
 
 // ── Trading Constants ─────────────────────────────────────────────────────
 
-const POSITION_SIZE_USDT = 2000;      // $2,000 notional per position
+const POSITION_SIZE_USDT = 1500;      // $2,000 notional per position
 const LEVERAGE = 10;                  // 10x isolated
-const SL_PERCENT = -0.5;              // -0.5% from entry
+const SL_PERCENT = -1.0;              // -0.5% from entry
 
 // UUID → Pair + Direction Mapping (must match server.js BOT_MAP)
 const BOT_MAP = {

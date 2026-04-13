@@ -1,7 +1,7 @@
 const express = require('express');
 const app = express();
-// v5.0.0: Direct Binance via CCXT — Gainium removed entirely
-const gainiumApi = require('./exchange-api');
+// v5.0.0: Direct Binance via CCXT — Direct Binance via CCXT
+const exchangeApi = require('./exchange-api');
 const binanceApi = require('./binance-api');
 const signalGate = require('./signal-gate');
 const fundingStrategy = require('./funding-strategy');
@@ -11,13 +11,12 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.0';
-// v5.0.0: Gainium webhook removed — all execution via CCXT direct to Binance
-// const GAINIUM_WEBHOOK_URL = 'https://api.gainium.io/trade_signal';
+const VERSION = '5.0.6';
+// v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
 // The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
-// UUID is what TradingView sends; Mongo ID is what the Gainium REST API uses.
+// UUID is what TradingView sends; Mongo ID is kept for internal mapping.
 // V4.1 bots — startCondition: Manual, relay creates deals via REST API after startBot.
 // History: ASAP (v3.0) → TechnicalIndicators (v3.1, 9 Apr) → Manual (v4.1, 11 Apr).
 // Manual + createDeal eliminates the TechnicalIndicators candle-wait ghost trade problem.
@@ -619,7 +618,7 @@ function extractActions(body) {
   }
 }
 
-// v5.0.0: Direct exchange actions — replaces Gainium webhook dispatch.
+// v5.0.0: Direct exchange actions — Direct exchange actions via CCXT.
 // startBot → no-op (ensureBotOpen + createDeal handle everything)
 // stopBot → close position + cancel orders via CCXT
 // closeAllDeals → close position + cancel orders via CCXT
@@ -630,7 +629,7 @@ async function sendAction(action, attempt = 1) {
   try {
     if (actionName === 'startBot') {
       // v5.0.0: startBot is a no-op — ensureBotOpen sets leverage/margin,
-      // createDeal opens the position. No Gainium bot to "start".
+      // createDeal opens the position directly on Binance via CCXT.
       log(`  [v5] startBot ${uuid.substring(0, 8)} → no-op (CCXT handles via createDeal)`);
       return { status: 200, ok: true };
     }
@@ -638,7 +637,7 @@ async function sendAction(action, attempt = 1) {
     if (actionName === 'stopBot' || actionName === 'closeAllDeals') {
       // v5.0.0: Close position directly on Binance via CCXT
       log(`  [v5] ${actionName} ${uuid.substring(0, 8)} → closing via CCXT`);
-      const closed = await gainiumApi.forceCloseDeals(uuid);
+      const closed = await exchangeApi.forceCloseDeals(uuid);
       return { status: closed ? 200 : 500, ok: closed };
     }
 
@@ -705,12 +704,12 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
   await new Promise(r => setTimeout(r, 5000));
 
   // Step 3: Verify via Binance API
-  if (!gainiumApi.isConfigured()) {
+  if (!exchangeApi.isConfigured()) {
     log(`[${requestId}]   ⚠ Binance API not configured (BINANCE_API_KEY/SECRET missing) — skipping verification`);
     return { verified: false, abortRemaining: false };
   }
 
-  const result = await gainiumApi.verifyAndForceClose(targetBot.uuid, targetBot.mongoId, targetBot.name);
+  const result = await exchangeApi.verifyAndForceClose(targetBot.uuid, targetBot.mongoId, targetBot.name);
 
   if (result.flat) {
     if (result.forceClosed > 0) {
@@ -719,10 +718,10 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
       log(`[${requestId}]   ✅ Binance verified flat — closeAllDeals worked correctly`);
     }
 
-    // v3.8.4: Exchange-level cross-check — Gainium says flat, but does Binance agree?
-    // A Gainium deal can show "closed" while the Binance position persists.
+    // v3.8.4: Exchange-level cross-check — Close confirmed, but does Binance agree?
+    // A deal can show "closed" while the Binance position persists.
     try {
-      const exchangeMap = await gainiumApi.getExchangePositionMap();
+      const exchangeMap = await exchangeApi.getExchangePositionMap();
       // Extract pair from bot name (e.g. "SOL Short v2" → "SOL")
       const pair = targetBot.name.split(' ')[0];
       const exchangePos = exchangeMap.get(pair);
@@ -730,10 +729,10 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
         log(`[${requestId}]   ⚠ EXCHANGE CROSS-CHECK FAIL: CCXT says flat but Binance still shows ${pair} ${exchangePos.side} (entry $${exchangePos.entryPrice?.toFixed(2)}, PnL $${exchangePos.pnl?.toFixed(2)})`);
         // Try one more round of force-close
         log(`[${requestId}]   🔁 Attempting extra force-close to sync exchange...`);
-        await gainiumApi.forceCloseDeals(targetBot.uuid);
+        await exchangeApi.forceCloseDeals(targetBot.uuid);
         await new Promise(r => setTimeout(r, 10000));
         // Re-check exchange
-        const recheck = await gainiumApi.getExchangePositionMap();
+        const recheck = await exchangeApi.getExchangePositionMap();
         const stillOpen = recheck.get(pair);
         if (stillOpen) {
           log(`[${requestId}]   🚨 Exchange position STILL OPEN after extra close attempt`);
@@ -752,8 +751,8 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
         log(`[${requestId}]   ✅ Exchange cross-check: Binance confirms flat for ${pair}`);
       }
     } catch (exchangeErr) {
-      // Non-fatal — Gainium already confirmed flat, exchange check is bonus hardening
-      log(`[${requestId}]   ⚠ Exchange cross-check failed: ${exchangeErr.message} (proceeding — Gainium confirmed flat)`);
+      // Non-fatal — close already confirmed, exchange check is bonus hardening
+      log(`[${requestId}]   ⚠ Exchange cross-check failed: ${exchangeErr.message} (proceeding — close confirmed)`);
     }
 
     return { verified: true, abortRemaining: false };
@@ -763,7 +762,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
   const alertMsg = `🚨 Trade switch cancelled — ${targetBot.name}\n\n` +
     `${result.error}\n\n` +
     `The system tried to switch direction but couldn't verify the old position closed properly on Binance. To be safe, the new bot was NOT started — this avoids having two opposite positions open at once (a "position conflict").\n\n` +
-    `⚠️ Check Gainium/Binance manually.\n\n` +
+    `⚠️ Check Binance manually.\n\n` +
     `${istTimestamp()}`;
   log(`[${requestId}]   🚨 ${alertMsg}`);
   await sendTelegramAlert(alertMsg);
@@ -799,11 +798,11 @@ async function processActions(actions, requestId, isRetry = false, context = {})
 
     log(`[${requestId}]   ${i + 1}/${actions.length}: ${actionName} → ${shortUuid}...`);
 
-    // v4.0.4: Ensure bot is "open" on Gainium before sending startBot webhook.
-    // Gainium silently ignores webhooks when bot status is "closed".
+    // v4.0.4: Ensure bot is "open" on Binance before sending startBot webhook.
+    // Validates exchange connection before proceeding.
     if (actionName === 'startBot' && BOT_MAP[uuid]) {
       const botInfo = BOT_MAP[uuid];
-      const ensureResult = await gainiumApi.ensureBotOpen(botInfo.mongoId, botInfo.name);
+      const ensureResult = await exchangeApi.ensureBotOpen(botInfo.mongoId, botInfo.name);
       if (!ensureResult.wasOpen) {
         log(`[${requestId}]   🔧 ${botInfo.name} was closed — started via REST API before webhook`);
       }
@@ -821,21 +820,21 @@ async function processActions(actions, requestId, isRetry = false, context = {})
     // Bots use Manual start condition — startBot activates the bot but doesn't
     // open a deal. We force-create one via the REST API to eliminate the
     // TechnicalIndicators candle-wait ghost trade problem.
-    if (actionName === 'startBot' && BOT_MAP[uuid] && gainiumApi.isConfigured()) {
+    if (actionName === 'startBot' && BOT_MAP[uuid] && exchangeApi.isConfigured()) {
       const botInfo = BOT_MAP[uuid];
-      // Brief pause to let Gainium register the bot as "open" before creating a deal
+      // Brief pause before creating a deal
       await new Promise(resolve => setTimeout(resolve, 2000));
-      let dealResult = await gainiumApi.createDeal(botInfo.mongoId, botInfo.name);
+      let dealResult = await exchangeApi.createDeal(botInfo.mongoId, botInfo.name);
 
       // v4.2.1: If deal creation was rejected due to max-deals-per-timeframe limit,
-      // wait 60s and retry once. The Gainium setting useMaxDealsPerHigherTimeframe=true
+      // wait 60s and retry once. if deal creation fails
       // with value 1 limits new deals to 1 per candle period. This can't be changed
       // via API or dashboard (hidden setting). A delayed retry gives the candle time
       // to advance, or at minimum catches transient rejections.
       if (!dealResult.success && dealResult.dealLimitReject) {
         log(`[${requestId}]   ⏳ Deal-limit rejection on ${botInfo.name} — waiting 60s for candle advance, then retrying...`);
         await new Promise(resolve => setTimeout(resolve, 60000));
-        dealResult = await gainiumApi.createDeal(botInfo.mongoId, botInfo.name);
+        dealResult = await exchangeApi.createDeal(botInfo.mongoId, botInfo.name);
         if (dealResult.success) {
           log(`[${requestId}]   🎯 Deal created on ${botInfo.name} via delayed retry (dealId: ${dealResult.dealId})`);
         }
@@ -850,7 +849,7 @@ async function processActions(actions, requestId, isRetry = false, context = {})
           `⚠️ Deal creation failed\n\n` +
           `Bot ${botInfo.name} was started but no deal was created.\n` +
           `Error: ${dealResult.error}\n\n` +
-          `${dealResult.dealLimitReject ? 'Cause: Gainium max-deals-per-timeframe limit (hidden setting, cannot be changed).\n' : ''}` +
+          `${dealResult.dealLimitReject ? 'Cause: Deal limit reached for this timeframe.\n' : ''}` +
           `The bot is active but has NO position on Binance.\n` +
           `${istTimestamp()}`
         ).catch(() => {});
@@ -956,7 +955,7 @@ app.get('/', (req, res) => {
     journal: tradeJournal.getSessionStats(),
     whaleHealth: tradeJournal.getWhaleWalletStatus(),
     cryptoCompareKey: !!process.env.CRYPTOCOMPARE_API_KEY,
-    apiConfigured: gainiumApi.isConfigured(),
+    apiConfigured: exchangeApi.isConfigured(),
     exchangeDataSource: 'ccxt-binanceusdm',
     telegramConfigured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
   });
@@ -1237,7 +1236,7 @@ app.get('/gate-check', async (req, res) => {
   }
 });
 
-// Test endpoint — end-to-end verification test (calls actual gainium-api functions)
+// Test endpoint — end-to-end verification test (calls actual exchange-api functions)
 app.get('/test-verify/:uuid', async (req, res) => {
   const uuid = req.params.uuid;
   const bot = BOT_MAP[uuid];
@@ -1247,7 +1246,7 @@ app.get('/test-verify/:uuid', async (req, res) => {
 
   // Test 1: getBotDeals (V1 — lists all bots, finds ours by UUID)
   try {
-    const deals = await gainiumApi.getBotDeals(uuid);
+    const deals = await exchangeApi.getBotDeals(uuid);
     results.getBotDeals = deals ? { success: true, deals } : { success: false, error: 'returned null' };
   } catch (e) {
     results.getBotDeals = { success: false, error: e.message };
@@ -1255,14 +1254,14 @@ app.get('/test-verify/:uuid', async (req, res) => {
 
   // Test 2: listOpenDeals (V1 — lists all deals, filters by mongoId since deals use ObjectId not UUID)
   try {
-    const openDeals = await gainiumApi.listOpenDeals(bot.mongoId);
+    const openDeals = await exchangeApi.listOpenDeals(bot.mongoId);
     results.listOpenDeals = { success: true, count: openDeals.length, deals: openDeals.map(d => ({ _id: d._id, pair: d.pair, status: d.status })) };
   } catch (e) {
     results.listOpenDeals = { success: false, error: e.message };
   }
 
   // Test 3: API configured check
-  results.apiConfigured = gainiumApi.isConfigured();
+  results.apiConfigured = exchangeApi.isConfigured();
 
   res.json({
     bot: bot.name,
@@ -1358,14 +1357,14 @@ app.post('/test/:pair/:direction', async (req, res) => {
   log(`[${requestId}] ✅ Gate passed: ${gateResult.reason}`);
 
   // ensureBotOpen — same as production flow
-  if (gainiumApi.isConfigured()) {
-    const ensureResult = await gainiumApi.ensureBotOpen(bot.mongoId, bot.name);
+  if (exchangeApi.isConfigured()) {
+    const ensureResult = await exchangeApi.ensureBotOpen(bot.mongoId, bot.name);
     if (!ensureResult.wasOpen) {
       log(`[${requestId}] 🔧 ${bot.name} was closed — started via REST API before webhook`);
     }
   }
 
-  // Send startBot webhook to Gainium (no closeAllDeals needed)
+  // Send startBot action to exchange
   try {
     const result = await sendAction({ action: 'startBot', uuid: bot.uuid });
     log(`[${requestId}] ✓ startBot returned ${result.status}`);
@@ -1376,15 +1375,15 @@ app.post('/test/:pair/:direction', async (req, res) => {
 
   // v4.1.0: Create deal via REST API (Manual start condition — no auto-deal)
   let dealCreated = false;
-  if (gainiumApi.isConfigured()) {
-    await new Promise(resolve => setTimeout(resolve, 2000)); // Let Gainium register bot as open
-    let dealResult = await gainiumApi.createDeal(bot.mongoId, bot.name);
+  if (exchangeApi.isConfigured()) {
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Brief pause before deal creation
+    let dealResult = await exchangeApi.createDeal(bot.mongoId, bot.name);
 
     // v4.2.1: Delayed retry on deal-limit rejection (maxDealsPerHigherTimeframe)
     if (!dealResult.success && dealResult.dealLimitReject) {
       log(`[${requestId}] ⏳ Deal-limit rejection — waiting 60s then retrying...`);
       await new Promise(resolve => setTimeout(resolve, 60000));
-      dealResult = await gainiumApi.createDeal(bot.mongoId, bot.name);
+      dealResult = await exchangeApi.createDeal(bot.mongoId, bot.name);
     }
 
     dealCreated = dealResult.success;
@@ -1414,7 +1413,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
     `Signal: Manual test (v4.1.0)\n` +
     `Going ${direction} on ${pair} at $${gateResult.data.currentPrice?.toFixed(2) || '?'}.\n\n` +
     `✅ Gate passed: ${gateResult.reason}\n` +
-    `🎯 Deal created: ${dealCreated ? 'YES' : 'NO — check Gainium'}\n` +
+    `🎯 Deal created: ${dealCreated ? 'YES' : 'NO — check Binance'}\n` +
     `Bot: ${bot.name}\n\n` +
     `${istTimestamp()}`
   ).catch(() => {});
@@ -1430,7 +1429,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
     dealCreated,
     message: dealCreated
       ? `Deal opened immediately on ${bot.name}`
-      : `Bot started but deal creation failed — check Gainium`,
+      : `Bot started but deal creation failed — check Binance`,
   });
 });
 
@@ -1461,13 +1460,13 @@ app.post('/webhook', (req, res) => {
   const hasStartBot = actions.some(a => a.action === 'startBot');
   const stopActions = actions.filter(a => a.action === 'stopBot');
   if (!hasStartBot && stopActions.length > 0) {
-    // v4.0.1: When paused, still clean up ACTIVE_BOTS but skip forwarding to Gainium
+    // v4.0.1: When paused, still clean up ACTIVE_BOTS but skip forwarding to exchange
     // (bots are already stopped, no need to spam Telegram with repeated kill switch messages)
     if (PAUSED) {
       for (const sa of stopActions) {
         if (sa.uuid && ACTIVE_BOTS[sa.uuid]) {
           const bot = ACTIVE_BOTS[sa.uuid];
-          log(`[${requestId}] ⏸️ Bare stopBot while paused — removing ${bot.botName} from ACTIVE_BOTS (no Gainium forward)`);
+          log(`[${requestId}] ⏸️ Bare stopBot while paused — removing ${bot.botName} from ACTIVE_BOTS (no exchange forward)`);
           delete ACTIVE_BOTS[sa.uuid];
           delete LAST_DIRECTION[bot.pair];
         }
@@ -1475,7 +1474,7 @@ app.post('/webhook', (req, res) => {
       log(`[${requestId}] ⏸️ Kill switch received while paused — logged only, not forwarded`);
       return;
     }
-    // v4.0.2: Track whether any bot was actually active — skip Gainium + Telegram if nothing to do
+    // v4.0.2: Track whether any bot was actually active — skip exchange + Telegram if nothing to do
     let hadActiveBots = false;
     for (const sa of stopActions) {
       if (sa.uuid && ACTIVE_BOTS[sa.uuid]) {
@@ -1500,9 +1499,9 @@ app.post('/webhook', (req, res) => {
       }
       // Update cooldown timestamps
       for (const sa of stopActions) KILL_SWITCH_LAST_ALERT[sa.uuid] = now;
-      // Still forward to Gainium (belt-and-suspenders) but suppress Telegram
+      // Still forward to exchange (belt-and-suspenders) but suppress Telegram
       Promise.all(actions.map(action => sendAction(action).catch(() => {}))).then(() => {
-        log(`[${requestId}] 🔇 Kill switch forwarded to Gainium (no Telegram — bots were already stopped)`);
+        log(`[${requestId}] 🔇 Kill switch forwarded to exchange (no Telegram — bots were already stopped)`);
       });
       return;
     }
@@ -1727,9 +1726,9 @@ app.post('/webhook', (req, res) => {
 const REVAL_INTERVAL = 2 * 60 * 1000; // 2 minutes
 // v4.0.0 SCALP MODE: Tight parameters for fast-cycling $5-10 scalps.
 // History: was 4% (v3.4.0) → 3.5% → 2.0% (v3.8.3) → now 0.8%.
-// v4.1.1: Drawdown stop DISABLED — Gainium bot-level SL on Binance is the hard floor.
+// v4.1.1: Drawdown stop DISABLED — CCXT stop-loss on Binance is the hard floor.
 // Relay race trusts the trend signal (Gate 2 EMA). If EMA supports direction,
-// temporary drawdown is noise. Gainium SL catches catastrophic moves.
+// temporary drawdown is noise. Binance SL catches catastrophic moves.
 // Set to Infinity to disable (code stays intact for re-enable).
 // Was: 0.8% (relay drawdown at 0.8% = 8% ROI at 10x)
 const REVAL_MAX_DRAWDOWN_PCT = Infinity;
@@ -1749,7 +1748,7 @@ const REVAL_PROFIT_SHIELD_PCT = Infinity;
 // 65 min covers the worst case (signal at :01 → next candle at :00 = 59 min + buffer).
 // v4.1.0: Grace period reduced from 65min → 5min.
 // With Manual + createDeal, deals open within seconds (no candle wait).
-// 5 min covers edge cases: API latency, Gainium processing, Binance settlement.
+// 5 min covers edge cases: API latency, CCXT processing, Binance settlement.
 const REVAL_GRACE_PERIOD_MS = 5 * 60 * 1000; // 5 minutes (deal creation + Binance settlement)
 // v4.1.1: Time stop DISABLED — relay race trusts the EMA signal.
 // If the trend still supports the position, elapsed time is irrelevant.
@@ -1762,11 +1761,11 @@ const REVAL_UNDERWATER_THRESHOLD_PCT = 0.1; // v4.0.0: position is "underwater" 
 const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite crossover probability > 80%
 
 // ── v4.2.0: RELAY-CONTROLLED EXIT ─────────────────────────────────────
-// The relay takes profit itself instead of depending on Gainium's trailing TP.
+// The relay takes profit itself instead of depending on Binance's trailing TP.
 // When unrealized P&L >= threshold, relay closes the deal via API and re-enters.
-// Gainium trailing TP was set to 1.5% PRICE move — at 10x that requires $30 profit,
+// Old trailing TP was set to 1.5% PRICE move — at 10x that requires $30 profit,
 // which was unreachable for our scalp-sized moves (0.6-1.2% price, $11-23 at peak).
-// trailingLevel = 0 on ALL deals — Gainium's trailing TP never once activated.
+// trailingLevel = 0 on ALL deals — trailing TP never once activated.
 // Root cause: tpPerc is a PRICE percentage, not deal ROI. 1.5% at 10x is 15% ROI.
 // Fix: relay monitors Binance P&L every 2 minutes and closes at $8 profit.
 const RELAY_TP_ENABLED = true;
@@ -1797,9 +1796,9 @@ async function runRevalidation() {
   // v3.6.0: Cache exchange position map once per reval cycle instead of
   // calling getExchangePositionMap() per bot (was 8 identical API calls).
   let cachedPosMap = null;
-  if (gainiumApi.isConfigured()) {
+  if (exchangeApi.isConfigured()) {
     try {
-      cachedPosMap = await gainiumApi.getExchangePositionMap();
+      cachedPosMap = await exchangeApi.getExchangePositionMap();
     } catch (e) {
       log(`🔄 Reval: failed to get exchange position map for cycle: ${e.message}`);
     }
@@ -1828,19 +1827,19 @@ async function runRevalidation() {
           log(`🔄 Reval: ${bot.botName} has no Binance position but is within grace period (${Math.round(botAgeMs / 1000)}s old, grace=${Math.round(REVAL_GRACE_PERIOD_MS / 60000)}min). Waiting for deal creation.`);
           continue;
         }
-        log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but no ${base} position in Gainium. Cleaning up.`);
+        log(`🔄 Reval: EXTERNAL CLOSE detected — ${bot.botName} tracked but no ${base} position on Binance. Cleaning up.`);
 
         const botInfo = BOT_MAP[uuid];
         if (botInfo) {
           try {
-            // v4.1.1: Cancel deals AND stop bot to force Gainium to fully close.
-            // Gainium cancel is async ("scheduled to be closed") — stopping the bot
+            // v4.1.1: Cancel deals AND stop bot to force-close via CCXT.
+            // Cancel is async ("scheduled to be closed") — stopping the bot
             // ensures all deals are terminated before we attempt re-entry.
-            const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName, 'cancel');
-            log(`🧹 External close cleanup: ${bot.botName} — ${restResult.closed} deal(s) canceled on Gainium`);
+            const restResult = await exchangeApi.closeDealsViaApi(botInfo.mongoId, bot.botName, 'cancel');
+            log(`🧹 External close cleanup: ${bot.botName} — ${restResult.closed} deal(s) canceled on Binance`);
             await sendAction({ action: 'stopBot', uuid });
             log(`🧹 External close cleanup: ${bot.botName} stopped`);
-            // Wait for Gainium to process the cancel + stop before re-entry
+            // Wait for Binance to settle before re-entry
             await new Promise(resolve => setTimeout(resolve, 3000));
           } catch (cleanErr) {
             log(`🧹 External close cleanup error for ${bot.botName}: ${cleanErr.message}`);
@@ -1941,7 +1940,7 @@ async function runRevalidation() {
     const bot = ACTIVE_BOTS[uuid];
     if (!bot) continue;
 
-    // v3.6.2: Grace period — 5 min for Gainium deal creation + first safety order.
+    // v3.6.2: Grace period — 5 min for deal creation + first safety order.
     // After grace, full reval + drawdown protection.
     const ageMs = Date.now() - new Date(bot.startedAt).getTime();
     if (ageMs < REVAL_GRACE_PERIOD_MS) {
@@ -1984,11 +1983,11 @@ async function runRevalidation() {
           log(`💰 RELAY TP: ${bot.botName} unrealized +$${unrealizedUsd.toFixed(2)} >= $${RELAY_TP_PROFIT_USD} — TAKING PROFIT`);
           log(`💰 Peak was +$${(bot.peakProfitUsd || unrealizedUsd).toFixed(2)}, entry $${effectiveEntry.toFixed(4)}, now $${currentPrice.toFixed(4)}`);
 
-          // Close the deal via Gainium API
+          // Close the deal via CCXT API
           const botInfo = BOT_MAP[uuid];
-          if (botInfo && gainiumApi.isConfigured()) {
+          if (botInfo && exchangeApi.isConfigured()) {
             try {
-              const closeResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
+              const closeResult = await exchangeApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
               log(`💰 RELAY TP: closed ${closeResult.closed} deal(s) for ${bot.botName}`);
 
               // Record the win
@@ -2087,7 +2086,7 @@ async function runRevalidation() {
       }
 
       // v4.0.0: Price drawdown check — 0.8% at 10x = 8% ROI loss hard cap.
-      // Gainium SL at 0.5% should trigger first; this is the relay-side backup.
+      // Binance SL at 0.5% should trigger first; this is the relay-side backup.
       if (result.allowed && effectiveEntry && result.data.currentPrice) {
         const currentPrice = result.data.currentPrice;
 
@@ -2139,17 +2138,17 @@ async function runRevalidation() {
         log(`🔄 Reval OK: ${bot.botName} (${bot.pair} ${bot.direction}) — ${result.reason}`);
 
         // v3.1.1: ASAP re-entry monitoring — if bot is running but deal closed (TP/SL).
-        // With ASAP startCondition, Gainium auto-opens next deal after 5-min cooldown.
+        // With ASAP startCondition, Exchange auto-opens next deal after 5-min cooldown.
         // Relay validates external gates — if they fail, stop the bot to prevent
         // ASAP from opening a deal into bad structure.
-        if (gainiumApi.isConfigured()) {
+        if (exchangeApi.isConfigured()) {
           const botInfo = BOT_MAP[uuid];
           if (botInfo) {
             try {
-              const deals = await gainiumApi.getBotDeals(uuid);
-              // v3.2.8: Stale deal detection — if Gainium says deal is active but
+              const deals = await exchangeApi.getBotDeals(uuid);
+              // v3.2.8: Stale deal detection — if CCXT says deal is active but
               // the loss exceeds the -8% SL, Binance likely already closed it.
-              // Force-close on Gainium to sync state.
+              // Force-close on Binance to sync state.
               // v3.5.0: Use DCA avgPrice (effectiveEntry) for stale deal detection,
               // not signal entryPrice which is the daily candle close from signal time
               if (deals && deals.active > 0 && effectiveEntry && result.data.currentPrice) {
@@ -2165,16 +2164,16 @@ async function runRevalidation() {
                     markTelegramAlertSent(uuid, 'stale-deal');
                     sendTelegramAlert(
                       `🚨 STALE DEAL: ${bot.botName}\n\n` +
-                      `Gainium shows an active deal but the loss (${lossPct.toFixed(2)}%) exceeds the -8% stop loss. ` +
+                      `CCXT shows an active deal but the loss (${lossPct.toFixed(2)}%) exceeds the -8% stop loss. ` +
                       `Binance likely already closed this position.\n\n` +
                       `Entry: $${effectiveEntry.toFixed(2)} | Now: $${curPrice.toFixed(2)}\n\n` +
-                      `Attempting to force-close the stale Gainium deal...\n\n` +
+                      `Attempting to force-close the stale deal...\n\n` +
                       `${istTimestamp()}`
                     ).catch(() => {});
                   }
-                  // Try REST API close to sync Gainium state
+                  // Try REST API close to sync state
                   try {
-                    const restResult = await gainiumApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
+                    const restResult = await exchangeApi.closeDealsViaApi(botInfo.mongoId, bot.botName);
                     log(`🚨 Stale deal REST close: ${restResult.closed} closed, ${restResult.failed} failed`);
                   } catch (staleErr) {
                     log(`🚨 Stale deal REST close error: ${staleErr.message}`);
@@ -2183,7 +2182,7 @@ async function runRevalidation() {
               }
 
               if (deals && deals.active === 0) {
-                // v4.2.0: Deal closed (SL hit by Gainium). Relay race baton pass.
+                // v4.2.0: Deal closed (SL hit on Binance). Relay race baton pass.
                 // SL=flip: market told us this direction is wrong → flip to opposite.
                 // No Gate 2 check — the SL IS the signal.
                 // (Relay TP exits are handled above and won't reach here.)
@@ -2193,7 +2192,7 @@ async function runRevalidation() {
                   ? (bot.direction === 'LONG' ? currentPrice < bot.entryPrice : currentPrice > bot.entryPrice)
                   : true; // If we can't determine, assume loss (safer — triggers flip)
                 recordDealClose(bot.pair, isLoss);
-                tradeJournal.recordExit({ botUuid: uuid, exitPrice: safePrice, exitReason: isLoss ? 'sl' : 'gainium-tp' });
+                tradeJournal.recordExit({ botUuid: uuid, exitPrice: safePrice, exitReason: isLoss ? 'sl' : 'binance-tp' });
 
                 // v4.2.0: SL=flip, TP=continue baton pass logic
                 let reentryDir;
@@ -2202,7 +2201,7 @@ async function runRevalidation() {
                   reentryDir = bot.direction === 'LONG' ? 'SHORT' : 'LONG';
                   log(`🔄 SL=FLIP: ${bot.botName} SL'd${safePrice ? ` at $${safePrice.toFixed(4)}` : ''} → flipping to ${reentryDir}`);
                 } else if (SL_FLIP_ENABLED && !isLoss) {
-                  // Gainium TP hit (rare — relay TP should catch first) → same direction
+                  // Binance TP hit (rare — relay TP should catch first) → same direction
                   reentryDir = bot.direction;
                   log(`🔄 TP=CONTINUE: ${bot.botName} TP'd${safePrice ? ` at $${safePrice.toFixed(4)}` : ''} → re-entering ${reentryDir}`);
                 } else {
@@ -2225,7 +2224,7 @@ async function runRevalidation() {
                     // Stop the old bot first if we're changing direction
                     if (reentryDir !== bot.direction) {
                       try { await sendAction({ action: 'stopBot', uuid }); } catch (e) {}
-                      await new Promise(resolve => setTimeout(resolve, 3000)); // v4.1.1: wait for Gainium cleanup
+                      await new Promise(resolve => setTimeout(resolve, 3000)); // v4.1.1: wait for Binance settlement
                     }
                     const action = reentryDir === bot.direction ? 're-entering same direction' : `FLIPPING to ${reentryDir}`;
                     log(`🔄 Baton pass → ${action}: ${reentryBot.name}`);
@@ -2500,13 +2499,13 @@ let selfHealRunning = false;
 async function runSelfHeal() {
   if (selfHealRunning) return;
   if (PAUSED) return;
-  if (!gainiumApi.isConfigured()) return;
+  if (!exchangeApi.isConfigured()) return;
 
   selfHealRunning = true;
 
   try {
     // Single API call to get all bot statuses — needed by both phases
-    const botStatuses = await gainiumApi.getAllBotStatuses();
+    const botStatuses = await exchangeApi.getAllBotStatuses();
     if (!botStatuses) {
       log(`🩺 Self-heal: API call failed — skipping this cycle`);
       selfHealRunning = false;
@@ -2514,14 +2513,14 @@ async function runSelfHeal() {
     }
 
     // ── Phase 0: Exchange Position Reconciliation (v3.8.4) ─────────────
-    // Query actual exchange positions via Gainium (reads Binance directly).
+    // Query actual exchange positions via CCXT (reads Binance directly).
     // Compare against ACTIVE_BOTS to catch two failure modes:
     //   A) Binance has a position the relay doesn't know about → re-track it
     //   B) ACTIVE_BOTS shows a position but Binance is flat → clean up stale tracking
-    // This is the ultimate ground truth — Gainium deal state can desync from
+    // This is the ultimate ground truth — internal state can desync from
     // Binance, but the exchange position map reflects actual Binance exposure.
     try {
-      const exchangeMap = await gainiumApi.getExchangePositionMap();
+      const exchangeMap = await exchangeApi.getExchangePositionMap();
       // Build tracked pairs — if both LONG + SHORT are tracked for same pair, that's
       // already a conflict state. Store all tracked bots, keyed by pair+direction.
       const trackedByPairDir = new Map(); // "SOL:LONG" → { uuid, botName }
@@ -2626,11 +2625,11 @@ async function runSelfHeal() {
           if (botInfo) {
             const bStatus = botStatuses.get(info.uuid);
             if (bStatus && bStatus.deals.active === 0) {
-              log(`🧹 Phase 0: STALE TRACKING — ${pair} ${info.direction} in ACTIVE_BOTS but Binance is flat and Gainium shows 0 deals. Cleaning up.`);
+              log(`🧹 Phase 0: STALE TRACKING — ${pair} ${info.direction} in ACTIVE_BOTS but Binance is flat and CCXT shows 0 deals. Cleaning up.`);
               delete ACTIVE_BOTS[info.uuid];
               sendTelegramAlert(
                 `🧹 Stale tracking cleaned: ${info.botName}\n\n` +
-                `Relay was monitoring ${pair} ${info.direction} but Binance has no position and Gainium shows 0 active deals.\n` +
+                `Relay was monitoring ${pair} ${info.direction} but Binance has no position and CCXT shows 0 active deals.\n` +
                 `Removed from tracking — pair is now available for re-entry.\n\n` +
                 `${istTimestamp()}`
               ).catch(() => {});
@@ -2645,7 +2644,7 @@ async function runSelfHeal() {
     }
 
     // ── Phase 1: Orphaned Deal Scan (v3.8.3) ───────────────────────────
-    // Check ALL pairs for deals that exist on Gainium but aren't tracked
+    // Check ALL pairs for deals that exist on Binance but aren't tracked
     // in ACTIVE_BOTS. This catches the critical scenario where a flip
     // started the new direction but the old deal didn't close — the pair
     // has an active bot (new direction) so it's not "orphaned", but the
@@ -2680,7 +2679,7 @@ async function runSelfHeal() {
           log(`🩺 Self-heal: RE-TRACKED ${bot.name} (${dir}) — deal active but not monitored. Now under reval + drawdown protection.`);
           sendTelegramAlert(
             `🚨 Orphaned deal re-tracked: ${bot.name}\n\n` +
-            `Found a ${dir} deal still open on Gainium/Binance but NOT being monitored by the relay. ` +
+            `Found a ${dir} deal still open on Binance but NOT being monitored by the relay. ` +
             `This can happen when a direction flip fails to close the old deal.\n\n` +
             `The relay is now monitoring this position with full revalidation + drawdown protection.\n\n` +
             `${istTimestamp()}`
@@ -2749,12 +2748,12 @@ async function runSelfHeal() {
           continue;
         }
 
-        // Check their status on Gainium
+        // Check their status on Binance
         const longStatus = botStatuses.get(longBot.uuid);
         const shortStatus = botStatuses.get(shortBot.uuid);
 
         if (!longStatus || !shortStatus) {
-          log(`🩺 Self-heal: ${pair} — couldn't find bot status on Gainium — skipping`);
+          log(`🩺 Self-heal: ${pair} — couldn't find bot status on Binance — skipping`);
           continue;
         }
 
@@ -2916,7 +2915,7 @@ async function handleTelegramCommand(text, chatId) {
 
     try {
       // One API call — listAllOpenDeals returns every open deal
-      const allDeals = await gainiumApi.listAllOpenDeals();
+      const allDeals = await exchangeApi.listAllOpenDeals();
       for (const deal of allDeals) {
         const botInfo = mongoToBot[deal.botId];
         if (!botInfo) continue; // not one of our bots
@@ -2946,21 +2945,21 @@ async function handleTelegramCommand(text, chatId) {
       }
     } catch (err) {
       log(`Telegram /positions error: ${err.message}`);
-      lines.push('⚠️ Could not fetch deals from Gainium API.');
+      lines.push('⚠️ Could not fetch deals from Binance.');
     }
 
     if (foundDeals === 0) {
-      lines.push('No open deals on Gainium.');
+      lines.push('No open deals on Binance.');
     } else {
-      lines.push(`<b>Gainium total: ${totalProfit >= 0 ? '+' : ''}$${totalProfit.toFixed(2)}</b>`);
+      lines.push(`<b>Total P&L: ${totalProfit >= 0 ? '+' : ''}$${totalProfit.toFixed(2)}</b>`);
     }
 
-    // Exchange ground truth via Gainium (Gainium reads Binance positions directly)
+    // Exchange ground truth via CCXT (reads Binance positions directly)
     if (foundDeals > 0) {
       try {
-        const exchangeMap = await gainiumApi.getExchangePositionMap();
+        const exchangeMap = await exchangeApi.getExchangePositionMap();
         if (exchangeMap.size > 0) {
-          lines.push('\n📈 <b>Exchange Positions (via Gainium)</b>\n');
+          lines.push('\n📈 <b>Binance Positions (via CCXT)</b>\n');
           let exchangeTotal = 0;
           for (const [pair, pos] of exchangeMap) {
             exchangeTotal += pos.pnl;
@@ -2997,7 +2996,7 @@ async function handleTelegramCommand(text, chatId) {
       `Strategy: ${STRATEGY_MODE}`,
       `Active bots: ${activeCount} (${activePairs})`,
       `Circuit breaker: ${cbParked.length > 0 ? '⚠️ Parked: ' + cbParked.join(', ') : '✅ Clear'}`,
-      `API: ${gainiumApi.isConfigured() ? '✅' : '❌'}`,
+      `API: ${exchangeApi.isConfigured() ? '✅' : '❌'}`,
       `\n${istTimestamp()} IST`,
     ];
     return statusLines.join('\n');
@@ -3160,7 +3159,7 @@ async function handleTelegramCommand(text, chatId) {
     let closed = 0, stopped = 0;
     const prevBots = { ...ACTIVE_BOTS };
     for (const [uuid, bot] of Object.entries(ACTIVE_BOTS)) {
-      try { await gainiumApi.forceCloseDeals(uuid); closed++; } catch (err) { log(`🚨 Kill: close failed ${bot.botName}: ${err.message}`); }
+      try { await exchangeApi.forceCloseDeals(uuid); closed++; } catch (err) { log(`🚨 Kill: close failed ${bot.botName}: ${err.message}`); }
     }
     for (const [uuid] of Object.entries(BOT_MAP)) {
       try { await sendAction({ action: 'stopBot', uuid }); stopped++; } catch (err) { /* may already be stopped */ }
@@ -3239,7 +3238,7 @@ app.post('/telegram', async (req, res) => {
   }
 });
 
-// ── Telegram Long-Polling (v5.0.5) ───────────────────────────────────────
+// ── Telegram Long-Polling (v5.0.6) ───────────────────────────────────────
 // Replaces webhook (requires HTTPS) with getUpdates polling.
 // Commands handled by existing handleTelegramCommand().
 let telegramPollingOffset = 0;
@@ -3300,32 +3299,32 @@ async function startTelegramPolling() {
 
 // ── Startup State Recovery (v3.2.8) ─────────────────────────────────────
 // After a deploy or Render restart, ACTIVE_BOTS is empty — all running
-// positions lose revalidation protection. This function queries Gainium
+// positions lose revalidation protection. This function queries CCXT
 // for open bots with active deals and rebuilds in-memory state so
 // revalidation starts protecting them immediately.
 
 async function recoverActiveState() {
-  if (!gainiumApi.isConfigured()) {
+  if (!exchangeApi.isConfigured()) {
     log(`🔄 Startup recovery: skipped — Binance API not configured`);
     return;
   }
 
   try {
-    // Step 1: Query exchange positions via Gainium (Gainium reads Binance directly)
+    // Step 1: Query exchange positions via CCXT (direct Binance)
     log(`🔄 Startup recovery: querying Binance positions via CCXT...`);
     let exchangePositions = new Map();
     try {
-      exchangePositions = await gainiumApi.getExchangePositionMap();
+      exchangePositions = await exchangeApi.getExchangePositionMap();
       log(`🔄 Startup recovery: exchange reports ${exchangePositions.size} open position(s)`);
     } catch (err) {
       log(`🔄 Startup recovery: exchange position query failed — ${err.message}`);
     }
 
-    // Step 2: Query Gainium for bot states
+    // Step 2: Query CCXT for bot states
     log(`🔄 Startup recovery: querying CCXT for active bots...`);
-    const botStatuses = await gainiumApi.getAllBotStatuses();
+    const botStatuses = await exchangeApi.getAllBotStatuses();
     if (!botStatuses) {
-      log(`🔄 Startup recovery: Gainium API call failed — will rely on incoming signals`);
+      log(`🔄 Startup recovery: CCXT API call failed — will rely on incoming signals`);
       return;
     }
 
@@ -3349,7 +3348,7 @@ async function recoverActiveState() {
 
       const pair = botInfo.name.split(' ')[0].toUpperCase();
 
-      // Cross-reference with exchange position data (via Gainium deals)
+      // Cross-reference with exchange position data (via CCXT deals)
       const exchangePos = exchangePositions.get(pair);
       let entryPrice = null;
       let pnl = null;
@@ -3458,8 +3457,8 @@ app.listen(PORT, async () => {
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
-  log(`   Exchange: Direct Binance via CCXT (v5.0.0 — Gainium removed)`);
-  log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set BINANCE_API_KEY + BINANCE_API_SECRET)'}`);
+  log(`   Exchange: Direct Binance via CCXT (v5.0.0 — )`);
+  log(`   API verification: ${exchangeApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set BINANCE_API_KEY + BINANCE_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
   log(`   Signal timeframe: 1H (v3.7.0 — migrated from 4H for faster entries)`);
   log(`   Cold-start scan: ✅ enabled (v3.8.0 — detects existing trends on startup)`);
@@ -3488,7 +3487,7 @@ app.listen(PORT, async () => {
             `Server outbound IP: <b>${currentIp}</b>\n` +
             `Error: ${msg.substring(0, 200)}\n\n` +
             `The IP may have changed. Update the Binance API key whitelist to include this IP.\n` +
-            `Ghost detection will fall back to Gainium (stale) until this is fixed.\n\n` +
+            `Ghost detection will not work until this is fixed.\n\n` +
             `${istTimestamp()}`
           ).catch(() => {});
         } else {
