@@ -68,10 +68,9 @@ let marketsLoaded = false;
 
 function getExchange() {
   if (!exchange) {
-    exchange = new ccxt.binance({
+    exchange = new ccxt.binanceusdm({
       apiKey: API_KEY,
       secret: API_SECRET,
-      options: { defaultType: 'future' },
       enableRateLimit: true,
     });
   }

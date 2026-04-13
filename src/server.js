@@ -704,9 +704,9 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
   log(`[${requestId}]   ⏳ Waiting 5s for Binance to settle...`);
   await new Promise(r => setTimeout(r, 5000));
 
-  // Step 3: Verify via Gainium REST API
+  // Step 3: Verify via Binance API
   if (!gainiumApi.isConfigured()) {
-    log(`[${requestId}]   ⚠ Gainium API not configured (GAINIUM_API_KEY/SECRET missing) — skipping verification`);
+    log(`[${requestId}]   ⚠ Binance API not configured (BINANCE_API_KEY/SECRET missing) — skipping verification`);
     return { verified: false, abortRemaining: false };
   }
 
@@ -714,9 +714,9 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 
   if (result.flat) {
     if (result.forceClosed > 0) {
-      log(`[${requestId}]   ✅ Gainium verified flat — force-closed ${result.forceClosed} deal(s)`);
+      log(`[${requestId}]   ✅ Binance verified flat — force-closed ${result.forceClosed} deal(s)`);
     } else {
-      log(`[${requestId}]   ✅ Gainium verified flat — closeAllDeals worked correctly`);
+      log(`[${requestId}]   ✅ Binance verified flat — closeAllDeals worked correctly`);
     }
 
     // v3.8.4: Exchange-level cross-check — Gainium says flat, but does Binance agree?
@@ -3418,7 +3418,7 @@ app.listen(PORT, async () => {
   log(`   Webhook endpoint: POST /webhook`);
   log(`   Telegram commands: POST /telegram`);
   log(`   Health check: GET /`);
-  log(`   Gainium target: ${GAINIUM_WEBHOOK_URL}`);
+  log(`   Exchange: Direct Binance via CCXT (v5.0.0 — Gainium removed)`);
   log(`   API verification: ${gainiumApi.isConfigured() ? '✅ configured' : '⚠ NOT configured (set BINANCE_API_KEY + BINANCE_API_SECRET)'}`);
   log(`   Telegram alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅ configured' : '⚠ NOT configured (optional)'}`);
   log(`   Signal timeframe: 1H (v3.7.0 — migrated from 4H for faster entries)`);
