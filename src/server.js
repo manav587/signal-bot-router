@@ -3242,8 +3242,11 @@ app.post('/telegram', async (req, res) => {
 // ── Register Telegram Webhook on startup ─────────────────────────────────
 async function registerTelegramWebhook() {
   if (!TELEGRAM_BOT_TOKEN) return;
-  const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://signal-bot-router.onrender.com';
-  const webhookUrl = `${renderUrl}/telegram`;
+  // v5.0: Telegram incoming webhooks require HTTPS - disabled for now
+  // Outgoing alerts (sendTelegram) still work without this
+  return; // TODO: re-enable when HTTPS is set up
+  const webhookBaseUrl = process.env.WEBHOOK_BASE_URL || 'http://45.122.45.55';
+  const webhookUrl = `${webhookBaseUrl}/telegram`;
   try {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`;
     const resp = await fetch(url, {
