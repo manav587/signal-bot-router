@@ -11,7 +11,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.11';
+const VERSION = '5.0.12';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -581,12 +581,26 @@ function istTimestamp() {
 // Internal logs still use istTimestamp() to stay compact.
 function timestampDual() {
   const now = new Date();
+
+  // IST is fixed UTC+5:30, no DST
   const istTime = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false, hour: '2-digit', minute: '2-digit' });
   const istDate = now.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
-  const gmtTime = now.toLocaleTimeString('en-GB', { timeZone: 'UTC', hour12: false, hour: '2-digit', minute: '2-digit' });
-  const gmtDate = now.toLocaleDateString('en-GB', { timeZone: 'UTC', day: '2-digit', month: 'short' });
-  return `IST: ${istTime}, ${istDate}
-GMT: ${gmtTime}, ${gmtDate}`;
+
+  // Europe/London handles BST/GMT transitions automatically; timeZoneName gives 'BST' or 'GMT'
+  const ukTime = now.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour12: false, hour: '2-digit', minute: '2-digit' });
+  const ukDate = now.toLocaleDateString('en-GB', { timeZone: 'Europe/London', day: '2-digit', month: 'short' });
+  const ukTzAbbr = now.toLocaleString('en-GB', { timeZone: 'Europe/London', timeZoneName: 'short' }).split(' ').pop();
+
+  // Compare wall-clock values (sv-SE gives sortable 'YYYY-MM-DD HH:MM:SS'); show earlier first
+  const istSortable = now.toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata', hour12: false });
+  const ukSortable = now.toLocaleString('sv-SE', { timeZone: 'Europe/London', hour12: false });
+
+  const istLine = `IST: ${istTime}, ${istDate}`;
+  const ukLine = `${ukTzAbbr}: ${ukTime}, ${ukDate}`;
+
+  return ukSortable < istSortable ? `${ukLine}
+${istLine}` : `${istLine}
+${ukLine}`;
 }
 
 function log(msg) {
