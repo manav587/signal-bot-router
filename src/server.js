@@ -11,7 +11,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.6';
+const VERSION = '5.0.7';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
@@ -1770,7 +1770,7 @@ const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite
 // Fix: relay monitors Binance P&L every 2 minutes and closes at $8 profit.
 const RELAY_TP_ENABLED = true;
 const RELAY_TP_PROFIT_USD = 10; // Close deal when unrealized profit >= $10
-const RELAY_TP_POSITION_SIZE = 2000; // Notional position size (base order)
+const RELAY_TP_POSITION_SIZE = 1500; // Notional position size (base order)
 
 // ── v4.2.0: SL=FLIP DIRECTION LOGIC ──────────────────────────────────
 // Relay race baton pass rules:
