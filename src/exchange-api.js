@@ -174,7 +174,9 @@ function isConfigured() {
  * @returns {{ active: number, all: number }}
  */
 async function getBotDeals(pairOrUuid) {
-  const pair = resolvePair(pairOrUuid);
+  // v5.0.9: Prefer bot config (gives direction); fall back to pair-only lookup
+  const config = resolveBotConfig(pairOrUuid);
+  const pair = config ? config.pair : resolvePair(pairOrUuid);
   if (!pair) {
     log(`getBotDeals: could not resolve pair from ${pairOrUuid}`);
     return { active: 0, all: 0 };
@@ -182,10 +184,15 @@ async function getBotDeals(pairOrUuid) {
 
   try {
     const pos = await getPositionForPair(pair);
-    if (pos && pos.contracts && pos.contracts !== 0) {
-      return { active: 1, all: 1 };
+    if (!pos || !pos.contracts || pos.contracts === 0) {
+      return { active: 0, all: 0 };
     }
-    return { active: 0, all: 0 };
+    // v5.0.9: Direction-aware — only count position if side matches this bot's direction
+    if (config) {
+      const expectedSide = config.direction.toLowerCase();
+      if (pos.side !== expectedSide) return { active: 0, all: 0 };
+    }
+    return { active: 1, all: 1 };
   } catch (err) {
     log(`getBotDeals error for ${pair}: ${err.message}`);
     return { active: 0, all: 0 };
@@ -203,7 +210,9 @@ async function getAllBotStatuses() {
     const pair = config.pair;
     try {
       const pos = await getPositionForPair(pair);
-      const hasPosition = pos && pos.contracts && pos.contracts !== 0;
+      // v5.0.9: Direction-aware check — only mark bot active if position side matches bot direction
+      const expectedSide = config.direction.toLowerCase(); // 'long' or 'short'
+      const hasPosition = pos && pos.contracts && pos.contracts !== 0 && pos.side === expectedSide;
 
       statusMap.set(uuid, {
         status: hasPosition ? 'open' : 'closed',
@@ -243,6 +252,16 @@ async function listOpenDeals(mongoIdOrPair) {
     const pos = await getPositionForPair(pair);
     if (!pos || !pos.contracts || pos.contracts === 0) {
       return [];
+    }
+
+    // v5.0.9: If caller passed a UUID/mongoId (not just a pair),
+    // only return this deal if its side matches the bot's direction.
+    // When called with a bare pair (from listAllOpenDeals), no filter applies.
+    if (config && !SUPPORTED_PAIRS.includes(mongoIdOrPair)) {
+      const expectedSide = config.direction.toLowerCase();
+      if (pos.side !== expectedSide) {
+        return [];
+      }
     }
 
     const side = pos.side === 'long' ? 'LONG' : 'SHORT';
@@ -615,4 +634,5 @@ module.exports = {
   getExchangePositionMap,
   ensureBotOpen,
   createDeal,
+  BOT_MAP,
 };

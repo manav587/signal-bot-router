@@ -11,25 +11,11 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.8';
+const VERSION = '5.0.9';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
-// ── UUID → MongoDB ID mapping (for API verification) ────────────────────
-// The relay needs MongoDB ObjectIds to call get_bot / manage_deal.
-// UUID is what TradingView sends; Mongo ID is kept for internal mapping.
-// V4.1 bots — startCondition: Manual, relay creates deals via REST API after startBot.
-// History: ASAP (v3.0) → TechnicalIndicators (v3.1, 9 Apr) → Manual (v4.1, 11 Apr).
-// Manual + createDeal eliminates the TechnicalIndicators candle-wait ghost trade problem.
-const BOT_MAP = {
-  '61a66c9f-7463-46db-a72f-2ef39565bc20': { mongoId: '69ce1dc4228af151def7f93e', name: 'SOL Long v2' },
-  '3af77f4f-73a7-45c1-a0fd-b7c3ce9f16ee': { mongoId: '69ce1dc6228af151def7f97b', name: 'SOL Short v2' },
-  '4d6f6265-4c9a-42e7-bf85-8956a1c03f6c': { mongoId: '69ce1dc8228af151def7f9a0', name: 'ETH Long v2' },
-  '69c91263-68c9-4f88-a543-7c319b5fde8b': { mongoId: '69ce1dca228af151def7fa03', name: 'ETH Short v2' },
-  'eb74f76c-c6ec-48c2-a74d-d9fd27c2fab5': { mongoId: '69ce1dcc228af151def7fa3c', name: 'XRP Long v2' },
-  '2751574b-cc46-4f62-bd01-cb404c21f8d7': { mongoId: '69ce1dcd228af151def7fab8', name: 'XRP Short v2' },
-  'd0ea54dc-7218-4666-8c81-85bcd0271a3f': { mongoId: '69ce1dcf228af151def7faf7', name: 'BTC Long v2' },
-  '21c9985a-db38-440d-9313-ac13825852be': { mongoId: '69ce1dd1228af151def7fb2e', name: 'BTC Short v2' },
-};
+// v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
+const BOT_MAP = exchangeApi.BOT_MAP;
 
 // ── Telegram Alerts (optional — sends critical failures to Manav) ────────
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
