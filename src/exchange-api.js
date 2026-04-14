@@ -429,7 +429,8 @@ async function getExchangePositionMap() {
       if (!pos.contracts || pos.contracts === 0) continue;
 
       const symbol = pos.symbol;
-      const base = symbol.replace('USDT', '');
+      // v5.0.8: CCXT returns unified 'SOL/USDT:USDT'; naive .replace('USDT','') yields 'SOL/:USDT' and breaks reval lookup.
+      const base = symbol.includes('/') ? symbol.split('/')[0] : symbol.replace('USDT', '');
       const side = pos.side === 'long' ? 'LONG' : 'SHORT';
 
       map.set(base, {

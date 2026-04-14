@@ -11,7 +11,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.7';
+const VERSION = '5.0.8';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // ── UUID → MongoDB ID mapping (for API verification) ────────────────────
