@@ -11,7 +11,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.9';
+const VERSION = '5.0.10';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -377,7 +377,7 @@ async function runFundingCheck() {
           `Tried to open a ${direction} on ${pair} because the funding rate (${result.data.fundingPct}) favours it, but the safety checks didn't pass.\n\n` +
           `Why: ${gateResult.reason}\n` +
           `No trade was placed.\n\n` +
-          `${istTimestamp()}`
+          `${timestampDual()}`
         ).catch(() => {});
         continue;
       }
@@ -428,7 +428,7 @@ async function runFundingCheck() {
         `📊 Funding rate trade\n\n` +
         `Opening a ${direction} on ${pair} at $${result.data.markPrice?.toFixed(2) || '?'}.\n\n` +
         `The funding rate (${result.data.fundingPct}) suggests traders are leaning the other way, which creates an opportunity. All safety checks passed.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
 
       // Execute through the same pipeline
@@ -503,7 +503,7 @@ function queueDeferredFlip(actions, requestId, targetBot, context = {}) {
   sendTelegramAlert(
     `📋 Waiting to switch direction\n\n` +
     `Trying to start ${targetBot.name}, but Binance still has the old position open (a "position conflict"). Will keep retrying every 60 seconds for up to 5 minutes while it clears.\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
 }
 
@@ -536,7 +536,7 @@ async function processDeferredQueue() {
         sendTelegramAlert(
           `✅ Direction switch succeeded\n\n` +
           `${newBotName} is now running. The old position (${item.targetBot.name}) cleared and the new bot started after ${item.retryCount} retries.\n\n` +
-          `${istTimestamp()}`
+          `${timestampDual()}`
         ).catch(() => {});
         DEFERRED_QUEUE.splice(i, 1);
         continue;
@@ -552,7 +552,7 @@ async function processDeferredQueue() {
         `❌ Direction switch failed\n\n` +
         `Couldn't start ${item.targetBot.name} after 5 minutes of retrying. The old position on Binance didn't close in time.\n\n` +
         `⚠️ Check Binance manually — you may need to close the stuck position and restart the bot.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
       DEFERRED_QUEUE.splice(i, 1);
     }
@@ -575,6 +575,15 @@ const DELAYS = {
 // Timestamp in IST (UTC+5:30) for Manav
 function istTimestamp() {
   return new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+}
+
+// v5.0.10: Dual-timezone timestamp for user-facing Telegram messages.
+// Internal logs still use istTimestamp() to stay compact.
+function timestampDual() {
+  const now = new Date();
+  const ist = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+  const gmt = now.toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
+  return `${ist} IST / ${gmt} GMT`;
 }
 
 function log(msg) {
@@ -727,7 +736,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
             `Entry: $${stillOpen.entryPrice?.toFixed(2)} | PnL: $${stillOpen.pnl?.toFixed(2)}\n\n` +
             `To prevent position conflicts, the new bot was NOT started.\n` +
             `⚠️ Check Binance manually.\n\n` +
-            `${istTimestamp()}`;
+            `${timestampDual()}`;
           await sendTelegramAlert(alertMsg);
           return { verified: false, abortRemaining: true };
         } else {
@@ -749,7 +758,7 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
     `${result.error}\n\n` +
     `The system tried to switch direction but couldn't verify the old position closed properly on Binance. To be safe, the new bot was NOT started — this avoids having two opposite positions open at once (a "position conflict").\n\n` +
     `⚠️ Check Binance manually.\n\n` +
-    `${istTimestamp()}`;
+    `${timestampDual()}`;
   log(`[${requestId}]   🚨 ${alertMsg}`);
   await sendTelegramAlert(alertMsg);
 
@@ -837,7 +846,7 @@ async function processActions(actions, requestId, isRetry = false, context = {})
           `Error: ${dealResult.error}\n\n` +
           `${dealResult.dealLimitReject ? 'Cause: Deal limit reached for this timeframe.\n' : ''}` +
           `The bot is active but has NO position on Binance.\n` +
-          `${istTimestamp()}`
+          `${timestampDual()}`
         ).catch(() => {});
       }
     }
@@ -888,28 +897,28 @@ async function processActions(actions, requestId, isRetry = false, context = {})
       tradeMsg = `ℹ️ Already in position — no change\n\n` +
         `${pair} is already ${direction}. TradingView sent a repeat signal, and all API calls succeeded, but no new orders were placed on Binance.\n\n` +
         `Your existing position continues as-is.\n` +
-        `${istTimestamp()}`;
+        `${timestampDual()}`;
     } else if (hasClose && hasStart && pair) {
       // Crossover flip: closed old position, opened new one
       tradeMsg = `✅ Trade switch complete\n\n` +
         `Closed the previous ${pair} position and opened a new ${direction} at $${price || '?'}.\n` +
         `(closeAllDeals → stopBot → startBot)\n\n` +
         `Bot: ${completedBots.join(', ')}\n` +
-        `${istTimestamp()}`;
+        `${timestampDual()}`;
     } else if (hasStart && pair) {
       // Fresh entry, no close needed
       tradeMsg = `✅ Trade opened\n\n` +
         `Opened a ${direction} on ${pair} at $${price || '?'}.\n` +
         `(startBot)\n\n` +
         `Bot: ${completedBots.join(', ')}\n` +
-        `${istTimestamp()}`;
+        `${timestampDual()}`;
     } else {
       // Fallback for non-crossover signals (stopBot only, etc.)
       const completedNames = actions.map(a => a.action).join(' → ');
       tradeMsg = `✅ Action complete\n\n` +
         `Done: ${completedNames}\n` +
         `Bot: ${completedBots.join(', ')}\n` +
-        `${istTimestamp()}`;
+        `${timestampDual()}`;
     }
     sendTelegramAlert(tradeMsg).catch(() => {});
 
@@ -959,7 +968,7 @@ app.get('/pause', (req, res) => {
   sendTelegramAlert(
     `⏸️ System paused\n\n` +
     `The relay is on hold. Any signals from TradingView will be logged but no trades will be placed until you resume.\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
   res.json({ status: 'paused', pausedAt: PAUSED_AT });
 });
@@ -977,7 +986,7 @@ app.get('/resume', (req, res) => {
   sendTelegramAlert(
     `▶️ System resumed\n\n` +
     `Back online after ${Math.floor(pauseDuration / 60)}m ${pauseDuration % 60}s. ${signalsMissed > 0 ? `${signalsMissed} signal(s) came in while paused and were skipped.` : 'No signals were missed.'} Trading is active again.\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
   res.json({ status: 'running', pauseDuration: pauseDuration + 's', signalsMissed });
 });
@@ -1007,7 +1016,7 @@ app.get('/strategy/crossover', (req, res) => {
   sendTelegramAlert(
     `🔀 Switched to crossover mode\n\n` +
     `Now using TradingView moving average alerts (EMA crossovers) to decide trades. Funding rate polling is off.\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
   res.json({ status: 'switched to crossover', mode: STRATEGY_MODE });
 });
@@ -1023,7 +1032,7 @@ app.get('/strategy/funding', (req, res) => {
   sendTelegramAlert(
     `🔀 Switched to funding rate mode\n\n` +
     `Now using Binance funding rates (checked every 4 hours) to decide trades. TradingView crossover alerts will be ignored.\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
   res.json({ status: 'switched to funding', mode: STRATEGY_MODE });
 });
@@ -1286,7 +1295,7 @@ app.get('/test-reconcile/:pair', async (req, res) => {
     `Deliberately removed ${bot.botName} from tracking to simulate a lost position.\n` +
     `Phase 0 (exchange reconciliation) and Phase 1 (deal scan) should detect and re-track this within the next self-heal cycle (≤5 min).\n\n` +
     `Watch for a "🔍 Exchange reconciliation" or "🩺 Self-heal: RE-TRACKED" alert.\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
 
   res.json({
@@ -1401,7 +1410,7 @@ app.post('/test/:pair/:direction', async (req, res) => {
     `✅ Gate passed: ${gateResult.reason}\n` +
     `🎯 Deal created: ${dealCreated ? 'YES' : 'NO — check Binance'}\n` +
     `Bot: ${bot.name}\n\n` +
-    `${istTimestamp()}`
+    `${timestampDual()}`
   ).catch(() => {});
 
   res.json({
@@ -1523,7 +1532,7 @@ app.post('/webhook', (req, res) => {
       sendTelegramAlert(
         `⏸️ Signal received but system is paused\n\n` +
         `TradingView sent a signal for ${botNames.join(', ')}, but the system is paused so no trade was placed. This is signal #${PAUSED_SIGNALS} since the pause.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
     } else {
       log(`[${requestId}] 🔇 Paused alert suppressed — cooldown active (signal #${PAUSED_SIGNALS})`);
@@ -1540,7 +1549,7 @@ app.post('/webhook', (req, res) => {
       sendTelegramAlert(
         `🔇 Duplicate signal ignored\n\n` +
         `TradingView said go ${direction} on ${pair}, but we're already ${direction}. This is a repeat of the last signal — no action needed.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
       return;
     }
@@ -1562,7 +1571,7 @@ app.post('/webhook', (req, res) => {
         `🔒 Signal deferred — recovery lock\n\n` +
         `TradingView sent ${direction} on ${pair}, but this pair was just recovered during server restart. ` +
         `Signals are deferred for 3 minutes while revalidation verifies the position is real.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
       return;
     }
@@ -1576,7 +1585,7 @@ app.post('/webhook', (req, res) => {
         `⚡ Circuit breaker — ${pair} paused\n\n` +
         `${pair} has been flipping direction too quickly (a sign of a choppy, indecisive market). The "circuit breaker" has kicked in to prevent losses from rapid back-and-forth trading.\n\n` +
         `${pair} is parked for 30 min. Other pairs continue normally.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
       return;
     }
@@ -1603,7 +1612,7 @@ app.post('/webhook', (req, res) => {
           `Why: ${gateResult.reason}\n` +
           `RSI(14): ${gateResult.data.rsi14 || '?'} · EMA50: $${gateResult.data.ema50?.toFixed(2) || '?'} (price ${gateResult.data.priceVsEma || '?'})\n\n` +
           `No trade placed — waiting for better alignment.\n\n` +
-          `${istTimestamp()}`
+          `${timestampDual()}`
         ).catch(() => {});
         return;
       }
@@ -1627,7 +1636,7 @@ app.post('/webhook', (req, res) => {
         `✅ RSI(14): ${gateResult.data.rsi14 || '?'} ${gateResult.data.rsiDirection || ''} (momentum indicator is in range)\n` +
         `✅ Price is ${gateResult.data.priceVsEma || '?'} the 50-period EMA ($${gateResult.data.ema50?.toFixed(2) || '?'})\n\n` +
         `Bot: ${botNames.join(', ')}\n` +
-        `${istTimestamp()}`;
+        `${timestampDual()}`;
       sendTelegramAlert(telegramSummary).catch(() => {});
 
       // Detect no-op: if the startBot target is already active in the same direction,
@@ -1687,7 +1696,7 @@ app.post('/webhook', (req, res) => {
         `Signal: 1H EMA 9/21 crossover\n` +
         `TradingView sent ${direction} on ${pair}, but the safety gate couldn't run: ${err.message}\n\n` +
         `Signal was NOT executed. Will wait for next signal when data is available.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
     });
     return;
@@ -1696,7 +1705,7 @@ app.post('/webhook', (req, res) => {
   // Non-crossover signals (no startBot action) — pass through without gating
   const telegramSummary = `📨 Signal received\n\n` +
     `${actionNames} on ${botNames.join(', ')}.\n\n` +
-    `${istTimestamp()}`;
+    `${timestampDual()}`;
   sendTelegramAlert(telegramSummary).catch(() => {});
 
   // Process in background (don't block the response)
@@ -1887,7 +1896,7 @@ async function runRevalidation() {
                 sendTelegramAlert(
                   `🔄 SL=Flip: ${bot.botName} → ${reentryBot.name}\n\n` +
                   `External close (SL on Binance). Flipping to ${reentryDir}.\n\n` +
-                  `${istTimestamp()}`
+                  `${timestampDual()}`
                 ).catch(() => {});
               } finally {
                 delete GATE_PENDING[base];
@@ -1895,24 +1904,24 @@ async function runRevalidation() {
             } else if (!reentryBot) {
               log(`🔄 External close: no ${reentryDir} bot found for ${base} — staying flat`);
               sendTelegramAlert(
-                `🧹 External close: ${bot.botName}\n\nPosition closed. No ${reentryDir} bot available for re-entry.\n\n${istTimestamp()}`
+                `🧹 External close: ${bot.botName}\n\nPosition closed. No ${reentryDir} bot available for re-entry.\n\n${timestampDual()}`
               ).catch(() => {});
             } else {
               log(`🔄 External close: ${base} on flip cooldown — skipping re-entry`);
               sendTelegramAlert(
-                `🧹 External close: ${bot.botName}\n\nPosition closed. Flip cooldown active — will re-enter on next reval cycle.\n\n${istTimestamp()}`
+                `🧹 External close: ${bot.botName}\n\nPosition closed. Flip cooldown active — will re-enter on next reval cycle.\n\n${timestampDual()}`
               ).catch(() => {});
             }
           } else {
             log(`🔄 External close: no direction passes Gate 2 for ${base} — staying flat`);
             sendTelegramAlert(
-              `🧹 External close: ${bot.botName}\n\nPosition closed. No direction supported by Gate 2 right now — waiting for next signal.\n\n${istTimestamp()}`
+              `🧹 External close: ${bot.botName}\n\nPosition closed. No direction supported by Gate 2 right now — waiting for next signal.\n\n${timestampDual()}`
             ).catch(() => {});
           }
         } catch (reentryErr) {
           log(`🔄 External close re-entry error for ${base}: ${reentryErr.message}`);
           sendTelegramAlert(
-            `🧹 External close: ${bot.botName}\n\nPosition closed. Re-entry check failed: ${reentryErr.message}\nWaiting for next signal.\n\n${istTimestamp()}`
+            `🧹 External close: ${bot.botName}\n\nPosition closed. Re-entry check failed: ${reentryErr.message}\nWaiting for next signal.\n\n${timestampDual()}`
           ).catch(() => {});
         }
         continue;
@@ -2016,7 +2025,7 @@ async function runRevalidation() {
                     `Captured profit at $${currentPrice.toFixed(4)}.\n` +
                     `Peak was +$${(bot.peakProfitUsd || unrealizedUsd).toFixed(2)}.\n` +
                     `Re-entering ${reentryDir} (trend working).\n\n` +
-                    `${istTimestamp()}`
+                    `${timestampDual()}`
                   ).catch(() => {});
                 } finally {
                   delete GATE_PENDING[bot.pair];
@@ -2154,7 +2163,7 @@ async function runRevalidation() {
                       `Binance likely already closed this position.\n\n` +
                       `Entry: $${effectiveEntry.toFixed(2)} | Now: $${curPrice.toFixed(2)}\n\n` +
                       `Attempting to force-close the stale deal...\n\n` +
-                      `${istTimestamp()}`
+                      `${timestampDual()}`
                     ).catch(() => {});
                   }
                   // Try REST API close to sync state
@@ -2241,7 +2250,7 @@ async function runRevalidation() {
                         `${isLoss ? '🔴 SL hit' : '🟢 TP hit'} → ${action}\n` +
                         `Exit: ${safePrice ? `$${safePrice.toFixed(4)}` : 'unknown'} | Peak P&L: $${(bot.peakProfitUsd || 0).toFixed(2)}\n` +
                         `New entry: ${reentryDir}\n\n` +
-                        `${istTimestamp()}`
+                        `${timestampDual()}`
                       ).catch(() => {});
                     } finally {
                       delete GATE_PENDING[bot.pair];
@@ -2257,7 +2266,7 @@ async function runRevalidation() {
                   delete ACTIVE_BOTS[uuid];
                   delete LAST_DIRECTION[bot.pair];
                   sendTelegramAlert(
-                    `⏹️ ${bot.botName} deal closed — no re-entry direction available.\n\n${istTimestamp()}`
+                    `⏹️ ${bot.botName} deal closed — no re-entry direction available.\n\n${timestampDual()}`
                   ).catch(() => {});
                 }
               }
@@ -2298,7 +2307,7 @@ async function runRevalidation() {
             `⚡ Circuit breaker tripped — ${bot.pair}\n\n` +
             `${bot.pair} has flipped direction too many times in a short window. This usually means the market is choppy and indecisive, so the system is stepping back.\n\n` +
             `No trades on ${bot.pair} for 30 minutes. Other pairs continue normally.\n\n` +
-            `${istTimestamp()}`
+            `${timestampDual()}`
           ).catch(() => {});
           flipResult = { flipped: false, reason: cbCheck.reason };
         } else if (cbCheck.parked) {
@@ -2403,7 +2412,7 @@ async function runRevalidation() {
               `⚠️ ${bot.botName}: close attempt failed\n\n` +
               `Revalidation tried to close this position but couldn't verify the deal closed on Binance. ` +
               `The bot is still tracked and protected by revalidation — will retry next cycle.\n\n` +
-              `${istTimestamp()}`
+              `${timestampDual()}`
             ).catch(() => {});
           }
         } catch (processErr) {
@@ -2448,7 +2457,7 @@ async function runRevalidation() {
         } else if (flipResult) {
           alertMsg += `\n\n⏸️ Didn't flip to the other direction: ${flipResult.reason}`;
         }
-        alertMsg += `\n\n${istTimestamp()}`;
+        alertMsg += `\n\n${timestampDual()}`;
 
         sendTelegramAlert(alertMsg).catch(() => {});
       }
@@ -2578,7 +2587,7 @@ async function runSelfHeal() {
               `${reconcileGate.reason}\n\n` +
               `Entry: $${pos.entryPrice?.toFixed(2) || '?'} | PnL: $${pos.pnl?.toFixed(2) || '?'}\n` +
               `Position closed and bot stopped.\n\n` +
-              `${istTimestamp()}`
+              `${timestampDual()}`
             ).catch(() => {});
           }
         } catch (gateErr) {
@@ -2591,13 +2600,13 @@ async function runSelfHeal() {
             ? `🚨 Direction mismatch fixed: ${base}\n\n` +
               `Relay was tracking ${oppositeDir} but Binance shows ${pos.side}.\n` +
               `Re-tracked to match the actual exchange position.\n\n` +
-              `${istTimestamp()}`
+              `${timestampDual()}`
             : `🔍 Exchange reconciliation: ${base} ${pos.side}\n\n` +
               `Found a ${pos.side} position on Binance for ${base} that the relay didn't know about.\n` +
               `Entry: $${pos.entryPrice?.toFixed(2) || '?'} | PnL: $${pos.pnl?.toFixed(2) || '?'}\n\n` +
               `Gate-check: PASSED ✅ — position validated against all gates.\n` +
               `Now tracked with full drawdown + revalidation protection.\n\n` +
-              `${istTimestamp()}`
+              `${timestampDual()}`
         ).catch(() => {});
         }
       }
@@ -2617,7 +2626,7 @@ async function runSelfHeal() {
                 `🧹 Stale tracking cleaned: ${info.botName}\n\n` +
                 `Relay was monitoring ${pair} ${info.direction} but Binance has no position and CCXT shows 0 active deals.\n` +
                 `Removed from tracking — pair is now available for re-entry.\n\n` +
-                `${istTimestamp()}`
+                `${timestampDual()}`
               ).catch(() => {});
             }
           }
@@ -2668,7 +2677,7 @@ async function runSelfHeal() {
             `Found a ${dir} deal still open on Binance but NOT being monitored by the relay. ` +
             `This can happen when a direction flip fails to close the old deal.\n\n` +
             `The relay is now monitoring this position with full revalidation + drawdown protection.\n\n` +
-            `${istTimestamp()}`
+            `${timestampDual()}`
           ).catch(() => {});
         }
       }
@@ -2820,7 +2829,7 @@ async function checkCrossoverProximity() {
         `RSI: ${d.rsi14 || '?'}\n` +
         `Current trend: ${d.trend}\n` +
         `Next signal: ${d.nextSignal}\n\n` +
-        `${istTimestamp()} IST`
+        `${timestampDual()}`
       ).catch(() => {});
 
       log(`📐 Crossover proximity alert: ${pair} at ${d.probability}% (ETA: ${timeEst})`);
@@ -2872,7 +2881,7 @@ function checkWhaleHealth() {
   lastWhaleHealthDate = today;
   const msg = `🐋 Whale wallet health alert\n\n` +
     alerts.map(a => `⚠️ ${a.message}`).join('\n') +
-    `\n\nGate 5 may be degraded — these wallets aren't providing data for our coins.\n\n${istTimestamp()}`;
+    `\n\nGate 5 may be degraded — these wallets aren't providing data for our coins.\n\n${timestampDual()}`;
   sendTelegramAlert(msg).catch(() => {});
   log(`🐋 Whale wallet staleness alert sent: ${alerts.map(a => a.label).join(', ')}`);
 }
@@ -2958,7 +2967,7 @@ async function handleTelegramCommand(text, chatId) {
       }
     }
 
-    lines.push(`\n${istTimestamp()} IST`);
+    lines.push(`\n${timestampDual()}`);
     return lines.join('\n');
   }
 
@@ -2983,7 +2992,7 @@ async function handleTelegramCommand(text, chatId) {
       `Active bots: ${activeCount} (${activePairs})`,
       `Circuit breaker: ${cbParked.length > 0 ? '⚠️ Parked: ' + cbParked.join(', ') : '✅ Clear'}`,
       `API: ${exchangeApi.isConfigured() ? '✅' : '❌'}`,
-      `\n${istTimestamp()} IST`,
+      `\n${timestampDual()}`,
     ];
     return statusLines.join('\n');
   }
@@ -2996,7 +3005,7 @@ async function handleTelegramCommand(text, chatId) {
       const extra = active ? ` — ${active.direction} since ${active.startedAt?.substring(11, 16) || '?'} UTC` : '';
       botLines.push(`${icon} ${botInfo.name}${extra}`);
     }
-    botLines.push(`\n${istTimestamp()} IST`);
+    botLines.push(`\n${timestampDual()}`);
     return botLines.join('\n');
   }
 
@@ -3040,7 +3049,7 @@ async function handleTelegramCommand(text, chatId) {
           }
         }
       }
-      lines.push(`\n${istTimestamp()} IST`);
+      lines.push(`\n${timestampDual()}`);
       return lines.join('\n');
     } catch (err) {
       return `❌ Binance test error: ${err.message}`;
@@ -3058,7 +3067,7 @@ async function handleTelegramCommand(text, chatId) {
   if (cmd === '/whales') {
     const status = tradeJournal.getWhaleWalletStatus();
     if (typeof status === 'object' && !Array.isArray(status)) {
-      return `🐋 <b>Whale Wallets</b>\n\n${status.status}\n\n${istTimestamp()} IST`;
+      return `🐋 <b>Whale Wallets</b>\n\n${status.status}\n\n${timestampDual()}`;
     }
     let lines = ['🐋 <b>Whale Wallet Health</b>\n'];
     for (const w of status) {
@@ -3070,7 +3079,7 @@ async function handleTelegramCommand(text, chatId) {
       lines.push('\n⚠️ <b>Stale Alerts:</b>');
       for (const a of alerts) lines.push(`  ${a.message}`);
     }
-    lines.push(`\n${istTimestamp()} IST`);
+    lines.push(`\n${timestampDual()}`);
     return lines.join('\n');
   }
 
@@ -3110,7 +3119,7 @@ async function handleTelegramCommand(text, chatId) {
         );
       }
 
-      lines.push(`\n${istTimestamp()} IST`);
+      lines.push(`\n${timestampDual()}`);
       return lines.join('\n');
     } catch (err) {
       log(`❌ /crossover error: ${err.message}`);
@@ -3124,7 +3133,7 @@ async function handleTelegramCommand(text, chatId) {
     PAUSED = true;
     PAUSED_AT = new Date().toISOString();
     log('⏸️ PAUSED via Telegram command');
-    return `⏸️ <b>Relay PAUSED</b>\n\nNo new signals will be processed.\nActive positions remain monitored by self-heal.\n\nSend /resume to go live again.\n\n${istTimestamp()} IST`;
+    return `⏸️ <b>Relay PAUSED</b>\n\nNo new signals will be processed.\nActive positions remain monitored by self-heal.\n\nSend /resume to go live again.\n\n${timestampDual()}`;
   }
 
   if (cmd === '/resume') {
@@ -3135,7 +3144,7 @@ async function handleTelegramCommand(text, chatId) {
     PAUSED_AT = null;
     PAUSED_ALERT_LAST = 0; // v4.0.2: Reset paused alert cooldown
     log('▶️ RESUMED via Telegram command');
-    return `▶️ <b>Relay RESUMED</b>\n\n${skipped} signal(s) were skipped while paused.\nNow processing incoming TradingView signals.\n\n${istTimestamp()} IST`;
+    return `▶️ <b>Relay RESUMED</b>\n\n${skipped} signal(s) were skipped while paused.\nNow processing incoming TradingView signals.\n\n${timestampDual()}`;
   }
 
   if (cmd === '/kill' || cmd === '/closeall') {
@@ -3152,7 +3161,7 @@ async function handleTelegramCommand(text, chatId) {
     }
     for (const uuid of Object.keys(ACTIVE_BOTS)) delete ACTIVE_BOTS[uuid];
     const summary = Object.values(prevBots).map(b => `• ${b.pair} ${b.direction}`).join('\n') || 'None were tracked';
-    return `🚨 <b>KILL SWITCH complete</b>\n\nDeals closed: ${closed}\nBots stopped: ${stopped}\nRelay: PAUSED\n\n${summary}\n\nSend /resume when ready.\n\n${istTimestamp()} IST`;
+    return `🚨 <b>KILL SWITCH complete</b>\n\nDeals closed: ${closed}\nBots stopped: ${stopped}\nRelay: PAUSED\n\n${summary}\n\nSend /resume when ready.\n\n${timestampDual()}`;
   }
 
   // Unknown command — show help
@@ -3418,7 +3427,7 @@ async function recoverActiveState() {
         parts.push(warnings.join('\n'));
       }
 
-      parts.push(`\n${istTimestamp()}`);
+      parts.push(`\n${timestampDual()}`);
       const msg = parts.join('\n');
 
       log(`🔄 Startup recovery: ✅ recovered ${recovered.length} bot(s), ${warnings.length} warning(s)`);
@@ -3428,7 +3437,7 @@ async function recoverActiveState() {
       sendTelegramAlert(
         `🔄 Startup recovery\n\n` +
         `Server restarted. No active positions found — system is flat.\n\n` +
-        `${istTimestamp()}`
+        `${timestampDual()}`
       ).catch(() => {});
     }
   } catch (err) {
@@ -3474,7 +3483,7 @@ app.listen(PORT, async () => {
             `Error: ${msg.substring(0, 200)}\n\n` +
             `The IP may have changed. Update the Binance API key whitelist to include this IP.\n` +
             `Ghost detection will not work until this is fixed.\n\n` +
-            `${istTimestamp()}`
+            `${timestampDual()}`
           ).catch(() => {});
         } else {
           log(`⚠ Binance API: non-auth error — ${msg.substring(0, 200)}`);
