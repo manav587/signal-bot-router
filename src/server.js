@@ -12,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.20';
+const VERSION = '5.0.21';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -116,7 +116,7 @@ const CONSECUTIVE_LOSSES = {};
 // the trend reversal that pays for all of them.
 // Set to Infinity to disable (code stays intact for re-enable).
 // Was: 3 losses → park 30min (v4.0.1)
-const MAX_CONSECUTIVE_LOSSES = Infinity;
+const MAX_CONSECUTIVE_LOSSES = 5;  // v5.0.21 overnight: auto-pause after 5 losses in a row (single winner resets counter)
 const LOSS_PARK_MS = 30 * 60 * 1000; // kept for reference
 
 function recordDealClose(pair, isLoss) {
