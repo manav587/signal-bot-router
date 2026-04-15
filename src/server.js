@@ -12,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.21';
+const VERSION = '5.0.22';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -119,11 +119,35 @@ const CONSECUTIVE_LOSSES = {};
 const MAX_CONSECUTIVE_LOSSES = 5;  // v5.0.21 overnight: auto-pause after 5 losses in a row (single winner resets counter)
 const LOSS_PARK_MS = 30 * 60 * 1000; // kept for reference
 
+// v5.0.22: GLOBAL consecutive-loss counter (across all pairs) → system-level PAUSE.
+// Per-pair counter above parks individual pairs. This one is the hard cap.
+// Max overnight loss = GLOBAL_LOSS_CAP × (POSITION_SIZE × Math.abs(SL_PERCENT/100))
+//                    = 5 × (500 × 0.01)
+//                    = \$25
+let GLOBAL_CONSECUTIVE_LOSSES = 0;
+const GLOBAL_LOSS_CAP = 5;
+
 function recordDealClose(pair, isLoss) {
   if (!CONSECUTIVE_LOSSES[pair]) CONSECUTIVE_LOSSES[pair] = { count: 0, parkedUntil: null };
   if (isLoss) {
     CONSECUTIVE_LOSSES[pair].count++;
-    log(`📉 ${pair}: consecutive loss #${CONSECUTIVE_LOSSES[pair].count}`);
+    GLOBAL_CONSECUTIVE_LOSSES++;
+    log(`📉 ${pair}: consecutive loss #${CONSECUTIVE_LOSSES[pair].count} (global streak: ${GLOBAL_CONSECUTIVE_LOSSES}/${GLOBAL_LOSS_CAP})`);
+
+    // v5.0.22 GLOBAL HARD CAP — pause the whole system
+    if (GLOBAL_CONSECUTIVE_LOSSES >= GLOBAL_LOSS_CAP && !PAUSED) {
+      PAUSED = true;
+      PAUSED_AT = new Date().toISOString();
+      log(`🚨 GLOBAL LOSS CAP HIT — ${GLOBAL_CONSECUTIVE_LOSSES} losses in a row across all pairs. System PAUSED.`);
+      sendTelegramAlert(
+        `🚨 <b>System auto-paused</b>\n\n` +
+        `${GLOBAL_CONSECUTIVE_LOSSES} consecutive losses across all pairs hit the global hard cap. ` +
+        `Trading is halted to prevent further drawdown.\n\n` +
+        `Review the journal, then /resume when you're ready.\n\n` +
+        `${timestampDual()}`
+      ).catch(() => {});
+    }
+
     if (CONSECUTIVE_LOSSES[pair].count >= MAX_CONSECUTIVE_LOSSES) {
       CONSECUTIVE_LOSSES[pair].parkedUntil = Date.now() + LOSS_PARK_MS;
       const resumeTime = new Date(CONSECUTIVE_LOSSES[pair].parkedUntil).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
@@ -133,6 +157,10 @@ function recordDealClose(pair, isLoss) {
   } else {
     if (CONSECUTIVE_LOSSES[pair]?.count > 0) {
       log(`✅ ${pair}: win — resetting consecutive loss counter (was ${CONSECUTIVE_LOSSES[pair].count})`);
+    }
+    if (GLOBAL_CONSECUTIVE_LOSSES > 0) {
+      log(`✅ Global loss streak broken — resetting (was ${GLOBAL_CONSECUTIVE_LOSSES})`);
+      GLOBAL_CONSECUTIVE_LOSSES = 0;
     }
     CONSECUTIVE_LOSSES[pair].count = 0;
     CONSECUTIVE_LOSSES[pair].parkedUntil = null;
@@ -972,6 +1000,7 @@ app.get('/', (req, res) => {
     fundingStrategy: fundingStrategy.getConfig(),
     circuitBreaker: { flipThreshold: CB_FLIP_THRESHOLD, windowMs: CB_WINDOW_MS, parkMs: CB_PARK_MS, state: CIRCUIT_BREAKER },
     consecutiveLossBreaker: { maxLosses: MAX_CONSECUTIVE_LOSSES, parkMs: LOSS_PARK_MS, state: CONSECUTIVE_LOSSES },
+    globalLossBreaker: { cap: GLOBAL_LOSS_CAP, current: GLOBAL_CONSECUTIVE_LOSSES },
     flipCooldowns: FLIP_COOLDOWN,
     recoveryLocks: RECOVERY_LOCK,
     gatePending: GATE_PENDING,
