@@ -11,7 +11,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.12';
+const VERSION = '5.0.13';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -785,6 +785,17 @@ async function verifyCloseAllDeals(closeAction, targetBot, requestId) {
 // ── Process actions sequentially with delays ─────────────────────────────
 
 async function processActions(actions, requestId, isRetry = false, context = {}) {
+  // v5.0.13: Hard gate on PAUSED. The /webhook HTTP entry point checks
+  // PAUSED before calling us, but internal callers (reval SL=FLIP, deferred
+  // retries) bypass that gate and could open positions while paused.
+  // Anything that would open/close/change an exchange position goes through
+  // this function, so gating here stops ALL trade-opening paths during pause.
+  if (PAUSED) {
+    const actionList = actions.map(a => `${a.action}(${(a.uuid || '').substring(0, 8)})`).join(' → ');
+    log(`[${requestId}] ⏸️ PAUSED — blocking internal action: ${actionList}`);
+    return;
+  }
+
   // v4.1.0: Bots use startCondition=Manual, relay creates deals via REST API.
   // Webhook startBot activates the bot; createDeal opens a deal immediately.
   // After TP/SL, bot sits idle (Manual = no auto-restart) until next crossover signal.
