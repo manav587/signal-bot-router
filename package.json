@@ -1,6 +1,6 @@
 {
   "name": "signal-bot-router",
-  "version": "5.0.14",
+  "version": "5.0.15",
   "description": "Webhook relay for TradingView to Binance Futures via CCXT (direct, no Gainium)",
   "main": "src/server.js",
   "scripts": {

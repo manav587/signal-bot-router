@@ -35,8 +35,8 @@ const BOT_MAP = {
   '69c91263-68c9-4f88-a543-7c319b5fde8b': { pair: 'ETHUSDT', direction: 'SHORT', mongoId: '69ce1dca228af151def7fa03', name: 'ETH Short v2' },
   'eb74f76c-c6ec-48c2-a74d-d9fd27c2fab5': { pair: 'XRPUSDT', direction: 'LONG', mongoId: '69ce1dcc228af151def7fa3c', name: 'XRP Long v2' },
   '2751574b-cc46-4f62-bd01-cb404c21f8d7': { pair: 'XRPUSDT', direction: 'SHORT', mongoId: '69ce1dcd228af151def7fab8', name: 'XRP Short v2' },
-  '21c9985a-db38-4409-af79-26f389d32d0a': { pair: 'BTCUSDT', direction: 'LONG', mongoId: '69ce1dcf228af151def7faf7', name: 'BTC Long v2' },
-  'd0ea54dc-7218-4662-b2bf-0c66f4be9e44': { pair: 'BTCUSDT', direction: 'SHORT', mongoId: '69ce1dd1228af151def7fb2e', name: 'BTC Short v2' },
+  'd0ea54dc-7218-4666-8c81-85bcd0271a3f': { pair: 'BTCUSDT', direction: 'LONG', mongoId: '69ce1dcf228af151def7faf7', name: 'BTC Long v2' },
+  '21c9985a-db38-440d-9313-ac13825852be': { pair: 'BTCUSDT', direction: 'SHORT', mongoId: '69ce1dd1228af151def7fb2e', name: 'BTC Short v2' },
 };
 
 // Reverse mappings
