@@ -12,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.16';
+const VERSION = '5.0.17';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -3473,21 +3473,47 @@ async function handleEnter(args, chatId) {
   const verdictLine = renderVerdict(dir, v);
   const priceStr = markPrice ? `$${markPrice.toFixed(4)}` : 'unknown';
   const qtyStr = qty ? qty.toFixed(4) : '?';
-  const slStr = slPrice ? `$${slPrice.toFixed(4)}` : '?';
+  const slStr = slPrice ? `$${slPrice.toFixed(2)}` : '?';
+
+  const TP_TARGET_USD = 10;
+  const maxLoss = size * (Math.abs(MANUAL_SL_PERCENT) / 100);
+  const tpPct = (TP_TARGET_USD / size) * 100;
+  const tpMul = dir === 'LONG' ? (1 + tpPct / 100) : (1 - tpPct / 100);
+  const tpPrice = markPrice ? markPrice * tpMul : null;
+  const tpStr = tpPrice ? `$${tpPrice.toFixed(2)}` : '?';
+  const margin = size / MANUAL_LEVERAGE;
+
+  // Balance
+  let balanceStr = '';
+  try {
+    const ccxt = require('ccxt');
+    const ex = new ccxt.binanceusdm({
+      apiKey: process.env.BINANCE_API_KEY,
+      secret: process.env.BINANCE_API_SECRET,
+    });
+    const bal = await ex.fetchBalance();
+    const lossPct = (maxLoss / bal.total.USDT) * 100;
+    const freeAfter = bal.total.USDT - margin;
+    balanceStr = `Balance $${bal.total.USDT.toFixed(2)} · max loss is ${lossPct.toFixed(2)}% · $${freeAfter.toFixed(2)} free after entry`;
+  } catch (e) { /* non-fatal */ }
+
   return [
     `<b>🎯 Pre-entry check · ${pair} ${dir}</b>`,
+    balanceStr,
     ``,
     `${verdictLine}`,
     `Score: ${score}/100${v.allowed ? '' : ' (gates would REJECT — override possible)'}`,
     ``,
     `<b>💼 About to open</b>`,
-    `${bot.name} · ${qtyStr} ${pair.replace('USDT','')} @ ~${priceStr}`,
-    `$${size} notional · ${MANUAL_LEVERAGE}x isolated · SL ${slStr} (${MANUAL_SL_PERCENT}%)`,
+    `${bot.name} · ${qtyStr} ${pair} @ ~${priceStr}`,
+    `$${size} notional · ${MANUAL_LEVERAGE}x isolated · margin $${margin.toFixed(2)}`,
+    `SL ${slStr} (${MANUAL_SL_PERCENT}%)   max loss -$${maxLoss.toFixed(2)}`,
+    `TP ${tpStr} (+${tpPct.toFixed(2)}%) target +$${TP_TARGET_USD.toFixed(2)}`,
     ``,
     `Reply <b>/yes</b> within 60 s to execute.`,
     ``,
     timestampDual(),
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 async function executeManualEnter(payload, chatId) {
@@ -3636,11 +3662,31 @@ async function handleRace(args, chatId) {
     }).filter(Boolean),
   });
 
+  // Fetch balance for context
+  let balanceUsdt = null;
+  try {
+    const ccxt = require('ccxt');
+    const ex = new ccxt.binanceusdm({
+      apiKey: process.env.BINANCE_API_KEY,
+      secret: process.env.BINANCE_API_SECRET,
+    });
+    const bal = await ex.fetchBalance();
+    balanceUsdt = bal.total.USDT;
+  } catch (e) { /* non-fatal */ }
+
+  // Relay TP constant (from server.js — hardcoded elsewhere)
+  const TP_TARGET_USD = 10;
+  const maxLossPerPos = MANUAL_POSITION_SIZE * (Math.abs(MANUAL_SL_PERCENT) / 100);
+  const totalMaxLoss = maxLossPerPos * proposed.length;
+  const totalTpPotential = TP_TARGET_USD * proposed.length;
+
   const lines = [
     `🏇 <b>Race scan</b> · ${proposed.length} horse${proposed.length === 1 ? '' : 's'} proposed`,
+    balanceUsdt !== null ? `Balance: $${balanceUsdt.toFixed(2)}` : '',
     ``,
     `<b>Top setups</b>`,
-  ];
+  ].filter(Boolean);
+
   for (const [i, r] of proposed.entries()) {
     lines.push(`   ${i + 1}. <b>${r.pair} ${r.dir}</b> · score ${r.score}`);
     lines.push(`      ${renderVerdict(r.dir, r.v)}`);
@@ -3655,14 +3701,44 @@ async function handleRace(args, chatId) {
     lines.push('', `<i>Disqualified: ${dqPairs}</i>`);
   }
 
-  lines.push(
-    '',
-    `<b>💼 Proposed entries</b> (top ${proposed.length})`,
-    ...proposed.map(r => `   ${r.pair} ${r.dir} · $${MANUAL_POSITION_SIZE} @ ~${r.v.data?.currentPrice ? '$' + r.v.data.currentPrice.toFixed(2) : '?'}`),
-    '',
-    `Total notional: $${totalNotional.toLocaleString('en-GB')}`,
-    `Total margin: $${totalMargin.toLocaleString('en-GB')} at ${MANUAL_LEVERAGE}x isolated`,
-  );
+  lines.push('', `<b>💼 Proposed entries</b>`);
+  for (const r of proposed) {
+    const price = r.v.data?.currentPrice;
+    if (!price) {
+      lines.push(`   ${r.pair} ${r.dir} — price unavailable`);
+      continue;
+    }
+    // Quantity calc — match createDeal logic
+    const rawQty = MANUAL_POSITION_SIZE / price;
+    // SL price
+    const slMul = r.dir === 'LONG' ? (1 + MANUAL_SL_PERCENT / 100) : (1 - MANUAL_SL_PERCENT / 100);
+    const slPrice = price * slMul;
+    // TP price — need the move that generates $10 profit
+    // For a $1500 notional: $10 profit = 0.667% price move in direction
+    const tpPct = (TP_TARGET_USD / MANUAL_POSITION_SIZE) * 100;
+    const tpMul = r.dir === 'LONG' ? (1 + tpPct / 100) : (1 - tpPct / 100);
+    const tpPrice = price * tpMul;
+
+    const pairCcy = r.pair.replace('USDT', '');
+    lines.push(`   <b>${r.pair} ${r.dir}</b>  ${rawQty.toFixed(4)} ${pairCcy} @ $${price.toFixed(2)}`);
+    lines.push(`      SL $${slPrice.toFixed(2)} (${MANUAL_SL_PERCENT}%)  max loss -$${maxLossPerPos.toFixed(2)}`);
+    lines.push(`      TP $${tpPrice.toFixed(2)} (+${tpPct.toFixed(2)}%) target +$${TP_TARGET_USD.toFixed(2)}`);
+  }
+
+  lines.push('', `<b>Totals</b>`);
+  lines.push(`   Notional      $${totalNotional.toLocaleString('en-GB')}`);
+  lines.push(`   Margin        $${totalMargin.toLocaleString('en-GB')}   (at ${MANUAL_LEVERAGE}x isolated)`);
+  if (balanceUsdt !== null) {
+    const lossPctBal = (totalMaxLoss / balanceUsdt) * 100;
+    const tpPctBal = (totalTpPotential / balanceUsdt) * 100;
+    lines.push(`   Max loss     -$${totalMaxLoss.toFixed(2)}  (${lossPctBal.toFixed(2)}% of balance if all SL hit)`);
+    lines.push(`   TP potential +$${totalTpPotential.toFixed(2)}  (${tpPctBal.toFixed(2)}% of balance if all reach TP)`);
+    const freeAfter = balanceUsdt - totalMargin;
+    lines.push(`   Balance after $${freeAfter.toFixed(2)}   free margin remains`);
+  } else {
+    lines.push(`   Max loss     -$${totalMaxLoss.toFixed(2)}  (if all SL hit)`);
+    lines.push(`   TP potential +$${totalTpPotential.toFixed(2)}  (if all reach TP)`);
+  }
 
   // Correlation nudge
   if (proposed.length > 1) {
