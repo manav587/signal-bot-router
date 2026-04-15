@@ -635,4 +635,7 @@ module.exports = {
   ensureBotOpen,
   createDeal,
   BOT_MAP,
+  POSITION_SIZE_USDT,
+  LEVERAGE,
+  SL_PERCENT,
 };

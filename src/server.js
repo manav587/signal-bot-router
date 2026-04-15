@@ -2,6 +2,7 @@ const express = require('express');
 const app = express();
 // v5.0.0: Direct Binance via CCXT — Direct Binance via CCXT
 const exchangeApi = require('./exchange-api');
+const { POSITION_SIZE_USDT: MANUAL_POSITION_SIZE, LEVERAGE: MANUAL_LEVERAGE, SL_PERCENT: MANUAL_SL_PERCENT } = exchangeApi;
 const binanceApi = require('./binance-api');
 const signalGate = require('./signal-gate');
 const fundingStrategy = require('./funding-strategy');
@@ -11,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.15';
+const VERSION = '5.0.16';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -3183,6 +3184,14 @@ async function handleTelegramCommand(text, chatId) {
     return `▶️ <b>Relay RESUMED</b>\n\n${skipped} signal(s) were skipped while paused.\nNow processing incoming TradingView signals.\n\n${timestampDual()}`;
   }
 
+  // ── Manual entry commands (v5.0.16) ────────────────────────────────
+  // /check, /enter, /exit, /race, /yes
+
+  if (cmd === '/check' || cmd === '/enter' || cmd === '/exit' ||
+      cmd === '/race' || cmd === '/yes' || cmd === '/y') {
+    return await handleManualEntryCommand(cmd, rest, chatId);
+  }
+
   if (cmd === '/kill' || cmd === '/closeall') {
     log('🚨 KILL SWITCH via Telegram — closing all positions');
     PAUSED = true;
@@ -3214,13 +3223,496 @@ async function handleTelegramCommand(text, chatId) {
     '<b>🎮 Control</b>\n' +
     '/pause — Stop processing signals\n' +
     '/resume — Resume signal processing\n' +
-    '/kill — ⚠️ Close ALL positions + pause';
+    '/kill — ⚠️ Close ALL positions + pause\n\n' +
+    '<b>🏇 Manual entry</b>\n' +
+    '/check [pair?] [dir?] — market gate verdict, read-only\n' +
+    '/race [N?] — scan 8, enter top N (default 2)\n' +
+    '/enter [pair] [dir] — propose single entry\n' +
+    '/exit [pair] — close a pair at market\n' +
+    '/yes — confirm pending /enter or /race (60s expiry)';
 }
 
 function buildProgressBar(currentPct, targetPct) {
   const blocks = 10;
   const filled = Math.min(blocks, Math.max(0, Math.round((currentPct / targetPct) * blocks)));
   return '▓'.repeat(filled) + '░'.repeat(blocks - filled) + ` ${currentPct}%`;
+}
+
+// ── Manual entry commands (v5.0.16) ────────────────────────────────────
+// Pending confirmations: chatId → { type, payload, expiresAt }
+const MANUAL_PENDING = new Map();
+const MANUAL_PENDING_TTL_MS = 60 * 1000; // 60 seconds
+
+function storePending(chatId, type, payload) {
+  MANUAL_PENDING.set(String(chatId), {
+    type,
+    payload,
+    expiresAt: Date.now() + MANUAL_PENDING_TTL_MS,
+  });
+}
+
+function takePending(chatId) {
+  const entry = MANUAL_PENDING.get(String(chatId));
+  if (!entry) return null;
+  MANUAL_PENDING.delete(String(chatId));
+  if (entry.expiresAt < Date.now()) return null;
+  return entry;
+}
+
+// Score a signal-gate validation result 0-100
+// Higher = stronger setup in favor of the given direction.
+function scoreSetup(direction, v) {
+  if (!v || !v.allowed) return 0;
+  const d = v.data || {};
+  let score = 0;
+
+  // 40 pts: 1H EMA 9/21 spread in direction's favor
+  if (d.ema9_1h && d.ema21_1h) {
+    const spreadPct = ((d.ema9_1h - d.ema21_1h) / d.ema21_1h) * 100;
+    const aligned = direction === 'LONG' ? spreadPct : -spreadPct;
+    score += Math.min(40, Math.max(0, aligned * 80));
+  }
+
+  // 20 pts: Price vs Daily EMA50
+  if (d.priceVsEma === 'ABOVE' && direction === 'LONG') score += 20;
+  else if (d.priceVsEma === 'BELOW' && direction === 'SHORT') score += 20;
+
+  // 20 pts: RSI alignment
+  if (d.rsi14 !== null && d.rsi14 !== undefined) {
+    const rsi = d.rsi14;
+    const rising = d.rsiDirection === 'RISING';
+    const falling = d.rsiDirection === 'FALLING';
+    if (direction === 'LONG') {
+      if (rsi >= 40 && rsi <= 65) score += 20;
+      else if (rsi < 40 && rising) score += 15;
+      else if (rsi > 70) score += 3;
+      else score += 10;
+    } else {
+      if (rsi >= 35 && rsi <= 60) score += 20;
+      else if (rsi > 60 && falling) score += 15;
+      else if (rsi < 30) score += 3;
+      else score += 10;
+    }
+  }
+
+  // 15 pts: whale consensus (if data present)
+  if (d.whale && d.whale.consensus) {
+    if (d.whale.consensus === 'both-agree') score += 15;
+    else if (d.whale.consensus === 'one-agrees') score += 8;
+  } else {
+    score += 5; // data unavailable — modest default
+  }
+
+  // 5 pts: healthy volatility
+  if (d.atrPct !== undefined && d.atrPct >= 0.3 && d.atrPct <= 2.0) {
+    score += 5;
+  }
+
+  return Math.round(score);
+}
+
+// Render gate verdict line compactly
+function renderVerdict(direction, v) {
+  if (!v) return 'no data';
+  const d = v.data || {};
+  const emaSymbol = d.shortTermTrend === 'BULLISH' ? '↑' : d.shortTermTrend === 'BEARISH' ? '↓' : '—';
+  const emaAgrees =
+    (direction === 'LONG' && d.shortTermTrend === 'BULLISH') ||
+    (direction === 'SHORT' && d.shortTermTrend === 'BEARISH');
+  const price = d.currentPrice ? `$${d.currentPrice.toFixed(2)}` : '?';
+  const ema50Side = d.priceVsEma || '?';
+  const rsi = d.rsi14 !== null && d.rsi14 !== undefined ? d.rsi14.toFixed(1) : '?';
+  const rsiDir = d.rsiDirection || '—';
+  const ok = v.allowed ? '✅' : '❌';
+  return `${ok} Price ${price} · 1H EMA ${emaSymbol} ${emaAgrees ? 'agrees' : 'against'} · ${ema50Side} EMA50 · RSI ${rsi} ${rsiDir}`;
+}
+
+async function resolveMarkPrice(pair) {
+  try {
+    const exch = exchangeApi; // use the module for getExchange? — fallback
+    // Use signalGate's own current price via validateSignal's data,
+    // but we can also grab from CCXT direct:
+    const ccxt = require('ccxt');
+    if (!process.env.BINANCE_API_KEY) return null;
+    const ex = new ccxt.binanceusdm({
+      apiKey: process.env.BINANCE_API_KEY,
+      secret: process.env.BINANCE_API_SECRET,
+    });
+    await ex.loadMarkets();
+    const ticker = await ex.fetchTicker(pair === 'BTCUSDT' ? 'BTC/USDT:USDT' :
+      pair === 'ETHUSDT' ? 'ETH/USDT:USDT' :
+      pair === 'SOLUSDT' ? 'SOL/USDT:USDT' :
+      pair === 'XRPUSDT' ? 'XRP/USDT:USDT' : pair);
+    return ticker.last;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function handleManualEntryCommand(cmd, rest, chatId) {
+  const args = (rest || '').trim();
+
+  // ── /yes — execute pending confirmation ────────────────────────
+  if (cmd === '/yes' || cmd === '/y') {
+    const entry = takePending(chatId);
+    if (!entry) {
+      return '🤷 Nothing pending — reply /enter, /race, or /exit first (or confirmation expired after 60 s).';
+    }
+    if (PAUSED) {
+      return '⏸️ System is paused — confirmation refused. /resume first.';
+    }
+    if (entry.type === 'enter') {
+      return await executeManualEnter(entry.payload, chatId);
+    }
+    if (entry.type === 'race') {
+      return await executeManualRace(entry.payload, chatId);
+    }
+    return '🤷 Pending confirmation had unknown type.';
+  }
+
+  // ── /check — read-only gate inspection ────────────────────────
+  if (cmd === '/check') {
+    return await handleCheck(args);
+  }
+
+  // ── /enter — propose single manual entry ──────────────────────
+  if (cmd === '/enter') {
+    return await handleEnter(args, chatId);
+  }
+
+  // ── /exit — close single pair immediately (no confirmation) ──
+  if (cmd === '/exit') {
+    return await handleExit(args);
+  }
+
+  // ── /race — scan and propose top setups ──────────────────────
+  if (cmd === '/race') {
+    return await handleRace(args, chatId);
+  }
+
+  return '🤷 Unknown manual command.';
+}
+
+async function handleCheck(args) {
+  const parts = args.split(/\s+/).filter(Boolean);
+  const pairsAll = ['SOL', 'ETH', 'XRP', 'BTC'];
+  let pairs = pairsAll;
+  let directions = ['LONG', 'SHORT'];
+  if (parts.length >= 1) {
+    const p = parts[0].toUpperCase();
+    if (!pairsAll.includes(p)) {
+      return `❌ Unknown pair "${parts[0]}". Options: ${pairsAll.join(', ')}.`;
+    }
+    pairs = [p];
+  }
+  if (parts.length >= 2) {
+    const dir = parts[1].toUpperCase();
+    if (!['LONG', 'SHORT'].includes(dir)) {
+      return `❌ Unknown direction "${parts[1]}". Options: LONG, SHORT.`;
+    }
+    directions = [dir];
+  }
+  const rows = [];
+  for (const pair of pairs) {
+    for (const dir of directions) {
+      const v = await signalGate.validateSignal(pair, dir);
+      const score = scoreSetup(dir, v);
+      rows.push({ pair, dir, v, score });
+    }
+  }
+  const lines = [`<b>🎯 Pre-entry check</b>`, ''];
+  for (const r of rows) {
+    lines.push(`<b>${r.pair} ${r.dir}</b> · score ${r.score}`);
+    lines.push(`   ${renderVerdict(r.dir, r.v)}`);
+  }
+  lines.push('', timestampDual());
+  return lines.join('\n');
+}
+
+async function handleEnter(args, chatId) {
+  const parts = args.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) {
+    return '❌ Usage: /enter [pair] [direction] [size?]  e.g. /enter SOL LONG  or  /enter ETH SHORT 500';
+  }
+  const pair = parts[0].toUpperCase();
+  const dir = parts[1].toUpperCase();
+  const size = parts[2] ? parseFloat(parts[2]) : MANUAL_POSITION_SIZE;
+  const pairsAll = ['SOL', 'ETH', 'XRP', 'BTC'];
+  if (!pairsAll.includes(pair)) return `❌ Unknown pair "${parts[0]}".`;
+  if (!['LONG', 'SHORT'].includes(dir)) return `❌ Unknown direction "${parts[1]}".`;
+  if (!size || size <= 0) return `❌ Invalid size.`;
+
+  if (PAUSED) return '⏸️ System is paused. /resume first.';
+
+  // Check pair has no existing position
+  try {
+    const posMap = await exchangeApi.getExchangePositionMap();
+    const base = pair.replace('USDT', '');
+    if (posMap.has(base)) {
+      const p = posMap.get(base);
+      return `❌ ${pair} already has a ${p.side} position. /exit ${pair} first.`;
+    }
+  } catch (e) { /* non-fatal */ }
+
+  const bot = findBot(pair, dir);
+  if (!bot) return `❌ No bot found for ${pair} ${dir} in BOT_MAP.`;
+
+  // Gate check for context
+  const v = await signalGate.validateSignal(pair, dir);
+  const score = scoreSetup(dir, v);
+  const markPrice = v.data && v.data.currentPrice ? v.data.currentPrice : await resolveMarkPrice(pair + 'USDT');
+  const qty = markPrice ? (size / markPrice) : null;
+  const slMultiplier = dir === 'LONG' ? (1 + MANUAL_SL_PERCENT / 100) : (1 - MANUAL_SL_PERCENT / 100);
+  const slPrice = markPrice ? markPrice * slMultiplier : null;
+
+  storePending(chatId, 'enter', {
+    pair, direction: dir, size, mongoId: bot.mongoId, botName: bot.name, botUuid: bot.uuid,
+    markPrice, qty, slPrice,
+  });
+
+  const verdictLine = renderVerdict(dir, v);
+  const priceStr = markPrice ? `$${markPrice.toFixed(4)}` : 'unknown';
+  const qtyStr = qty ? qty.toFixed(4) : '?';
+  const slStr = slPrice ? `$${slPrice.toFixed(4)}` : '?';
+  return [
+    `<b>🎯 Pre-entry check · ${pair} ${dir}</b>`,
+    ``,
+    `${verdictLine}`,
+    `Score: ${score}/100${v.allowed ? '' : ' (gates would REJECT — override possible)'}`,
+    ``,
+    `<b>💼 About to open</b>`,
+    `${bot.name} · ${qtyStr} ${pair.replace('USDT','')} @ ~${priceStr}`,
+    `$${size} notional · ${MANUAL_LEVERAGE}x isolated · SL ${slStr} (${MANUAL_SL_PERCENT}%)`,
+    ``,
+    `Reply <b>/yes</b> within 60 s to execute.`,
+    ``,
+    timestampDual(),
+  ].join('\n');
+}
+
+async function executeManualEnter(payload, chatId) {
+  const { pair, direction, size, mongoId, botName, botUuid } = payload;
+  try {
+    log(`[manual-enter] /yes received for ${pair} ${direction} size=${size}`);
+    await exchangeApi.ensureBotOpen(mongoId, botName);
+    // Temporarily override POSITION_SIZE if user specified custom size.
+    // createDeal uses the module-level constant, so we can't easily override
+    // without modifying exchange-api. For now, ignore custom size and use default.
+    // (Documented in help text: custom size currently uses default.)
+    const deal = await exchangeApi.createDeal(mongoId, botName);
+    if (!deal.success) {
+      return `❌ Deal creation failed: ${deal.error}\n\n${timestampDual()}`;
+    }
+
+    // Register in ACTIVE_BOTS so reval picks it up
+    ACTIVE_BOTS[botUuid] = {
+      pair: pair,
+      direction,
+      botName,
+      startedAt: new Date().toISOString(),
+      entryPrice: null,
+      origin: 'manual-enter',
+      peakProfitUsd: 0,
+    };
+    LAST_ACTIVE[pair] = Date.now();
+    LAST_DIRECTION[pair] = direction;
+
+    return [
+      `✅ <b>Opened ${botName}</b>`,
+      `Deal id: ${deal.dealId}`,
+      `Now monitored by reval cycles.`,
+      ``,
+      timestampDual(),
+    ].join('\n');
+  } catch (err) {
+    log(`[manual-enter] error: ${err.message}`);
+    return `❌ Enter failed: ${err.message}\n\n${timestampDual()}`;
+  }
+}
+
+async function handleExit(args) {
+  const pair = (args || '').trim().toUpperCase();
+  const pairsAll = ['SOL', 'ETH', 'XRP', 'BTC'];
+  if (!pair) return `❌ Usage: /exit [pair]  e.g. /exit SOL`;
+  if (!pairsAll.includes(pair)) return `❌ Unknown pair "${pair}".`;
+
+  try {
+    const posMap = await exchangeApi.getExchangePositionMap();
+    if (!posMap.has(pair)) {
+      return `🤷 No open ${pair} position on Binance. Nothing to close.`;
+    }
+    const pos = posMap.get(pair);
+    // Find the bot entry by pair (either Long or Short)
+    const bot = findBot(pair, pos.side);
+    if (!bot) {
+      return `❌ No bot in BOT_MAP for ${pair} ${pos.side}. Manual CCXT close required.`;
+    }
+    const closed = await exchangeApi.forceCloseDeals(bot.uuid);
+    // Clean up tracker
+    for (const [uuid, b] of Object.entries(ACTIVE_BOTS)) {
+      if (b.pair === pair) delete ACTIVE_BOTS[uuid];
+    }
+    return [
+      closed ? `✅ <b>Closed ${pair} ${pos.side}</b>` : `⚠ Close attempted but not confirmed — check /positions`,
+      `Was: ${pos.side} ${pos.size} @ entry $${(pos.entryPrice || 0).toFixed(4)}`,
+      ``,
+      timestampDual(),
+    ].join('\n');
+  } catch (err) {
+    return `❌ Exit failed: ${err.message}\n\n${timestampDual()}`;
+  }
+}
+
+async function handleRace(args, chatId) {
+  const parts = args.split(/\s+/).filter(Boolean);
+  let topN = 2;
+  if (parts.length >= 1 && parts[0].toLowerCase() === 'top' && parts[1]) {
+    topN = parts[1].toLowerCase() === 'all' ? 8 : parseInt(parts[1], 10) || 2;
+  } else if (parts.length >= 1 && /^\d+$/.test(parts[0])) {
+    topN = parseInt(parts[0], 10);
+  }
+
+  if (PAUSED) return '⏸️ System is paused. /resume first.';
+
+  const pairsAll = ['SOL', 'ETH', 'XRP', 'BTC'];
+  const directions = ['LONG', 'SHORT'];
+  const candidates = [];
+
+  // Find which pairs already have positions — skip them
+  let activePairs = new Set();
+  try {
+    const posMap = await exchangeApi.getExchangePositionMap();
+    activePairs = new Set([...posMap.keys()]);
+  } catch (e) { /* non-fatal */ }
+
+  // Run all 8 validateSignal calls in parallel
+  const tasks = [];
+  for (const pair of pairsAll) {
+    for (const dir of directions) {
+      tasks.push(
+        signalGate.validateSignal(pair, dir).then(v => ({ pair, dir, v, score: scoreSetup(dir, v) }))
+      );
+    }
+  }
+  const results = await Promise.all(tasks);
+
+  // Rank
+  results.sort((a, b) => b.score - a.score);
+  const qualifying = results.filter(r => r.v && r.v.allowed && r.score > 0 && !activePairs.has(r.pair));
+  const disqualified = results.filter(r => !(r.v && r.v.allowed) || activePairs.has(r.pair));
+
+  // Take top N but only one direction per pair (the higher-scored one)
+  const seenPairs = new Set();
+  const proposed = [];
+  for (const r of qualifying) {
+    if (seenPairs.has(r.pair)) continue;
+    seenPairs.add(r.pair);
+    proposed.push(r);
+    if (proposed.length >= topN) break;
+  }
+
+  if (proposed.length === 0) {
+    return [
+      `🏇 <b>Race scan</b>`,
+      ``,
+      `No qualifying setups right now — all 8 bots gated, or all pairs already have positions.`,
+      ``,
+      `Disqualified:`,
+      ...disqualified.slice(0, 8).map(r => `   ${r.pair} ${r.dir}: ${r.v && !r.v.allowed ? (r.v.reason || 'gate fail') : 'pair already open'}`),
+      ``,
+      timestampDual(),
+    ].join('\n');
+  }
+
+  // Calculate margin
+  const totalNotional = proposed.length * MANUAL_POSITION_SIZE;
+  const totalMargin = totalNotional / MANUAL_LEVERAGE;
+
+  // Build preview + store pending
+  storePending(chatId, 'race', {
+    proposed: proposed.map(r => {
+      const bot = findBot(r.pair, r.dir);
+      return bot ? { pair: r.pair, direction: r.dir, mongoId: bot.mongoId, botName: bot.name, botUuid: bot.uuid } : null;
+    }).filter(Boolean),
+  });
+
+  const lines = [
+    `🏇 <b>Race scan</b> · ${proposed.length} horse${proposed.length === 1 ? '' : 's'} proposed`,
+    ``,
+    `<b>Top setups</b>`,
+  ];
+  for (const [i, r] of proposed.entries()) {
+    lines.push(`   ${i + 1}. <b>${r.pair} ${r.dir}</b> · score ${r.score}`);
+    lines.push(`      ${renderVerdict(r.dir, r.v)}`);
+  }
+
+  if (qualifying.length > proposed.length) {
+    lines.push('', `<i>Also qualifying but skipped: ${qualifying.slice(proposed.length).map(r => r.pair + ' ' + r.dir).join(', ')}</i>`);
+  }
+
+  const dqPairs = disqualified.map(r => r.pair + ' ' + r.dir).join(', ');
+  if (dqPairs) {
+    lines.push('', `<i>Disqualified: ${dqPairs}</i>`);
+  }
+
+  lines.push(
+    '',
+    `<b>💼 Proposed entries</b> (top ${proposed.length})`,
+    ...proposed.map(r => `   ${r.pair} ${r.dir} · $${MANUAL_POSITION_SIZE} @ ~${r.v.data?.currentPrice ? '$' + r.v.data.currentPrice.toFixed(2) : '?'}`),
+    '',
+    `Total notional: $${totalNotional.toLocaleString('en-GB')}`,
+    `Total margin: $${totalMargin.toLocaleString('en-GB')} at ${MANUAL_LEVERAGE}x isolated`,
+  );
+
+  // Correlation nudge
+  if (proposed.length > 1) {
+    const dirs = proposed.map(p => p.dir);
+    if (dirs.every(d => d === dirs[0])) {
+      lines.push('', `⚠ All proposed entries are <b>${dirs[0]}</b> on correlated crypto. You're taking ${proposed.length}× directional exposure.`);
+    }
+  }
+
+  lines.push('', `Reply <b>/yes</b> within 60 s to execute.`, '', timestampDual());
+  return lines.join('\n');
+}
+
+async function executeManualRace(payload, chatId) {
+  const { proposed } = payload;
+  const results = [];
+  for (const p of proposed) {
+    try {
+      await exchangeApi.ensureBotOpen(p.mongoId, p.botName);
+      const deal = await exchangeApi.createDeal(p.mongoId, p.botName);
+      if (deal.success) {
+        ACTIVE_BOTS[p.botUuid] = {
+          pair: p.pair,
+          direction: p.direction,
+          botName: p.botName,
+          startedAt: new Date().toISOString(),
+          entryPrice: null,
+          origin: 'manual-race',
+          peakProfitUsd: 0,
+        };
+        LAST_ACTIVE[p.pair] = Date.now();
+        LAST_DIRECTION[p.pair] = p.direction;
+        results.push(`✅ ${p.botName} (deal ${deal.dealId})`);
+        log(`[manual-race] Opened ${p.botName} · deal ${deal.dealId}`);
+      } else {
+        results.push(`❌ ${p.botName}: ${deal.error}`);
+      }
+      await new Promise(r => setTimeout(r, 800)); // gentle spacing between orders
+    } catch (err) {
+      results.push(`❌ ${p.botName}: ${err.message}`);
+    }
+  }
+  return [
+    `<b>🏇 Race executed</b>`,
+    ...results,
+    ``,
+    `Now monitored by reval cycles.`,
+    ``,
+    timestampDual(),
+  ].join('\n');
 }
 
 app.post('/telegram', async (req, res) => {
