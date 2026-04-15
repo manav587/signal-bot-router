@@ -12,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.18';
+const VERSION = '5.0.19';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -3189,7 +3189,8 @@ async function handleTelegramCommand(text, chatId) {
 
   if (cmd === '/check' || cmd === '/enter' || cmd === '/exit' ||
       cmd === '/race' || cmd === '/yes' || cmd === '/y') {
-    return await handleManualEntryCommand(cmd, rest, chatId);
+    const manualRest = (text || '').trim().split(/\s+/).slice(1).join(' ');
+    return await handleManualEntryCommand(cmd, manualRest, chatId);
   }
 
   if (cmd === '/kill' || cmd === '/closeall') {
