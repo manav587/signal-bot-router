@@ -11,7 +11,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.13';
+const VERSION = '5.0.14';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -1896,6 +1896,10 @@ async function runRevalidation() {
           }
 
           if (reentryDir) {
+            if (PAUSED) {
+              log(`🔄 External close: would flip ${base} to ${reentryDir} but system is PAUSED — skipping re-entry`);
+              continue;
+            }
             const reentryBot = findBot(base, reentryDir);
             if (reentryBot && !isFlipOnCooldown(base)) {
               log(`🔄 External close → baton pass: ${reentryBot.name} (${reentryDir})`);
@@ -2242,6 +2246,10 @@ async function runRevalidation() {
                 }
 
                 if (reentryDir) {
+                  if (PAUSED) {
+                    log(`🔄 Deal-close flip: would flip ${bot.pair} to ${reentryDir} but system is PAUSED — skipping re-entry`);
+                    continue;
+                  }
                   const reentryBot = findBot(bot.pair, reentryDir);
                   if (reentryBot) {
                     // Stop the old bot first if we're changing direction
