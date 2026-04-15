@@ -12,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.17';
+const VERSION = '5.0.18';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -3311,6 +3311,135 @@ function scoreSetup(direction, v) {
   return Math.round(score);
 }
 
+// Build a critical recommendation (tiered verdict + reasons) for a setup.
+// Tiers: STRONG (full confluence) / MIXED (tradeable, lower conviction) /
+//        WEAK (few confirmations) / AVOID (blocking gate or red flag).
+function buildRecommendation(pair, direction, v, score) {
+  const d = (v && v.data) || {};
+  const greens = [];
+  const yellows = [];
+  const reds = [];
+
+  // 1H EMA 9/21 — PRIMARY, blocking
+  if (v && v.allowed) {
+    if (d.shortTermTrend === (direction === 'LONG' ? 'BULLISH' : 'BEARISH')) {
+      const spread = (d.ema9_1h && d.ema21_1h)
+        ? Math.abs((d.ema9_1h - d.ema21_1h) / d.ema21_1h * 100)
+        : 0;
+      if (spread >= 0.3) {
+        greens.push(`1H EMA ${d.shortTermTrend.toLowerCase()}, wide spread ${spread.toFixed(2)}% (strong trend)`);
+      } else if (spread > 0) {
+        yellows.push(`1H EMA ${d.shortTermTrend.toLowerCase()}, narrow spread ${spread.toFixed(2)}% (weak trend)`);
+      } else {
+        greens.push(`1H EMA ${d.shortTermTrend.toLowerCase()}`);
+      }
+    }
+  } else {
+    reds.push('1H EMA against direction — blocking gate failed');
+  }
+
+  // Daily EMA50 alignment
+  if (d.priceVsEma) {
+    const aligned = (d.priceVsEma === 'ABOVE' && direction === 'LONG') ||
+                    (d.priceVsEma === 'BELOW' && direction === 'SHORT');
+    if (aligned) {
+      greens.push(`Price ${d.priceVsEma.toLowerCase()} daily EMA50 (macro aligned)`);
+    } else {
+      yellows.push(`Price ${d.priceVsEma.toLowerCase()} daily EMA50 (against ${direction} macro)`);
+    }
+  }
+
+  // RSI
+  if (d.rsi14 !== null && d.rsi14 !== undefined) {
+    const rsi = d.rsi14;
+    const dir = d.rsiDirection || 'FLAT';
+    if (direction === 'LONG') {
+      if (rsi >= 40 && rsi <= 65) {
+        greens.push(`RSI ${rsi.toFixed(1)} in bullish zone (${dir.toLowerCase()})`);
+      } else if (rsi > 70) {
+        reds.push(`RSI ${rsi.toFixed(1)} overbought — LONG is late, risk of reversal`);
+      } else if (rsi > 65) {
+        yellows.push(`RSI ${rsi.toFixed(1)} approaching overbought`);
+      } else if (rsi < 35 && dir === 'RISING') {
+        yellows.push(`RSI ${rsi.toFixed(1)} oversold but rising (bounce attempt)`);
+      } else if (rsi < 35) {
+        reds.push(`RSI ${rsi.toFixed(1)} oversold and not rising — weakness`);
+      } else {
+        yellows.push(`RSI ${rsi.toFixed(1)} neutral`);
+      }
+    } else {
+      if (rsi >= 35 && rsi <= 60) {
+        greens.push(`RSI ${rsi.toFixed(1)} in bearish zone (${dir.toLowerCase()})`);
+      } else if (rsi < 30) {
+        reds.push(`RSI ${rsi.toFixed(1)} oversold — SHORT is late, risk of bounce`);
+      } else if (rsi < 35) {
+        yellows.push(`RSI ${rsi.toFixed(1)} approaching oversold`);
+      } else if (rsi > 65 && dir === 'FALLING') {
+        yellows.push(`RSI ${rsi.toFixed(1)} overbought and falling (rejection)`);
+      } else if (rsi > 65) {
+        reds.push(`RSI ${rsi.toFixed(1)} overbought and not falling — momentum against`);
+      } else {
+        yellows.push(`RSI ${rsi.toFixed(1)} neutral`);
+      }
+    }
+  }
+
+  // Whale consensus (advisory)
+  if (d.whale && d.whale.consensus) {
+    if (d.whale.consensus === 'both-agree') {
+      greens.push('Whales 2/2 agree');
+    } else if (d.whale.consensus === 'both-oppose') {
+      reds.push('Whales 2/2 opposing — smart money against');
+    } else if (d.whale.consensus === 'one-agrees') {
+      yellows.push('Whales split (1 agrees, 1 mixed)');
+    }
+  }
+
+  // Volatility
+  if (d.atrPct !== undefined && d.atrPct !== null) {
+    const atr = d.atrPct;
+    if (atr >= 0.3 && atr <= 2.0) {
+      greens.push(`Volatility healthy (ATR ${atr.toFixed(2)}%)`);
+    } else if (atr > 2.0) {
+      yellows.push(`Volatility elevated (ATR ${atr.toFixed(2)}% — wider risk)`);
+    } else {
+      yellows.push(`Volatility thin (ATR ${atr.toFixed(2)}% — pre-breakout or dead market)`);
+    }
+  }
+
+  // Determine tier
+  let tier, verdict, action;
+  if (reds.length > 0 || !v || !v.allowed) {
+    tier = 'AVOID';
+    verdict = '🔴 AVOID';
+    action = 'Do not enter. Conditions are against this direction.';
+  } else if (greens.length >= 3 && yellows.length <= 1 && score >= 75) {
+    tier = 'STRONG';
+    verdict = '🟢 STRONG — full confluence';
+    action = 'Enter with conviction. All major conditions aligned.';
+  } else if (greens.length >= 2 && score >= 55) {
+    tier = 'MIXED';
+    verdict = '🟡 MIXED — tradeable but split';
+    action = 'Lower conviction. Consider skipping or half-size.';
+  } else {
+    tier = 'WEAK';
+    verdict = '🟠 WEAK — few confirmations';
+    action = 'Probably skip. Signals don\'t agree.';
+  }
+
+  return { tier, verdict, action, greens, yellows, reds };
+}
+
+// Format a recommendation block for display
+function renderRecommendation(rec) {
+  const lines = [`${rec.verdict}`];
+  for (const g of rec.greens) lines.push(`   ✅ ${g}`);
+  for (const y of rec.yellows) lines.push(`   ⚠ ${y}`);
+  for (const r of rec.reds) lines.push(`   ❌ ${r}`);
+  lines.push(`   → ${rec.action}`);
+  return lines.join('\n');
+}
+
 // Render gate verdict line compactly
 function renderVerdict(direction, v) {
   if (!v) return 'no data';
@@ -3417,15 +3546,17 @@ async function handleCheck(args) {
     for (const dir of directions) {
       const v = await signalGate.validateSignal(pair, dir);
       const score = scoreSetup(dir, v);
-      rows.push({ pair, dir, v, score });
+      const rec = buildRecommendation(pair, dir, v, score);
+      rows.push({ pair, dir, v, score, rec });
     }
   }
   const lines = [`<b>🎯 Pre-entry check</b>`, ''];
   for (const r of rows) {
-    lines.push(`<b>${r.pair} ${r.dir}</b> · score ${r.score}`);
-    lines.push(`   ${renderVerdict(r.dir, r.v)}`);
+    lines.push(`<b>${r.pair} ${r.dir}</b> · score ${r.score}/100`);
+    lines.push(renderRecommendation(r.rec));
+    lines.push('');
   }
-  lines.push('', timestampDual());
+  lines.push(timestampDual());
   return lines.join('\n');
 }
 
@@ -3470,7 +3601,7 @@ async function handleEnter(args, chatId) {
     markPrice, qty, slPrice,
   });
 
-  const verdictLine = renderVerdict(dir, v);
+  const rec = buildRecommendation(pair, dir, v, score);
   const priceStr = markPrice ? `$${markPrice.toFixed(4)}` : 'unknown';
   const qtyStr = qty ? qty.toFixed(4) : '?';
   const slStr = slPrice ? `$${slPrice.toFixed(2)}` : '?';
@@ -3501,8 +3632,8 @@ async function handleEnter(args, chatId) {
     `<b>🎯 Pre-entry check · ${pair} ${dir}</b>`,
     balanceStr,
     ``,
-    `${verdictLine}`,
-    `Score: ${score}/100${v.allowed ? '' : ' (gates would REJECT — override possible)'}`,
+    renderRecommendation(rec),
+    `Score: ${score}/100`,
     ``,
     `<b>💼 About to open</b>`,
     `${bot.name} · ${qtyStr} ${pair} @ ~${priceStr}`,
@@ -3622,32 +3753,58 @@ async function handleRace(args, chatId) {
   }
   const results = await Promise.all(tasks);
 
-  // Rank
+  // Build recommendation for each and rank
+  for (const r of results) {
+    r.rec = buildRecommendation(r.pair, r.dir, r.v, r.score);
+  }
   results.sort((a, b) => b.score - a.score);
-  const qualifying = results.filter(r => r.v && r.v.allowed && r.score > 0 && !activePairs.has(r.pair));
-  const disqualified = results.filter(r => !(r.v && r.v.allowed) || activePairs.has(r.pair));
+  const strong = results.filter(r => r.rec.tier === 'STRONG' && !activePairs.has(r.pair));
+  const mixed = results.filter(r => r.rec.tier === 'MIXED' && !activePairs.has(r.pair));
+  const weak = results.filter(r => r.rec.tier === 'WEAK' && !activePairs.has(r.pair));
+  const disqualified = results.filter(r => r.rec.tier === 'AVOID' || activePairs.has(r.pair));
+  // Qualifying = STRONG + MIXED (user can still choose to include these)
+  const qualifying = [...strong, ...mixed];
 
-  // Take top N but only one direction per pair (the higher-scored one)
+  // Default: only STRONG tier. If user explicitly asks for more (topN large) and
+  // not enough STRONG setups, include MIXED setups too.
   const seenPairs = new Set();
   const proposed = [];
-  for (const r of qualifying) {
+  // First pass: STRONG only
+  for (const r of strong) {
     if (seenPairs.has(r.pair)) continue;
     seenPairs.add(r.pair);
     proposed.push(r);
     if (proposed.length >= topN) break;
   }
+  // Second pass: if user asked for more than we have STRONG, include MIXED
+  if (proposed.length < topN) {
+    for (const r of mixed) {
+      if (seenPairs.has(r.pair)) continue;
+      seenPairs.add(r.pair);
+      proposed.push(r);
+      if (proposed.length >= topN) break;
+    }
+  }
 
   if (proposed.length === 0) {
-    return [
+    const lines = [
       `🏇 <b>Race scan</b>`,
       ``,
-      `No qualifying setups right now — all 8 bots gated, or all pairs already have positions.`,
+      `No STRONG setups right now.`,
       ``,
-      `Disqualified:`,
-      ...disqualified.slice(0, 8).map(r => `   ${r.pair} ${r.dir}: ${r.v && !r.v.allowed ? (r.v.reason || 'gate fail') : 'pair already open'}`),
-      ``,
-      timestampDual(),
-    ].join('\n');
+    ];
+    if (mixed.length > 0) {
+      lines.push(`<i>Mixed (tradeable but low conviction): ${mixed.map(r => r.pair + ' ' + r.dir).join(', ')}</i>`);
+      lines.push('');
+    }
+    if (weak.length > 0) {
+      lines.push(`<i>Weak: ${weak.map(r => r.pair + ' ' + r.dir).join(', ')}</i>`);
+      lines.push('');
+    }
+    lines.push(`<i>Use /check to see full verdicts for all 8 bots, or wait for conditions to align.</i>`);
+    lines.push('', `→ <b>Recommendation: skip this cycle. No strong setup.</b>`);
+    lines.push('', timestampDual());
+    return lines.join('\n');
   }
 
   // Calculate margin
@@ -3688,8 +3845,10 @@ async function handleRace(args, chatId) {
   ].filter(Boolean);
 
   for (const [i, r] of proposed.entries()) {
-    lines.push(`   ${i + 1}. <b>${r.pair} ${r.dir}</b> · score ${r.score}`);
-    lines.push(`      ${renderVerdict(r.dir, r.v)}`);
+    lines.push(`   ${i + 1}. <b>${r.pair} ${r.dir}</b> · score ${r.score}/100`);
+    lines.push(`      ${r.rec.verdict}`);
+    for (const g of r.rec.greens.slice(0, 3)) lines.push(`         ✅ ${g}`);
+    for (const y of r.rec.yellows.slice(0, 2)) lines.push(`         ⚠ ${y}`);
   }
 
   if (qualifying.length > proposed.length) {
