@@ -23,7 +23,7 @@ const API_SECRET = process.env.BINANCE_API_SECRET || '';
 
 // ── Trading Constants ─────────────────────────────────────────────────────
 
-const POSITION_SIZE_USDT = 1500;      // $1,500 notional per position
+const POSITION_SIZE_USDT = 500;       // $500 notional — OVERNIGHT SCALING (v5.0.20). Revert to 1500 after test.
 const LEVERAGE = 10;                  // 10x isolated
 const SL_PERCENT = -1.0;              // -1.0% from entry
 

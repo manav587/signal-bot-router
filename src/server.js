@@ -12,7 +12,7 @@ const tradeJournal = require('./trade-journal');
 app.use(express.json());
 app.use(express.text({ type: '*/*' }));
 
-const VERSION = '5.0.19';
+const VERSION = '5.0.20';
 // v5.0.0: All execution via CCXT direct to Binance — all execution via CCXT direct to Binance
 
 // v5.0.9: BOT_MAP is now imported from exchange-api.js (single source of truth).
@@ -1793,8 +1793,8 @@ const PROXIMITY_BLOCK_THRESHOLD = 80; // v4.0.1: block ASAP re-entry if opposite
 // Root cause: tpPerc is a PRICE percentage, not deal ROI. 1.5% at 10x is 15% ROI.
 // Fix: relay monitors Binance P&L every 2 minutes and closes at $8 profit.
 const RELAY_TP_ENABLED = true;
-const RELAY_TP_PROFIT_USD = 10; // Close deal when unrealized profit >= $10
-const RELAY_TP_POSITION_SIZE = 1500; // Notional position size (base order)
+const RELAY_TP_PROFIT_USD = 3.33; // OVERNIGHT SCALING — proportional to $500 position. Revert to 10 with size 1500.
+const RELAY_TP_POSITION_SIZE = 500;  // OVERNIGHT SCALING — matches POSITION_SIZE_USDT // Notional position size (base order)
 
 // ── v4.2.0: SL=FLIP DIRECTION LOGIC ──────────────────────────────────
 // Relay race baton pass rules:
